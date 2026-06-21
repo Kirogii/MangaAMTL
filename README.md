@@ -13,16 +13,17 @@ ________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
 
 #  Installation
--1. Clone the repository
-git clone `https://github.com/Kirogii/MangaAMTL.git`
-cd MangaAMTL
--2. Install dependencies
+- 1: Clone the repository
+`git clone https://github.com/Kirogii/MangaAMTL.git`
+- 2: Cd inside
+`cd MangaAMTL`
+- 3: Install dependencies
 `pip install`
--3. Run the development server
-`python app.py"
--4
-The application will start on:
-http://localhost:7860
+- 4: Run the development server
+`python app.py`
+
+` The application will start on:
+ http://localhost:7860`
 _________________________________________________________________________________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
