@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Manga Translator API",
+  "version": "1.0",
+  "description": "Translates manga images on web pages using a custom FastAPI backend.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Manga Translator Settings"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
