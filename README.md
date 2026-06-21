@@ -1,4 +1,8 @@
-## **MangaAMTL is an open-source manga translation tool**
+#      **           MangaAMTL is an open-source manga translation tool**
+<p align="center">
+  <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/2.jpg?raw=true" alt="Preview1" width="45%" />
+  <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/1.jpg?raw=true" alt="Preview2" width="45%" />
+</p>
 
 > [!WARNING]  
 > Do not run this for production unless you know what you are doing (If you do not know what that is do not portforward this)
