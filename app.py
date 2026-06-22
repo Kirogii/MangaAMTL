@@ -564,9 +564,19 @@ def _parse_paddle_result(result) -> List[Dict[str, Any]]:
 # ===========================================================================
 # Qwen GGUF translator (switchable)
 # ===========================================================================
+# --- Language Map ---
+LANG_MAP = {
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "id": "Indonesian",
+    "ru": "Russian",
+    "es": "Spanish"
+}
+
 SYSTEM_PROMPT = (
-    "You are a professional manga translator. Translate the user's Japanese or Korean text into natural, fluent English. "
-    "If the text is already in English, or is a single character, or is meaningless, just return it exactly as is. "
+    "You are a professional manga translator. Translate the user's Japanese or Korean text into natural, fluent {lang}. "
+    "If the text is already in the target language, or is a single character, or is meaningless, just return it exactly as is. "
     "Output ONLY the translation, no notes, no romanization, no quotes."
 )
 
@@ -604,12 +614,16 @@ def switch_qwen_model(repo_id: str, filename: Optional[str] = None):
     logging.info(f"[Qwen] Switched to {repo_id}/{filename}, preloading...")
     get_qwen()  # preload in this thread
 
-def qwen_translate(text: str) -> str:
+def qwen_translate(text: str, target_lang: str = "en") -> str:
     if not text.strip():
         return ""
+    
+    lang_name = LANG_MAP.get(target_lang, "English")
+    dynamic_prompt = SYSTEM_PROMPT.format(lang=lang_name)
+    
     llm = get_qwen()
     msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": dynamic_prompt},
         {"role": "user",   "content": text},
     ]
     with _llm_lock:
@@ -819,7 +833,8 @@ def draw_text_outline(draw, pos, text, font, fill, outline, outline_width):
 # ===========================================================================
 async def detect_translate_inpaint(pil_img: Image.Image,
                                    use_lama: bool = True,
-                                   colorize: bool = False) -> Tuple[Image.Image, List[Dict]]:
+                                   colorize: bool = False,
+                                   target_lang: str = "en") -> Tuple[Image.Image, List[Dict]]:
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
     loop = asyncio.get_running_loop()
@@ -888,7 +903,8 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             if not t.strip():
                 tasks.append(asyncio.sleep(0, result=""))
             else:
-                tasks.append(loop.run_in_executor(_llm_executor, qwen_translate, t))
+                # Pass target_lang to qwen_translate
+                tasks.append(loop.run_in_executor(_llm_executor, qwen_translate, t, target_lang))
         return await asyncio.gather(*tasks)
 
     inpaint_task = loop.run_in_executor(None, _do_inpaint)
@@ -986,6 +1002,15 @@ async def job_worker():
             pil = job["_pil"]
             use_lama = job["_use_lama"]
             colorize = job.get("_colorize", False)
+            target_lang = job.get("_target_lang", "en") # <--- ADD THIS
+            
+            # Add target_lang=target_lang to the function call
+            result_img, boxes = await detect_translate_inpaint(
+                pil, 
+                use_lama=use_lama, 
+                colorize=colorize, 
+                target_lang=target_lang
+            )
             result_img, boxes = await detect_translate_inpaint(pil, use_lama=use_lama, colorize=colorize)
             buf = io.BytesIO()
             result_img.convert("RGB").save(buf, format="PNG")
@@ -1397,14 +1422,16 @@ async def v1_translate(
 async def v1_translate_upload(
     file: UploadFile = File(...),
     use_lama: str = Form("true"),
-    lang: str = Form(DEFAULT_LANG),
+    lang: str = Form("en"),
     colorize: str = Form("false"),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
-    """Multipart convenience endpoint for extensions that prefer file uploads."""
-    # Robust string to boolean conversion for HTML Form data
     use_lama_bool = use_lama.lower() in ("true", "1", "on", "yes")
     colorize_bool = colorize.lower() in ("true", "1", "on", "yes")
+    
+    # Validate language
+    if lang not in LANG_MAP:
+        lang = "en"
     
     raw = await file.read()
     try:
@@ -1412,16 +1439,15 @@ async def v1_translate_upload(
     except Exception as e:
         raise HTTPException(400, f"bad image: {e}")
     
-    # Hard error if colorize is requested but onnxruntime isn't installed
     if (colorize_bool or _colorize_enabled) and ort is None:
-        raise HTTPException(500, "Colorization requested but 'onnxruntime' is not installed. Run: pip install onnxruntime")
+        raise HTTPException(500, "Colorization requested but 'onnxruntime' is not installed.")
 
     job_id = idempotency_key or uuid.uuid4().hex
     _jobs[job_id] = {
         "id": job_id, "status": "queued", "created_at": time.time(),
         "_pil": pil, "_use_lama": use_lama_bool,
         "_colorize": colorize_bool or _colorize_enabled,
-        "lang": lang,
+        "_target_lang": lang,  # <--- ADD THIS
     }
     if _job_queue is None:
         raise HTTPException(503, "Server is still starting up, please try again in a moment.")
