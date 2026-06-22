@@ -4,13 +4,15 @@ Manga translation service (FastAPI, OpenAI-style /v1/ endpoints).
 
 - OCR: Hayai OCR (Japanese, with YOLO text box detection) /
        PaddleOCR korean_PP-OCRv5_mobile_rec (Korean, end-to-end).
-- Translation: Qwen 0.8B GGUF  (Manojb/Qwen_Qwen3.5-0.8B-Q4_K_M.gguf).
+- Translation: Qwen 0.8B GGUF  (switchable via /v1/changemodel).
 - Inpainting: SimpleLama (preferred) with cv2.inpaint fallback.
+- Colorizer: Manga Light Colorizer v6 (ONNX) — optional per-request or global.
 - Text render: auto-fit binary-search font sizing + per-box ink-color sampling.
 - API: /health /version /meta /warmup /setmodel /getmodel
        /v1/translate /v1/translate/{id} /v1/translate/{id}/image
+       /v1/changemodel /v1/listmodels /v1/colorize
        /v1/ai/resolve /v1/ai/prompt/default
-- UI: Embedded HTML testing interface at / with Korean/Japanese OCR model switches
+- UI: Embedded HTML testing interface at /
 - Logs: /console endpoint to view all backend logs and errors
 """
 from __future__ import annotations
@@ -36,7 +38,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
 # --- FastAPI ---------------------------------------------------------------
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Request
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Request, Form
 from fastapi.responses import JSONResponse, Response, HTMLResponse, PlainTextResponse
 
 # --- Optional deps ---------------------------------------------------------
@@ -65,64 +67,51 @@ try:
 except Exception:
     PaddleOCR = None
 
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
+
 # --- Sanitization ----
 import re
 
-# Unicode ranges your English comic font (AnimeAce / Arial) actually supports.
-# Anything outside → drop, so PIL never draws a □.
 _ALLOWED_RANGES = (
-    (0x0020, 0x007E),   # Basic Latin (ASCII printable)
-    (0x00A0, 0x00FF),   # Latin-1 supplement (à, é, ñ, etc.)
-    (0x0100, 0x017F),   # Latin Extended-A
-    (0x0180, 0x024F),   # Latin Extended-B
-    (0x2000, 0x206F),   # General Punctuation (quotes, dashes, ellipsis)
+    (0x0020, 0x007E),
+    (0x00A0, 0x00FF),
+    (0x0100, 0x017F),
+    (0x0180, 0x024F),
+    (0x2000, 0x206F),
 )
 
-# Translate common "smart" Unicode punctuation → ASCII equivalents so we
-# keep meaning instead of deleting it.
 _PUNCT_MAP = {
-    0x2018: "'", 0x2019: "'",   # ‘ ’
-    0x201C: '"', 0x201D: '"',   # “ ”
-    0x2013: '-', 0x2014: '-',   # – —
-    0x2026: '...',              # …
-    0x00A0: ' ',                # non-breaking space
-    0x2022: '*',                # •
+    0x2018: "'", 0x2019: "'",
+    0x201C: '"', 0x201D: '"',
+    0x2013: '-', 0x2014: '-',
+    0x2026: '...',
+    0x00A0: ' ',
+    0x2022: '*',
     0x2122: '(TM)', 0x00A9: '(c)', 0x00AE: '(R)',
 }
 
 def clean_text_for_font(text: str) -> str:
-    """Drop any character the rendering font can't display."""
     if not text:
         return ""
-    
-    # Build translation table once on first call (cached via function attribute)
     if not hasattr(clean_text_for_font, '_trans_table'):
-        # Map smart punctuation to ASCII
         table = {chr(cp): rep for cp, rep in _PUNCT_MAP.items()}
-        
-        # Identify characters to drop (CJK, Hangul, symbols, etc.)
-        # Check against allowed ranges
         drop_chars = set()
-        for cp in range(0x110000):  # Check entire unicode range
+        for cp in range(0x110000):
             if cp < 0x20 and chr(cp) not in '\t\n':
                 drop_chars.add(chr(cp))
                 continue
             if not any(lo <= cp <= hi for lo, hi in _ALLOWED_RANGES):
                 drop_chars.add(chr(cp))
-                
-        # Add drop chars to table as None
         for ch in drop_chars:
             table[ch] = None
-            
         clean_text_for_font._trans_table = str.maketrans(table)
-
-    # Execute C-level translation (instant)
     result = text.translate(clean_text_for_font._trans_table)
     result = re.sub(r'[ \t]+', ' ', result)
     result = re.sub(r'\n+', ' ', result)
     return result.strip()
-
-
 
 
 # --- Config ----------------------------------------------------------------
@@ -149,6 +138,19 @@ if not FONT_PATH.exists():
 DEFAULT_LANG       = "en"
 BUILD_ID           = "manga-v1-2025.01"
 
+# --- Colorizer Config ------------------------------------------------------
+COLORIZER_DIR = MODEL_DIR / "colorizer"
+COLORIZER_DIR.mkdir(parents=True, exist_ok=True)
+COLORIZER_GENERATOR_PATH = COLORIZER_DIR / "v6_generator.onnx"
+COLORIZER_SAM_PATH = COLORIZER_DIR / "v6_sam_encoder.onnx"
+COLORIZER_GENERATOR_URL = "https://huggingface.co/sharky172/manga-light-colorizer/resolve/main/models/v6_generator.onnx"
+COLORIZER_SAM_URL = "https://huggingface.co/sharky172/manga-light-colorizer/resolve/main/models/v6_sam_encoder.onnx"
+COLORIZER_DEFAULT_INFER_SIZE = 768
+
+# --- GGUF Model Config -----------------------------------------------------
+GGUF_DIR = MODEL_DIR / "gguf"
+GGUF_DIR.mkdir(parents=True, exist_ok=True)
+
 # --- Logging / Console -----------------------------------------------------
 class MemoryLogHandler(logging.Handler):
     def __init__(self, capacity: int = 2000):
@@ -164,12 +166,10 @@ class MemoryLogHandler(logging.Handler):
 log_handler = MemoryLogHandler()
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
-# Attach to root logger
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 root_logger.addHandler(log_handler)
 
-# Capture uvicorn logs
 logging.getLogger("uvicorn").addHandler(log_handler)
 logging.getLogger("uvicorn.access").addHandler(log_handler)
 
@@ -186,11 +186,23 @@ _paddle_ocr_model  = None
 _current_ocr_model = "ja"
 _ocr_model_lock = threading.Lock()
 
+# Colorizer globals
+_colorizer_session = None
+_colorizer_sam_session = None
+_colorizer_lock = threading.Lock()
+_colorize_enabled = False  # global default toggle
+
+# Qwen model-switching globals
+_current_qwen_repo_id = Qwen_REPO_ID
+_current_qwen_filename = Qwen_MODEL_FILENAME
+_current_qwen_path: Optional[pathlib.Path] = None
+_qwen_model_lock = threading.Lock()
+
 # Job queue
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_lock = asyncio.Lock()
-_job_queue: Optional[asyncio.Queue] = None  # Initialized on startup
-_worker_task = None  # Keep a strong reference to prevent GC
+_job_queue: Optional[asyncio.Queue] = None
+_worker_task = None
 
 # LLM Concurrency Control
 _llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
@@ -224,6 +236,157 @@ def cv2_to_pil(cv2_img: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB))
 
 # ===========================================================================
+# Colorizer (ONNX) — Manga Light Colorizer v6
+# ===========================================================================
+def ensure_colorizer_models():
+    """Download colorizer ONNX models if missing or corrupt."""
+    import shutil
+    
+    # Download Generator
+    if not COLORIZER_GENERATOR_PATH.exists() or COLORIZER_GENERATOR_PATH.stat().st_size < 10000:
+        logging.info(f"[Colorizer] Downloading generator via HuggingFace...")
+        try:
+            from huggingface_hub import hf_hub_download
+            p = hf_hub_download(repo_id="sharky172/manga-light-colorizer", filename="models/v6_generator.onnx")
+            shutil.copy(str(p), str(COLORIZER_GENERATOR_PATH))
+        except ImportError:
+            download_if_missing(COLORIZER_GENERATOR_URL, COLORIZER_GENERATOR_PATH)
+            
+    # Download SAM Encoder
+    if not COLORIZER_SAM_PATH.exists() or COLORIZER_SAM_PATH.stat().st_size < 10000:
+        logging.info(f"[Colorizer] Downloading SAM encoder via HuggingFace...")
+        try:
+            from huggingface_hub import hf_hub_download
+            p = hf_hub_download(repo_id="sharky172/manga-light-colorizer", filename="models/v6_sam_encoder.onnx")
+            shutil.copy(str(p), str(COLORIZER_SAM_PATH))
+        except ImportError:
+            download_if_missing(COLORIZER_SAM_URL, COLORIZER_SAM_PATH)
+
+def get_colorizer_sessions():
+    """Lazily load and cache the colorizer ONNX sessions."""
+    global _colorizer_session, _colorizer_sam_session
+    if ort is None:
+        raise RuntimeError("onnxruntime not installed: pip install onnxruntime")
+    with _colorizer_lock:
+        if _colorizer_session is None:
+            ensure_colorizer_models()
+            available = ort.get_available_providers()
+            providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                         if "CUDAExecutionProvider" in available
+                         else ["CPUExecutionProvider"])
+            logging.info(f"[Colorizer] Loading generator: {COLORIZER_GENERATOR_PATH}")
+            _colorizer_session = ort.InferenceSession(str(COLORIZER_GENERATOR_PATH), providers=providers)
+            if COLORIZER_SAM_PATH.exists():
+                logging.info(f"[Colorizer] Loading SAM encoder: {COLORIZER_SAM_PATH}")
+                _colorizer_sam_session = ort.InferenceSession(str(COLORIZER_SAM_PATH), providers=providers)
+            else:
+                _colorizer_sam_session = None
+            logging.info(f"[Colorizer] Ready. Provider: {_colorizer_session.get_providers()[0]}, "
+                         f"SAM: {'on' if _colorizer_sam_session else 'off'}")
+    return _colorizer_session, _colorizer_sam_session
+
+def _denormalize_rgb(rgb_norm: np.ndarray) -> np.ndarray:
+    """[-1, 1] -> [0, 255] uint8."""
+    return np.clip((rgb_norm + 1.0) * 127.5, 0, 255).astype(np.uint8)
+
+def _extract_sam_features_onnx(sam_session, L_bw_norm: np.ndarray):
+    """Extract SAM features via ONNX. WD14 disabled (zeros)."""
+    L_01 = (L_bw_norm + 1.0) / 2.0
+    L_1024 = cv2.resize(L_01, (1024, 1024), interpolation=cv2.INTER_LINEAR)
+    rgb_sam = np.stack([L_1024, L_1024, L_1024], axis=0)[np.newaxis].astype(np.float32)
+    sam_out = sam_session.run(None, {"rgb_input": rgb_sam})
+    sam_level0 = sam_out[0]
+    sam_level1 = sam_out[1]
+    wd14_embedding = np.zeros((1, 1024), dtype=np.float32)
+    return sam_level0, sam_level1, wd14_embedding
+
+def _colorize_onnx(session, L_bw, sam_level0, sam_level1, wd14_embedding) -> np.ndarray:
+    """Run generator ONNX. Returns RGB (H, W, 3) in [0, 255]."""
+    L_norm = (L_bw.astype(np.float32) / 127.5) - 1.0
+    L_tensor = L_norm[np.newaxis, np.newaxis, :, :]
+    ort_inputs = {
+        "L_bw": L_tensor,
+        "sam_level0": sam_level0,
+        "sam_level1": sam_level1,
+        "wd14_embedding": wd14_embedding,
+    }
+    rgb_pred = session.run(None, ort_inputs)[0]
+    rgb_pred = rgb_pred[0].transpose(1, 2, 0)
+    return _denormalize_rgb(rgb_pred)
+
+def colorize_pil(pil_img: Image.Image,
+                 infer_size: int = COLORIZER_DEFAULT_INFER_SIZE) -> Image.Image:
+    """
+    Colorize a manga image using local ONNX models.
+    Input is converted to grayscale, colorized at infer_size, then resized
+    back to the original resolution.
+    Returns an RGB PIL Image.
+    """
+    session, sam_session = get_colorizer_sessions()
+    gray = np.array(pil_img.convert("L"))
+    orig_H, orig_W = gray.shape
+    L_bw = cv2.resize(gray, (infer_size, infer_size), interpolation=cv2.INTER_AREA)
+    H_in, W_in = L_bw.shape
+    L_norm = (L_bw.astype(np.float32) / 127.5) - 1.0
+
+    if sam_session is not None:
+        sam_level0, sam_level1, wd14_embedding = _extract_sam_features_onnx(sam_session, L_norm)
+    else:
+        sam_level0 = np.zeros((1, 256, H_in // 16, W_in // 16), dtype=np.float32)
+        sam_level1 = np.zeros((1, 256, H_in // 32, W_in // 32), dtype=np.float32)
+        wd14_embedding = np.zeros((1, 1024), dtype=np.float32)
+
+    rgb_output = _colorize_onnx(session, L_bw, sam_level0, sam_level1, wd14_embedding)
+    rgb_output = cv2.resize(rgb_output, (orig_W, orig_H), interpolation=cv2.INTER_LANCZOS4)
+    return Image.fromarray(rgb_output)
+
+# ===========================================================================
+# GGUF model management (download / list / switch)
+# ===========================================================================
+def _gguf_local_path(repo_id: str, filename: str) -> pathlib.Path:
+    safe = repo_id.replace("/", "__") + "__" + filename
+    return GGUF_DIR / safe
+
+def download_gguf(repo_id: str, filename: str) -> pathlib.Path:
+    """Download a GGUF model. Uses huggingface_hub if available to prevent bad downloads."""
+    # Use huggingface_hub if available (handles cache, redirects, and 404 errors safely)
+    try:
+        from huggingface_hub import hf_hub_download
+        logging.info(f"[GGUF] Ensuring {repo_id}/{filename} is downloaded via huggingface_hub...")
+        path = hf_hub_download(repo_id=repo_id, filename=filename)
+        return pathlib.Path(path)
+    except ImportError:
+        pass
+    
+    # Fallback to direct URL download if huggingface_hub isn't installed
+    dest = _gguf_local_path(repo_id, filename)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    logging.info(f"[GGUF] Downloading {url} -> {dest}")
+    download_if_missing(url, dest)
+    return dest
+
+def list_local_gguf_models() -> List[Dict[str, Any]]:
+    models = []
+    for f in sorted(GGUF_DIR.glob("*.gguf")):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        stem = f.stem  # repo_id__filename without .gguf
+        # Try to split back into repo_id / filename
+        # Format: {org}__{model_name}__{filename.gguf}
+        parts = stem.split("__")
+        filename_part = parts[-1]
+        repo_part = "/".join(parts[:-1]) if len(parts) > 1 else stem
+        models.append({
+            "name": stem,
+            "repo_id": repo_part,
+            "filename": filename_part,
+            "size_mb": round(size_mb, 1),
+            "path": str(f),
+        })
+    return models
+
+# ===========================================================================
 # Hayai OCR (Japanese) — YOLO detection + Hayai recognition
 # ===========================================================================
 def get_hayai_ocr():
@@ -244,12 +407,6 @@ def get_yolo():
     return _global_yolo
 
 def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
-    """
-    Japanese OCR pipeline:
-      1. YOLO detects manga text-box regions.
-      2. Hayai OCR reads each cropped region (supports multi-line, furigana, SFX).
-    Returns list of {"text": str, "bbox": (x1,y1,x2,y2)}.
-    """
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
     yolo = get_yolo()
@@ -269,7 +426,6 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
         x2, y2 = min(w - 1, int(xy[2])), min(h - 1, int(xy[3]))
 
         box_area = (x2 - x1) * (y2 - y1)
-        # Reject boxes that cover more than 80% of the image or are too small
         if box_area > 0.8 * img_area or box_area < 100:
             continue
 
@@ -284,7 +440,7 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     return out
 
 # ===========================================================================
-# PaddleOCR (Korean) — korean_PP-OCRv5_mobile_rec
+# PaddleOCR (Korean)
 # ===========================================================================
 def get_paddle_ocr():
     global _paddle_ocr_model
@@ -292,33 +448,14 @@ def get_paddle_ocr():
         if PaddleOCR is None:
             raise RuntimeError("paddleocr not installed: pip install paddleocr paddlepaddle")
         logging.info("[PaddleOCR] Loading Korean model (korean_PP-OCRv5_mobile_rec)...")
-        
-        # PaddleOCR 3.x enables doc orientation/unwarping by default (causing PP-LCNet downloads).
-        # We disable them and explicitly request the Korean v5 mobile recognition model.
         for attempt_kwargs in [
-            # PaddleOCR 3.x (newest API) - Explicit model names
-            dict(
-                lang='korean', 
-                use_textline_orientation=False, 
-                use_doc_orientation_classify=False, 
-                use_doc_unwarping=False,
-                text_rec_model_name='korean_PP-OCRv5_mobile_rec'
-            ),
-            # PaddleOCR 3.x (fallback without explicit rec name)
-            dict(
-                lang='korean', 
-                use_textline_orientation=False, 
-                use_doc_orientation_classify=False, 
-                use_doc_unwarping=False
-            ),
-            # PaddleOCR 2.x (legacy API)
-            dict(
-                lang='korean', 
-                use_angle_cls=False, 
-                show_log=False, 
-                rec_model_name='korean_PP-OCRv5_mobile_rec'
-            ),
-            # Minimal fallback
+            dict(lang='korean', use_textline_orientation=False,
+                 use_doc_orientation_classify=False, use_doc_unwarping=False,
+                 text_rec_model_name='korean_PP-OCRv5_mobile_rec'),
+            dict(lang='korean', use_textline_orientation=False,
+                 use_doc_orientation_classify=False, use_doc_unwarping=False),
+            dict(lang='korean', use_angle_cls=False, show_log=False,
+                 rec_model_name='korean_PP-OCRv5_mobile_rec'),
             dict(lang='korean'),
         ]:
             try:
@@ -327,15 +464,12 @@ def get_paddle_ocr():
                 return _paddle_ocr_model
             except (ValueError, TypeError) as e:
                 logging.warning(f"[PaddleOCR] Failed with {attempt_kwargs}: {e}")
-        
         raise RuntimeError("Failed to initialize PaddleOCR with any known API variant")
     return _paddle_ocr_model
-
 
 def paddle_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
     img_bgr = pil_to_cv2(pil_img)
     paddle = get_paddle_ocr()
-    # PaddleOCR 3.x removed the 'cls' parameter from .ocr()
     try:
         result = paddle.ocr(img_bgr, cls=False)
     except (ValueError, TypeError):
@@ -343,18 +477,12 @@ def paddle_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
     return _parse_paddle_result(result)
 
 def _parse_paddle_result(result) -> List[Dict[str, Any]]:
-    """Parse PaddleOCR result into our standard {text, bbox} format.
-    Handles both PaddleOCR 2.x and 3.x result structures.
-    """
     out: List[Dict[str, Any]] = []
     if not result:
         return out
-
     first = result[0] if isinstance(result, list) else result
     if first is None:
         return out
-
-    # --- Case 1: PaddleOCR 2.x — list of [box_points, (text, conf)] ---
     if isinstance(first, list):
         for line in first:
             try:
@@ -368,8 +496,6 @@ def _parse_paddle_result(result) -> List[Dict[str, Any]]:
                 out.append({"text": text.strip(), "bbox": (x1, y1, x2, y2)})
             except (ValueError, TypeError):
                 continue
-
-    # --- Case 2: PaddleOCR 3.x — OCRResult with rec_texts / rec_polys ---
     elif hasattr(first, 'rec_texts') and hasattr(first, 'rec_polys'):
         texts = first.rec_texts
         polys = first.rec_polys
@@ -381,11 +507,10 @@ def _parse_paddle_result(result) -> List[Dict[str, Any]]:
             x1, y1 = int(min(xs)), int(min(ys))
             x2, y2 = int(max(xs)), int(max(ys))
             out.append({"text": text.strip(), "bbox": (x1, y1, x2, y2)})
-
     return out
 
 # ===========================================================================
-# Qwen GGUF translator
+# Qwen GGUF translator (switchable)
 # ===========================================================================
 SYSTEM_PROMPT = (
     "You are a professional manga translator. Translate the user's Japanese or Korean text into natural, fluent English. "
@@ -394,20 +519,38 @@ SYSTEM_PROMPT = (
 )
 
 def get_qwen():
-    global _global_qwen
+    global _global_qwen, _current_qwen_path
     if _global_qwen is None:
         if Llama is None:
             raise RuntimeError("llama-cpp-python not installed: pip install llama-cpp-python")
-        logging.info(f"[Qwen] loading {Qwen_REPO_ID} ...")
-        _global_qwen = Llama.from_pretrained(
-            repo_id=Qwen_REPO_ID,
-            filename=Qwen_MODEL_FILENAME,
-            n_ctx=2048,
-            n_threads=max(4, os.cpu_count() or 4),
-            n_gpu_layers=-1,       # Auto-offload to GPU if available
-            verbose=False,
-        )
+        with _qwen_model_lock:
+            if _global_qwen is None:
+                path = _current_qwen_path
+                if path is None or not path.exists():
+                    path = download_gguf(_current_qwen_repo_id, _current_qwen_filename)
+                    _current_qwen_path = path
+                logging.info(f"[Qwen] loading {path} ...")
+                _global_qwen = Llama(
+                    model_path=str(path),
+                    n_ctx=2048,
+                    n_threads=max(4, os.cpu_count() or 4),
+                    n_gpu_layers=-1,
+                    verbose=False,
+                )
+                logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename}")
     return _global_qwen
+
+def switch_qwen_model(repo_id: str, filename: str):
+    """Download (if needed) and switch to a new GGUF model. Thread-safe."""
+    global _global_qwen, _current_qwen_repo_id, _current_qwen_filename, _current_qwen_path
+    path = download_gguf(repo_id, filename)
+    with _qwen_model_lock:
+        _current_qwen_repo_id = repo_id
+        _current_qwen_filename = filename
+        _current_qwen_path = path
+        _global_qwen = None  # unload old model
+    logging.info(f"[Qwen] Switched to {repo_id}/{filename}, preloading...")
+    get_qwen()  # preload in this thread
 
 def qwen_translate(text: str) -> str:
     if not text.strip():
@@ -417,7 +560,6 @@ def qwen_translate(text: str) -> str:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": text},
     ]
-
     with _llm_lock:
         out = llm.create_chat_completion(
             messages=msgs,
@@ -428,8 +570,7 @@ def qwen_translate(text: str) -> str:
         )
     try:
         raw = out["choices"][0]["message"]["content"].strip()
-        # Only run replace if the token actually exists in the string
-        for tok in ("<|im_start|>", "<|im_end|>", "</s>", "¥", "×", "×", "¥"):
+        for tok in ("<|im_start|>", "<|im_end|>", "</s>", "¥", "×"):
             if tok in raw:
                 raw = raw.replace(tok, "")
         return clean_text_for_font(raw)
@@ -466,26 +607,19 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
     region = img_bgr[max(0,y1):y2, max(0,x1):x2]
     if region.size == 0:
         return (0,0,0), (255,255,255)
-
     if region.shape[0] > 120 or region.shape[1] > 120:
         region = cv2.resize(region, (120, 120), interpolation=cv2.INTER_AREA)
-
     pixels = region.reshape(-1, 3).astype(np.float32)
     if len(pixels) < 8:
         return (0,0,0), (255,255,255)
-
-    # --- Optimized Background mode calculation using bincount ---
     quant = (pixels / 32).astype(np.int32)
     keys = quant[:,0] * 64 + quant[:,1] * 8 + quant[:,2]
-    # bincount is much faster than np.unique + return_counts for integer arrays
     counts = np.bincount(keys)
     bg_key = int(np.argmax(counts))
     bg_bgr = np.array([bg_key // 64, (bg_key // 8) % 8, bg_key % 8], dtype=np.float32) * 32 + 16
-
     dists = np.linalg.norm(pixels - bg_bgr, axis=1)
     thresh = max(60.0, float(np.percentile(dists, 75)))
     text_mask = dists > thresh
-
     if int(text_mask.sum()) < 5:
         bg_lum = float(bg_bgr.mean())
         ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
@@ -498,20 +632,16 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
             ink_bgr = np.median(text_pixels[ext_mask], axis=0)
         else:
             ink_bgr = np.median(text_pixels, axis=0)
-
-    def snap(c: np.ndarray) -> np.ndarray:
+    def snap(c):
         c = np.asarray(c, dtype=np.float32)
         if np.all(c < 40):  return np.array([0,0,0], dtype=np.float32)
         if np.all(c > 215): return np.array([255,255,255], dtype=np.float32)
         return c
-
     ink_bgr = snap(ink_bgr)
     bg_bgr  = snap(bg_bgr)
-
     if float(np.linalg.norm(ink_bgr - bg_bgr)) < 80:
         bg_lum = float(bg_bgr.mean())
         ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
-
     text_rgb    = (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0]))
     outline_rgb = (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
     return text_rgb, outline_rgb
@@ -519,67 +649,32 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
 # ===========================================================================
 # Text wrapping & auto-fit (binary search)
 # ===========================================================================
-import functools  # ← also add to your top-level imports if not present
+import functools
 
 @functools.lru_cache(maxsize=256)
 def _get_font_cached(font_path: str, size: int) -> ImageFont.FreeTypeFont:
-    """Return a cached FreeTypeFont for (font_path, size).
-
-    PIL's ImageFont.truetype re-parses the TTF file on every call. During
-    binary-search auto-fit (sizes 8..96) that's ~7 disk reads per text box,
-    per image. This cache keeps one ImageFont object per (path,size) pair in
-    memory so the disk hit happens at most once per size ever used.
-
-    lru_cache is thread-safe under the GIL for lookups; a rare double-load
-    on first miss is harmless (only the winner is stored).
-    """
     try:
         return ImageFont.truetype(font_path, size)
     except Exception:
-        # Don't poison the cache with the fallback default — a later
-        # successful load at the same key would be skipped. Return a fresh
-        # default each time the truetype call fails.
         return ImageFont.load_default()
 
-
 def clear_font_cache() -> None:
-    """Drop all cached font objects (call after hot-swapping the TTF file)."""
     _get_font_cached.cache_clear()
 
-
 def get_font(font_path, size: int) -> ImageFont.FreeTypeFont:
-    """Public accessor — accepts str or pathlib.Path, normalizes to str key."""
     return _get_font_cached(str(font_path), size)
 
-def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
-              max_width: int, allow_break: bool = False) -> Optional[List[str]]:
-    """Wrap text to fit within max_width.
-    
-    - Normal mode (allow_break=False): never breaks a word mid-character.
-      Returns None if a single word is wider than max_width (signals the
-      binary search to try a smaller font size).
-    - Fallback mode (allow_break=True): breaks long words by character
-      as an absolute last resort.
-    
-    Guarantees: every returned line contains at least one word (or one
-    character fragment in fallback mode).
-    """
+def wrap_text(draw, text, font, max_width, allow_break=False):
     words = text.split()
     if not words:
         return [""]
-    
     lines = []
     cur = ""
-    
     for word in words:
         word_width = draw.textlength(word, font=font)
-        
-        # --- Single word doesn't fit on its own line ---
         if word_width > max_width:
             if not allow_break:
-                # Signal: font is too big, binary search should go smaller
                 return None
-            # Last-resort character breaking
             if cur:
                 lines.append(cur)
                 cur = ""
@@ -595,17 +690,13 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont
                 lines.append(part)
                 word = word[split_idx:]
             continue
-        
-        # --- Try to append word to current line ---
         test = (cur + " " + word) if cur else word
         if draw.textlength(test, font=font) <= max_width:
             cur = test
         else:
-            # Current line is full; push it and start a new line with this word
             if cur:
                 lines.append(cur)
-            cur = word  # word alone fits (checked above), so this line has ≥1 word
-    
+            cur = word
     if cur:
         lines.append(cur)
     return lines
@@ -620,29 +711,19 @@ def _measure_block(draw, lines, font):
         if w > max_w: max_w = w
     return heights, total_h, max_w
 
-def fit_font_and_wrap(draw: ImageDraw.ImageDraw, text: str,
-                      box_w: int, box_h: int,
-                      font_path: str = str(FONT_PATH),
-                      max_size: int = 96, min_size: int = 8
-                      ) -> Tuple[int, List[str], List[int]]:
-    """Binary-search the largest font size where text fits in (box_w, box_h)."""
+def fit_font_and_wrap(draw, text, box_w, box_h,
+                      font_path=str(FONT_PATH), max_size=96, min_size=8):
     if not text.strip():
         return min_size, [""], [0]
-    
-    # Initialize font cache on function object (no global variables needed)
     if not hasattr(fit_font_and_wrap, '_cache'):
         fit_font_and_wrap._cache = {}
     cache = fit_font_and_wrap._cache
-    
     lo, hi = min_size, max_size
-    best_size: Optional[int] = None
-    best_lines: Optional[List[str]] = None
-    best_heights: Optional[List[int]] = None
-    
+    best_size = None
+    best_lines = None
+    best_heights = None
     while lo <= hi:
         mid = (lo + hi) // 2
-        
-        # --- CACHED FONT LOAD ---
         key = (font_path, mid)
         if key not in cache:
             try:
@@ -650,21 +731,16 @@ def fit_font_and_wrap(draw: ImageDraw.ImageDraw, text: str,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-        
         lines = wrap_text(draw, text, font, box_w - 4, allow_break=False)
-        
         if lines is None:
             hi = mid - 1
             continue
-        
         heights, total_h, max_w = _measure_block(draw, lines, font)
-        
         if max_w <= box_w - 4 and total_h <= box_h - 4:
             best_size, best_lines, best_heights = mid, lines, heights
             lo = mid + 1
         else:
             hi = mid - 1
-    
     if best_lines is None:
         key = (font_path, min_size)
         if key not in cache:
@@ -673,33 +749,25 @@ def fit_font_and_wrap(draw: ImageDraw.ImageDraw, text: str,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-        
         fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True)
         best_lines = fallback_lines if fallback_lines else [text]
         heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
         best_heights = heights
-        logging.warning(
-            f"Text could not fit cleanly even at min_size={min_size} "
-            f"in box ({box_w}x{box_h}). Using character-break fallback."
-        )
-    
+        logging.warning(f"Text could not fit cleanly even at min_size={min_size} in box ({box_w}x{box_h}).")
     return best_size, best_lines, best_heights
+
 def draw_text_outline(draw, pos, text, font, fill, outline, outline_width):
     x, y = pos
-    # PIL native stroke is implemented in C and is 10x-50x faster than 
-    # drawing text in a nested dx/dy loop. It also looks better (proper antialiasing).
-    draw.text(
-        (x, y), text, font=font, fill=fill, 
-        stroke_width=outline_width, 
-        stroke_fill=outline
-    )
+    draw.text((x, y), text, font=font, fill=fill,
+              stroke_width=outline_width, stroke_fill=outline)
 
 # ===========================================================================
-# Core pipeline (Concurrent Inpainting & Translation)
+# Core pipeline (Concurrent Inpainting & Translation + optional Colorize)
 # ===========================================================================
 async def detect_translate_inpaint(pil_img: Image.Image,
-                                   use_lama: bool = True) -> Tuple[Image.Image, List[Dict]]:
+                                   use_lama: bool = True,
+                                   colorize: bool = False) -> Tuple[Image.Image, List[Dict]]:
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
     loop = asyncio.get_running_loop()
@@ -726,6 +794,12 @@ async def detect_translate_inpaint(pil_img: Image.Image,
     cleaned.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
 
     if not cleaned:
+        # Even with no text, optionally colorize the raw image
+        if colorize and ort is not None:
+            try:
+                pil_img = colorize_pil(pil_img)
+            except Exception as e:
+                logging.error(f"Colorization failed: {e}")
         return pil_img, []
 
     # --- Concurrent Translation and Inpainting ---
@@ -735,22 +809,18 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             x1,y1,x2,y2 = c["bbox"]
             pad = max(2, int(min(x2-x1, y2-y1) * 0.06))
             mask[max(0,y1-pad):min(h,y2+pad), max(0,x1-pad):min(w,x2+pad)] = 255
-            
         mask_area = np.count_nonzero(mask)
         total_area = h * w
-        
         try:
             if use_lama and SimpleLama:
                 return lama_inpaint(img_bgr, mask)
             elif mask_area > 0.25 * total_area:
-                # cv2.inpaint will create a wavy green mess if the mask is too large.
-                # Fallback to filling the boxes with the detected background color.
-                logging.warning("Mask too large for cv2.inpaint. Filling boxes with solid colors instead.")
+                logging.warning("Mask too large for cv2.inpaint. Filling boxes with solid colors.")
                 filled = img_bgr.copy()
                 for c in cleaned:
                     x1,y1,x2,y2 = c["bbox"]
                     _, bg_rgb = detect_text_and_bg_colors(img_bgr, (x1,y1,x2,y2))
-                    bg_bgr = (bg_rgb[2], bg_rgb[1], bg_rgb[0]) # RGB to BGR
+                    bg_bgr = (bg_rgb[2], bg_rgb[1], bg_rgb[0])
                     cv2.rectangle(filled, (x1, y1), (x2, y2), bg_bgr, -1)
                 return filled
             else:
@@ -766,29 +836,39 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             if not t.strip():
                 tasks.append(asyncio.sleep(0, result=""))
             else:
-                # Use the dedicated single-thread LLM executor
                 tasks.append(loop.run_in_executor(_llm_executor, qwen_translate, t))
         return await asyncio.gather(*tasks)
 
-    # Run both concurrently, but with a timeout safety net
     inpaint_task = loop.run_in_executor(None, _do_inpaint)
     translation_task = _do_translation()
-    
+
     try:
         inpainted, translations = await asyncio.wait_for(
             asyncio.gather(inpaint_task, translation_task),
-            timeout=120.0  # 2 minutes max
+            timeout=120.0
         )
     except asyncio.TimeoutError:
         logging.error("Pipeline timed out after 120s")
         raise RuntimeError("Translation pipeline timed out")
 
-    # --- Render ---
+    # --- Optional: Colorize the inpainted (text-free) image ---
+    if colorize:
+        if ort is None:
+            raise RuntimeError("onnxruntime not installed but colorization requested. Run: pip install onnxruntime")
+        try:
+            inpainted_pil = cv2_to_pil(inpainted)
+            colorized_pil = await loop.run_in_executor(None, colorize_pil, inpainted_pil)
+            inpainted = pil_to_cv2(colorized_pil)
+            logging.info("Colorization applied to inpainted image.")
+        except Exception as e:
+            logging.error(f"Colorization failed, using non-colorized: {e}")
+            raise RuntimeError(f"Colorization ONNX failed: {e}")
+
+    # --- Render translated text on top of (possibly colorized) inpainted image ---
     base_pil = cv2_to_pil(inpainted).convert("RGBA")
     out = base_pil.copy()
     draw = ImageDraw.Draw(out)
 
-    # Ensure cache exists
     if not hasattr(fit_font_and_wrap, '_cache'):
         fit_font_and_wrap._cache = {}
     cache = fit_font_and_wrap._cache
@@ -802,11 +882,9 @@ async def detect_translate_inpaint(pil_img: Image.Image,
                                "font_size": 0, "text_color": None, "outline_color": None})
             continue
 
-        text_rgb, outline_rgb = detect_text_and_bg_colors(img_bgr, (x1,y1,x2,y2))
+        text_rgb, outline_rgb = detect_text_and_bg_colors(inpainted, (x1,y1,x2,y2))
         box_w, box_h = x2 - x1, y2 - y1
         font_size, lines, heights = fit_font_and_wrap(draw, trans, box_w, box_h, str(FONT_PATH))
-        
-        # --- CACHED FONT LOAD ---
         key = (str(FONT_PATH), font_size)
         if key not in cache:
             try:
@@ -814,7 +892,6 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-
         total_h = sum(heights)
         cur_y = y1 + max(0, (box_h - total_h) // 2)
         outline_w = max(1, int(font_size * 0.08))
@@ -824,23 +901,16 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             draw_text_outline(draw, (pos_x, cur_y), ln, font,
                               fill=text_rgb, outline=outline_rgb, outline_width=outline_w)
             cur_y += hln
-
         boxes_info.append({
-            "bbox": c["bbox"],
-            "orig": c["text"],
-            "trans": trans,
-            "font_size": font_size,
-            "text_color": text_rgb,
-            "outline_color": outline_rgb,
+            "bbox": c["bbox"], "orig": c["text"], "trans": trans,
+            "font_size": font_size, "text_color": text_rgb, "outline_color": outline_rgb,
         })
-
     return out, boxes_info
 
 # ===========================================================================
 # Job queue / worker
 # ===========================================================================
 def _cleanup_old_jobs():
-    """Remove completed/errored jobs older than 10 minutes."""
     now = time.time()
     to_remove = [
         jid for jid, j in _jobs.items()
@@ -863,7 +933,8 @@ async def job_worker():
         try:
             pil = job["_pil"]
             use_lama = job["_use_lama"]
-            result_img, boxes = await detect_translate_inpaint(pil, use_lama=use_lama)
+            colorize = job.get("_colorize", False)
+            result_img, boxes = await detect_translate_inpaint(pil, use_lama=use_lama, colorize=colorize)
             buf = io.BytesIO()
             result_img.convert("RGB").save(buf, format="PNG")
             job["image_bytes"] = buf.getvalue()
@@ -883,7 +954,12 @@ async def job_worker():
 async def _start_worker():
     global _job_queue, _worker_task
     _job_queue = asyncio.Queue()
-    _worker_task = asyncio.create_task(job_worker())  # Keep reference to prevent GC
+    _worker_task = asyncio.create_task(job_worker())
+    
+    # Preload Qwen model in the background to avoid timeout on the very first request
+    logging.info("[Startup] Preloading Qwen translation model in background...")
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(_llm_executor, get_qwen)
 
 # ===========================================================================
 # API models
@@ -893,14 +969,19 @@ class TranslateRequest(BaseModel):
     use_lama: bool = True
     lang: str = DEFAULT_LANG
     source: Optional[str] = None
+    colorize: bool = False  # per-request colorize toggle
 
 class AIResolveRequest(BaseModel):
     provider: Optional[str] = None
     model: Optional[str] = None
     model_list: Optional[List[str]] = None
 
+class ChangeModelRequest(BaseModel):
+    repo_id: str
+    filename: str
+
 # ===========================================================================
-# Embedded HTML Testing UI (Raw string prevents \n JS bugs)
+# Embedded HTML Testing UI
 # ===========================================================================
 @app.get("/", response_class=HTMLResponse)
 async def root_ui():
@@ -927,18 +1008,39 @@ async def root_ui():
             .switcher { margin-bottom: 15px; padding: 10px; background: #eef; border-radius: 5px; }
             .switcher label { margin-right: 10px; font-weight: bold; }
             .switcher input { margin-right: 5px; }
+            .model-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+            select, input[type="text"] { padding: 6px; border-radius: 4px; border: 1px solid #ccc; }
         </style>
     </head>
     <body>
         <div class="container">
             <h2>Manga Translator API - Testing UI</h2>
-            
+
             <div class="switcher">
                 <label>OCR Model:</label>
                 <input type="radio" id="ocrJa" name="ocrModel" value="ja" checked onchange="switchModel()">
                 <label for="ocrJa">Japanese (Hayai+YOLO)</label>
                 <input type="radio" id="ocrKo" name="ocrModel" value="ko" onchange="switchModel()" style="margin-left: 20px;">
                 <label for="ocrKo">Korean (PaddleOCR)</label>
+            </div>
+
+            <div class="switcher">
+                <label>Colorize:</label>
+                <input type="checkbox" id="colorizeChk"> <label for="colorizeChk">Enable manga colorization (ONNX v6)</label>
+                <span id="colorizeStatus" style="margin-left:10px; color:#666;"></span>
+            </div>
+
+            <div class="switcher">
+                <label>Translation GGUF Model:</label>
+                <div class="model-row">
+                    <select id="ggufSelect" style="min-width:350px;"></select>
+                    <button onclick="loadModelList()">Refresh List</button>
+                    <button onclick="changeModel()">Switch Model</button>
+                    <input type="text" id="customRepo" placeholder="repo_id (e.g. Manojb/Qwen_Qwen3.5-0.8B-Q4_K_M.gguf)" style="min-width:300px;">
+                    <input type="text" id="customFile" placeholder="filename.gguf" style="min-width:180px;">
+                    <button onclick="changeModelCustom()">Switch (custom)</button>
+                </div>
+                <div id="modelStatus" style="margin-top:6px; color:#666;"></div>
             </div>
 
             <div class="upload-box">
@@ -966,9 +1068,91 @@ async def root_ui():
                 try {
                     const res = await fetch(`/setmodel?model=${selected}`, { method: "POST" });
                     const data = await res.json();
-                    console.log("Switched model:", data);
+                    console.log("Switched OCR model:", data);
                 } catch (e) {
-                    console.error("Failed to switch model:", e);
+                    console.error("Failed to switch OCR model:", e);
+                }
+            }
+
+            async function loadModelList() {
+                const sel = document.getElementById('ggufSelect');
+                const status = document.getElementById('modelStatus');
+                status.innerText = "Fetching models...";
+                try {
+                    const res = await fetch('/v1/listmodels');
+                    const data = await res.json();
+                    sel.innerHTML = '';
+                    if (data.models && data.models.length > 0) {
+                        data.models.forEach(m => {
+                            const opt = document.createElement('option');
+                            opt.value = m.name;
+                            opt.textContent = `${m.repo_id}/${m.filename} (${m.size_mb} MB)`;
+                            opt.dataset.repo = m.repo_id;
+                            opt.dataset.file = m.filename;
+                            sel.appendChild(opt);
+                        });
+                        status.innerText = "Models loaded.";
+                    } else {
+                        status.innerText = "No local models found.";
+                    }
+                } catch (e) {
+                    status.innerText = "Error loading models.";
+                    console.error(e);
+                }
+            }
+
+            async function changeModel() {
+                const sel = document.getElementById('ggufSelect');
+                const status = document.getElementById('modelStatus');
+                if (!sel.value) {
+                    alert("Select a model first or refresh list.");
+                    return;
+                }
+                const opt = sel.options[sel.selectedIndex];
+                const repo = opt.dataset.repo;
+                const file = opt.dataset.file;
+                status.innerText = `Switching to ${repo}/${file}...`;
+                try {
+                    const res = await fetch('/v1/changemodel', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({repo_id: repo, filename: file})
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        status.innerText = `Active model: ${data.repo_id}/${data.filename}`;
+                    } else {
+                        status.innerText = `Error: ${data.detail || 'Failed'}`;
+                    }
+                } catch (e) {
+                    status.innerText = "Request failed.";
+                }
+            }
+
+            async function changeModelCustom() {
+                const repo = document.getElementById('customRepo').value.trim();
+                const file = document.getElementById('customFile').value.trim();
+                const status = document.getElementById('modelStatus');
+                if (!repo || !file) {
+                    alert("Provide both repo_id and filename.");
+                    return;
+                }
+                status.innerText = `Downloading/Switching to ${repo}/${file}...`;
+                try {
+                    const res = await fetch('/v1/changemodel', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({repo_id: repo, filename: file})
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        status.innerText = `Active model: ${data.repo_id}/${data.filename}`;
+                        loadModelList(); // refresh dropdown
+                    } else {
+                        status.innerText = `Error: ${data.detail || 'Failed'}`;
+                    }
+                } catch (e) {
+                    status.innerText = "Request failed.";
                 }
             }
 
@@ -978,6 +1162,7 @@ async def root_ui():
                 const origImg = document.getElementById('origImg');
                 const transImg = document.getElementById('transImg');
                 const boxesInfo = document.getElementById('boxesInfo');
+                const colorizeChk = document.getElementById('colorizeChk').checked;
 
                 if (!fileInput.files[0]) {
                     alert("Please select an image file.");
@@ -992,6 +1177,7 @@ async def root_ui():
 
                 const formData = new FormData();
                 formData.append("file", fileInput.files[0]);
+                formData.append("colorize", colorizeChk);
 
                 try {
                     const upRes = await fetch("/v1/translate/upload", { method: "POST", body: formData });
@@ -1013,7 +1199,7 @@ async def root_ui():
                     
                     let done = false;
                     let pollCount = 0;
-                    const MAX_POLLS = 30; // ~10 min at wait=20
+                    const MAX_POLLS = 30;
                     
                     while (!done && pollCount < MAX_POLLS) {
                         pollCount++;
@@ -1044,6 +1230,11 @@ async def root_ui():
                     boxesInfo.textContent = e.stack;
                 }
             }
+
+            // Initial load
+            window.onload = () => {
+                loadModelList();
+            };
         </script>
     </body>
     </html>
@@ -1075,9 +1266,8 @@ async def get_model():
     return {"current_model": _current_ocr_model}
 
 # ===========================================================================
-# Endpoints (root-level, matching the spec you pasted)
+# Root-level endpoints
 # ===========================================================================
-
 @app.post("/reloadfont")
 async def reload_font():
     """Clear the font cache so a swapped TTF is picked up."""
@@ -1102,9 +1292,10 @@ async def meta():
         ],
         "sources": ["hayai-yolo", "paddleocr"],
         "server_ai_key": False,
-        "translation_model": Qwen_REPO_ID,
+        "translation_model": _current_qwen_repo_id,
         "ocr_backend": "switchable",
         "current_ocr_model": _current_ocr_model,
+        "colorize_enabled": _colorize_enabled,
     }
 
 @app.get("/warmup")
@@ -1142,6 +1333,7 @@ async def v1_translate(
         "created_at": time.time(),
         "_pil": pil,
         "_use_lama": req.use_lama,
+        "_colorize": req.colorize or _colorize_enabled,
         "lang": req.lang,
     }
     if _job_queue is None:
@@ -1152,20 +1344,32 @@ async def v1_translate(
 @app.post("/v1/translate/upload")
 async def v1_translate_upload(
     file: UploadFile = File(...),
-    use_lama: bool = True,
-    lang: str = DEFAULT_LANG,
+    use_lama: str = Form("true"),
+    lang: str = Form(DEFAULT_LANG),
+    colorize: str = Form("false"),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """Multipart convenience endpoint for extensions that prefer file uploads."""
+    # Robust string to boolean conversion for HTML Form data
+    use_lama_bool = use_lama.lower() in ("true", "1", "on", "yes")
+    colorize_bool = colorize.lower() in ("true", "1", "on", "yes")
+    
     raw = await file.read()
     try:
         pil = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as e:
         raise HTTPException(400, f"bad image: {e}")
+    
+    # Hard error if colorize is requested but onnxruntime isn't installed
+    if (colorize_bool or _colorize_enabled) and ort is None:
+        raise HTTPException(500, "Colorization requested but 'onnxruntime' is not installed. Run: pip install onnxruntime")
+
     job_id = idempotency_key or uuid.uuid4().hex
     _jobs[job_id] = {
         "id": job_id, "status": "queued", "created_at": time.time(),
-        "_pil": pil, "_use_lama": use_lama, "lang": lang,
+        "_pil": pil, "_use_lama": use_lama_bool,
+        "_colorize": colorize_bool or _colorize_enabled,
+        "lang": lang,
     }
     if _job_queue is None:
         raise HTTPException(503, "Server is still starting up, please try again in a moment.")
@@ -1212,12 +1416,46 @@ async def v1_translate_image(job_id: str):
         raise HTTPException(409, f"job status={job['status']}")
     return Response(content=job["image_bytes"], media_type="image/png")
 
+# ===========================================================================
+# GGUF Model Management Endpoints
+# ===========================================================================
+@app.post("/v1/changemodel")
+async def v1_change_model(req: ChangeModelRequest):
+    """Switch the active Qwen GGUF translation model."""
+    try:
+        loop = asyncio.get_running_loop()
+        # Run in executor to avoid blocking the event loop while downloading/loading
+        await loop.run_in_executor(None, switch_qwen_model, req.repo_id, req.filename)
+        return {"status": "ok", "repo_id": req.repo_id, "filename": req.filename}
+    except Exception as e:
+        logging.error(f"Failed to switch model: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, detail=str(e))
+
+@app.get("/v1/listmodels")
+async def v1_list_models():
+    """List all locally downloaded GGUF models available for translation."""
+    return {"models": list_local_gguf_models()}
+
+# ===========================================================================
+# Colorize Global Toggle Endpoint
+# ===========================================================================
+@app.post("/v1/colorize")
+async def v1_toggle_colorize(enable: bool = Query(...)):
+    """Globally enable or disable the manga colorizer for all future translations."""
+    global _colorize_enabled
+    _colorize_enabled = enable
+    logging.info(f"Global colorization toggled to: {enable}")
+    return {"status": "ok", "colorize_enabled": _colorize_enabled}
+
+# ===========================================================================
+# AI Resolve / Prompt Endpoints
+# ===========================================================================
 @app.post("/v1/ai/resolve")
 async def v1_ai_resolve(req: AIResolveRequest):
     return {
         "provider": req.provider or "qwen-gguf",
-        "model":    req.model or Qwen_REPO_ID,
-        "model_list": req.model_list or [Qwen_REPO_ID],
+        "model":    req.model or _current_qwen_repo_id,
+        "model_list": req.model_list or [_current_qwen_repo_id],
         "resolved": True,
     }
 
