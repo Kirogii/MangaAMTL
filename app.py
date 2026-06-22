@@ -77,11 +77,20 @@ except Exception:
 import re
 
 _ALLOWED_RANGES = (
-    (0x0020, 0x007E),
-    (0x00A0, 0x00FF),
-    (0x0100, 0x017F),
-    (0x0180, 0x024F),
-    (0x2000, 0x206F),
+    (0x0020, 0x007E),   # Basic Latin (English)
+    (0x00A0, 0x00FF),   # Latin-1 Supplement (Spanish)
+    (0x0100, 0x017F),   # Latin Extended-A
+    (0x0180, 0x024F),   # Latin Extended-B
+    (0x0400, 0x04FF),   # Cyrillic (Russian)
+    (0x0500, 0x052F),   # Cyrillic Supplement
+    (0x2000, 0x206F),   # General Punctuation
+    (0x3000, 0x303F),   # CJK Symbols and Punctuation
+    (0x3040, 0x309F),   # Japanese Hiragana
+    (0x30A0, 0x30FF),   # Japanese Katakana
+    (0x3400, 0x4DBF),   # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),   # CJK Unified Ideographs (Kanji/Hanja)
+    (0xAC00, 0xD7AF),   # Korean Hangul Syllables
+    (0xFF00, 0xFFEF),   # Halfwidth and Fullwidth Forms
 )
 
 _PUNCT_MAP = {
@@ -572,12 +581,13 @@ LANG_MAP = {
     "id": "Indonesian",
     "ru": "Russian",
     "es": "Spanish"
+    "cz": "Chinese"
 }
 
 SYSTEM_PROMPT = (
-    "You are a professional manga translator. Translate the user's Japanese or Korean text into natural, fluent {lang}. "
-    "If the text is already in the target language, or is a single character, or is meaningless, just return it exactly as is. "
-    "Output ONLY the translation, no notes, no romanization, no quotes."
+    "You are a manga translation engine. "
+    "Translate the user's text into {lang}. "
+    "Output ONLY the {lang} translation, with no explanations, no notes, and no quotes."
 )
 
 def get_qwen():
@@ -620,6 +630,9 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
     
     lang_name = LANG_MAP.get(target_lang, "English")
     dynamic_prompt = SYSTEM_PROMPT.format(lang=lang_name)
+    
+    # ADDED LOG: Look at your FastAPI terminal when translating to see this!
+    logging.info(f"[LLM] Translating to {lang_name}: '{text}'")
     
     llm = get_qwen()
     msgs = [
@@ -1002,16 +1015,15 @@ async def job_worker():
             pil = job["_pil"]
             use_lama = job["_use_lama"]
             colorize = job.get("_colorize", False)
-            target_lang = job.get("_target_lang", "en") # <--- ADD THIS
+            target_lang = job.get("_target_lang", "en")
             
-            # Add target_lang=target_lang to the function call
+            # Run translation pipeline with the target language
             result_img, boxes = await detect_translate_inpaint(
                 pil, 
                 use_lama=use_lama, 
                 colorize=colorize, 
                 target_lang=target_lang
             )
-            result_img, boxes = await detect_translate_inpaint(pil, use_lama=use_lama, colorize=colorize)
             buf = io.BytesIO()
             result_img.convert("RGB").save(buf, format="PNG")
             job["image_bytes"] = buf.getvalue()
@@ -1411,7 +1423,7 @@ async def v1_translate(
         "_pil": pil,
         "_use_lama": req.use_lama,
         "_colorize": req.colorize or _colorize_enabled,
-        "lang": req.lang,
+        "_target_lang": req.lang,
     }
     if _job_queue is None:
         raise HTTPException(503, "Server is still starting up, please try again in a moment.")
@@ -1434,6 +1446,8 @@ async def v1_translate_upload(
         lang = "en"
     
     raw = await file.read()
+    logging.info(f"[Upload] Received lang='{lang}', colorize={colorize_bool}")
+
     try:
         pil = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as e:
