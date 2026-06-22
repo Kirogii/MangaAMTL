@@ -5,7 +5,7 @@
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "translateAllImages") {
-      startTranslationProcess(message.ocrModel);
+      startTranslationProcess(message.ocrModel, message.targetLang);
     }
   });
 
@@ -291,13 +291,13 @@
 
   injectUI();
 
-  async function startTranslationProcess(selectedOcrModel) {
+    async function startTranslationProcess(selectedOcrModel, selectedTargetLang) {
     if (isTranslating) return;
     isTranslating = true;
     floatPopup.style.display = 'none';
 
-    // Grab URL, OCR model, and Colorize settings
-    const { serverUrl, ocrModel, colorize } = await chrome.storage.local.get(['serverUrl', 'ocrModel', 'colorize']);
+    // Grab URL, OCR model, Colorize, and Target Lang settings
+    const { serverUrl, ocrModel, colorize, targetLang } = await chrome.storage.local.get(['serverUrl', 'ocrModel', 'colorize', 'targetLang']);
     if (!serverUrl) {
       alert("Please set your FastAPI Server URL in the extension popup!");
       isTranslating = false;
@@ -305,6 +305,8 @@
     }
 
     const targetOcr = selectedOcrModel || ocrModel || 'ja';
+    const targetLanguage = selectedTargetLang || targetLang || 'en';
+    
     if (!['ja', 'ko'].includes(targetOcr)) {
       alert(`Invalid OCR model: ${targetOcr}`);
       isTranslating = false;
@@ -339,23 +341,21 @@
       spinners.push(createSpinner(img));
     });
 
-    const overlay = createProgressOverlay(images.length, targetOcr, colorize);
+    const overlay = createProgressOverlay(images.length, targetOcr, colorize, targetLanguage);
 
     let processedCount = 0;
     for (const img of images) {
       updateOverlay(overlay, processedCount, images.length, img.src);
       
-      // Add yellow border to currently working image
       img.style.outline = '4px solid yellow';
       img.style.outlineOffset = '-4px';
 
       try {
-        await processImage(img, serverUrl, colorize);
+        await processImage(img, serverUrl, colorize, targetLanguage);
       } catch (e) {
         console.error(`Failed to translate ${img.src}:`, e);
       }
 
-      // Remove yellow border and spinner when done
       img.style.outline = '';
       const spinner = spinners.shift();
       if (spinner) spinner.remove();
@@ -364,7 +364,7 @@
       updateOverlay(overlay, processedCount, images.length);
     }
 
-    overlay.innerText = `✅ Translation Complete! (OCR: ${targetOcr === 'ja' ? 'Japanese' : 'Korean'}, Colorize: ${colorize ? 'On' : 'Off'})`;
+    overlay.innerText = `✅ Translation Complete! (OCR: ${targetOcr === 'ja' ? 'Japanese' : 'Korean'}, Lang: ${targetLanguage}, Colorize: ${colorize ? 'On' : 'Off'})`;
     setTimeout(() => overlay.remove(), 3000);
     isTranslating = false;
   }
@@ -498,7 +498,7 @@
   // ========================================================================
   // PROCESSING & REPLACEMENT LOGIC
   // ========================================================================
-  async function processImage(img, serverUrl, colorize) {
+  async function processImage(img, serverUrl, colorize, targetLang) {
     const targetSrc = img.dataset.mtTargetSrc;
 
     const fetchResponse = await chrome.runtime.sendMessage({ type: "fetchImage", url: targetSrc });
@@ -508,7 +508,8 @@
       type: "submitImage",
       serverUrl: serverUrl,
       base64Data: fetchResponse.base64,
-      colorize: colorize // Pass the colorize setting to background.js
+      colorize: colorize,
+      targetLang: targetLang // Pass language to background
     });
 
     if (submitResponse.success && submitResponse.image_b64) {
@@ -537,7 +538,7 @@
   // ========================================================================
   // UI OVERLAY
   // ========================================================================
-  function createProgressOverlay(total, ocrModel, colorize) {
+  function createProgressOverlay(total, ocrModel, colorize, targetLang) {
     const overlay = document.createElement('div');
     overlay.style.cssText = `
       position: fixed;
@@ -556,7 +557,7 @@
     `;
     const label = ocrModel === 'ko' ? 'Korean (PaddleOCR)' : 'Japanese (Hayai+YOLO)';
     const colLabel = colorize ? 'On' : 'Off';
-    overlay.innerText = `Starting translation of ${total} images... [OCR: ${label}, Color: ${colLabel}]`;
+    overlay.innerText = `Starting translation of ${total} images... [OCR: ${label}, Lang: ${targetLang}, Color: ${colLabel}]`;
     document.body.appendChild(overlay);
     return overlay;
   }

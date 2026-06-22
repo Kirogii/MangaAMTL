@@ -14,7 +14,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === "submitImage") {
-    const { serverUrl, base64Data, colorize } = request;
+    const { serverUrl, base64Data, colorize, targetLang } = request;
     
     // Convert Base64 back to Blob for FormData
     const byteString = atob(base64Data.split(',')[1]);
@@ -28,7 +28,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const formData = new FormData();
     formData.append("file", blob, "manga_page.png");
     formData.append("use_lama", "true");
-    formData.append("lang", "en");
+    formData.append("lang", targetLang || "en"); // Send target language to backend
     formData.append("colorize", colorize ? "true" : "false"); // Pass colorize flag
 
     // Step 1: Upload
