@@ -22,7 +22,7 @@ ________________________________________________________________________________
 - 2: Cd inside
 `cd MangaAMTL`
 - 3: Install dependencies
-`pip install`
+`pip install -r requirements.txt`
 - 4: Run the development server
 `python app.py`
 
