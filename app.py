@@ -65,6 +65,66 @@ try:
 except Exception:
     PaddleOCR = None
 
+# --- Sanitization ----
+import re
+
+# Unicode ranges your English comic font (AnimeAce / Arial) actually supports.
+# Anything outside → drop, so PIL never draws a □.
+_ALLOWED_RANGES = (
+    (0x0020, 0x007E),   # Basic Latin (ASCII printable)
+    (0x00A0, 0x00FF),   # Latin-1 supplement (à, é, ñ, etc.)
+    (0x0100, 0x017F),   # Latin Extended-A
+    (0x0180, 0x024F),   # Latin Extended-B
+    (0x2000, 0x206F),   # General Punctuation (quotes, dashes, ellipsis)
+)
+
+# Translate common "smart" Unicode punctuation → ASCII equivalents so we
+# keep meaning instead of deleting it.
+_PUNCT_MAP = {
+    0x2018: "'", 0x2019: "'",   # ‘ ’
+    0x201C: '"', 0x201D: '"',   # “ ”
+    0x2013: '-', 0x2014: '-',   # – —
+    0x2026: '...',              # …
+    0x00A0: ' ',                # non-breaking space
+    0x2022: '*',                # •
+    0x2122: '(TM)', 0x00A9: '(c)', 0x00AE: '(R)',
+}
+
+def clean_text_for_font(text: str) -> str:
+    """Drop any character the rendering font can't display.
+
+    - Maps smart punctuation → ASCII
+    - Keeps Latin / Latin-1 / Latin Extended / general punctuation
+    - Drops CJK, Hangul, emoji, music notes, decorative glyphs, etc.
+    - Collapses runs of whitespace
+    Returns '' if nothing renderable remains (caller should then skip the box).
+    """
+    if not text:
+        return ""
+
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        # Skip control chars (keep tab/newline for safety)
+        if cp < 0x20 and ch not in '\t\n':
+            continue
+        # Smart-punctuation → ASCII
+        if cp in _PUNCT_MAP:
+            out.append(_PUNCT_MAP[cp])
+            continue
+        # Keep if inside any allowed range
+        if any(lo <= cp <= hi for lo, hi in _ALLOWED_RANGES):
+            out.append(ch)
+        # else: silently drop (CJK, Hangul, symbols, emoji, etc.)
+
+    result = ''.join(out)
+    result = re.sub(r'[ \t]+', ' ', result)
+    result = re.sub(r'\n+', ' ', result)
+    return result.strip()
+
+
+
+
 # --- Config ----------------------------------------------------------------
 ROOT_DIR = pathlib.Path(__file__).parent.resolve()
 MODEL_DIR = ROOT_DIR / "models"
@@ -324,12 +384,6 @@ def _parse_paddle_result(result) -> List[Dict[str, Any]]:
 
     return out
 
-def paddle_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
-    img_bgr = pil_to_cv2(pil_img)
-    paddle = get_paddle_ocr()
-    result = paddle.ocr(img_bgr, cls=False)
-    return _parse_paddle_result(result)
-
 # ===========================================================================
 # Qwen GGUF translator
 # ===========================================================================
@@ -363,7 +417,7 @@ def qwen_translate(text: str) -> str:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": text},
     ]
-    
+
     # Serialize LLM access to prevent concurrent CUDA deadlocks
     with _llm_lock:
         out = llm.create_chat_completion(
@@ -374,7 +428,13 @@ def qwen_translate(text: str) -> str:
             stop=["<|im_end|>", "</s>"],
         )
     try:
-        return out["choices"][0]["message"]["content"].strip()
+        raw = out["choices"][0]["message"]["content"].strip()
+        # Strip any chat-template tokens that slipped through as literal text
+        for tok in ("<|im_start|>", "<|im_end|>", "</s>", "<|endoftext|>",
+                    "<|system|>", "<|user|>", "<|assistant|>"):
+            raw = raw.replace(tok, "")
+        # Drop any character the render font can't draw
+        return clean_text_for_font(raw)
     except Exception:
         return ""
 
@@ -467,7 +527,18 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
 # Text wrapping & auto-fit (binary search)
 # ===========================================================================
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
-              max_width: int) -> List[str]:
+              max_width: int, allow_break: bool = False) -> Optional[List[str]]:
+    """Wrap text to fit within max_width.
+    
+    - Normal mode (allow_break=False): never breaks a word mid-character.
+      Returns None if a single word is wider than max_width (signals the
+      binary search to try a smaller font size).
+    - Fallback mode (allow_break=True): breaks long words by character
+      as an absolute last resort.
+    
+    Guarantees: every returned line contains at least one word (or one
+    character fragment in fallback mode).
+    """
     words = text.split()
     if not words:
         return [""]
@@ -476,33 +547,40 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont
     cur = ""
     
     for word in words:
-        while word:
-            test = (cur + " " + word) if cur else word
-            if draw.textlength(test, font=font) <= max_width:
-                cur = test
-                word = ""
-            else:
-                if cur:
-                    # Current line is full, push it and start new line with current word
-                    lines.append(cur)
-                    cur = ""
-                else:
-                    # Word itself is too long for the line, break it by characters
-                    split_idx = len(word)
-                    while split_idx > 1 and draw.textlength(word[:split_idx], font=font) > max_width:
-                        split_idx -= 1
-                    
-                    # Ensure at least 1 character is taken to prevent infinite loops
-                    if split_idx == 0:
-                        split_idx = 1
-                        
-                    part = word[:split_idx]
-                    # Add a hyphen if we broke the word and there's room for it
-                    if draw.textlength(part + "-", font=font) <= max_width:
-                        part += "-"
-                        
-                    lines.append(part)
-                    word = word[split_idx:]
+        word_width = draw.textlength(word, font=font)
+        
+        # --- Single word doesn't fit on its own line ---
+        if word_width > max_width:
+            if not allow_break:
+                # Signal: font is too big, binary search should go smaller
+                return None
+            # Last-resort character breaking
+            if cur:
+                lines.append(cur)
+                cur = ""
+            while word:
+                split_idx = len(word)
+                while split_idx > 1 and draw.textlength(word[:split_idx], font=font) > max_width:
+                    split_idx -= 1
+                if split_idx == 0:
+                    split_idx = 1
+                part = word[:split_idx]
+                if draw.textlength(part + "-", font=font) <= max_width and split_idx < len(word):
+                    part += "-"
+                lines.append(part)
+                word = word[split_idx:]
+            continue
+        
+        # --- Try to append word to current line ---
+        test = (cur + " " + word) if cur else word
+        if draw.textlength(test, font=font) <= max_width:
+            cur = test
+        else:
+            # Current line is full; push it and start a new line with this word
+            if cur:
+                lines.append(cur)
+            cur = word  # word alone fits (checked above), so this line has ≥1 word
+    
     if cur:
         lines.append(cur)
     return lines
@@ -522,25 +600,63 @@ def fit_font_and_wrap(draw: ImageDraw.ImageDraw, text: str,
                       font_path: str = str(FONT_PATH),
                       max_size: int = 96, min_size: int = 8
                       ) -> Tuple[int, List[str], List[int]]:
+    """Binary-search the largest font size where text fits in (box_w, box_h).
+    
+    Each line is guaranteed to contain at least one complete word (no mid-word
+    breaks). For tall narrow boxes, this naturally produces one word per line
+    going downward, at the largest font size that fits horizontally.
+    """
     if not text.strip():
         return min_size, [""], [0]
+    
     lo, hi = min_size, max_size
-    best_size, best_lines, best_heights = min_size, [text], [0]
+    best_size: Optional[int] = None
+    best_lines: Optional[List[str]] = None
+    best_heights: Optional[List[int]] = None
+    
     while lo <= hi:
         mid = (lo + hi) // 2
         try:
             font = ImageFont.truetype(font_path, mid)
         except Exception:
             font = ImageFont.load_default()
-        lines = wrap_text(draw, text, font, box_w - 4)
+        
+        # Try wrapping without breaking any word
+        lines = wrap_text(draw, text, font, box_w - 4, allow_break=False)
+        
+        if lines is None:
+            # A single word doesn't fit at this size → need smaller font
+            hi = mid - 1
+            continue
+        
         heights, total_h, max_w = _measure_block(draw, lines, font)
+        
         if max_w <= box_w - 4 and total_h <= box_h - 4:
+            # Fits! Try larger
             best_size, best_lines, best_heights = mid, lines, heights
             lo = mid + 1
         else:
+            # Doesn't fit (too tall) → try smaller
             hi = mid - 1
+    
+    # --- Absolute fallback: no font size produced clean word-wrapping ---
+    # Use min_size and allow character breaking as last resort
+    if best_lines is None:
+        try:
+            font = ImageFont.truetype(font_path, min_size)
+        except Exception:
+            font = ImageFont.load_default()
+        fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True)
+        best_lines = fallback_lines if fallback_lines else [text]
+        heights, _, _ = _measure_block(draw, best_lines, font)
+        best_size = min_size
+        best_heights = heights
+        logging.warning(
+            f"Text could not fit cleanly even at min_size={min_size} "
+            f"in box ({box_w}x{box_h}). Using character-break fallback."
+        )
+    
     return best_size, best_lines, best_heights
-
 def draw_text_outline(draw, pos, text, font, fill, outline, outline_width):
     x, y = pos
     for dx in range(-outline_width, outline_width + 1):
@@ -645,6 +761,9 @@ async def detect_translate_inpaint(pil_img: Image.Image,
     boxes_info: List[Dict] = []
     for c, trans in zip(cleaned, translations):
         x1,y1,x2,y2 = c["bbox"]
+        # Belt-and-suspenders: clean again in case the LLM output bypassed
+        # qwen_translate (e.g. idempotent cache, future OpenAI backend, etc.)
+        trans = clean_text_for_font(trans)
         if not trans.strip():
             boxes_info.append({"bbox": c["bbox"], "orig": c["text"], "trans": "",
                                "font_size": 0, "text_color": None, "outline_color": None})
