@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 # --- FastAPI ---------------------------------------------------------------
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Request, Form
 from fastapi.responses import JSONResponse, Response, HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # --- Optional deps ---------------------------------------------------------
 try:
@@ -175,6 +176,16 @@ logging.getLogger("uvicorn.access").addHandler(log_handler)
 
 # --- Globals ---------------------------------------------------------------
 app = FastAPI(title="Manga Translation API", version="1.0.0")
+
+# Allow the extension (chrome-extension://<id>) and any web page to call us
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=".*",        # wide-open for local dev
+    allow_credentials=False,        # must be False when using regex wildcard
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
 _simple_lama_model = None
 _global_yolo       = None
@@ -347,44 +358,85 @@ def _gguf_local_path(repo_id: str, filename: str) -> pathlib.Path:
     safe = repo_id.replace("/", "__") + "__" + filename
     return GGUF_DIR / safe
 
-def download_gguf(repo_id: str, filename: str) -> pathlib.Path:
-    """Download a GGUF model. Uses huggingface_hub if available to prevent bad downloads."""
-    # Use huggingface_hub if available (handles cache, redirects, and 404 errors safely)
+import shutil
+
+def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
+    """Download a GGUF model and mirror it into GGUF_DIR so list_local_gguf_models finds it."""
     try:
-        from huggingface_hub import hf_hub_download
-        logging.info(f"[GGUF] Ensuring {repo_id}/{filename} is downloaded via huggingface_hub...")
-        path = hf_hub_download(repo_id=repo_id, filename=filename)
-        return pathlib.Path(path)
+        from huggingface_hub import hf_hub_download, list_repo_files
     except ImportError:
-        pass
-    
-    # Fallback to direct URL download if huggingface_hub isn't installed
-    dest = _gguf_local_path(repo_id, filename)
-    if dest.exists() and dest.stat().st_size > 0:
-        return dest
-    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-    logging.info(f"[GGUF] Downloading {url} -> {dest}")
-    download_if_missing(url, dest)
-    return dest
+        raise RuntimeError("huggingface_hub not installed. Run: pip install huggingface_hub")
+
+    if not filename:
+        logging.info(f"[GGUF] No filename provided for {repo_id}, scanning repo for .gguf files...")
+        files = list_repo_files(repo_id)
+        gguf_files = [f for f in files if f.endswith('.gguf')]
+        if not gguf_files:
+            raise RuntimeError(f"No .gguf files found in repo: {repo_id}")
+        filename = next((f for f in gguf_files if "q4_k_m" in f.lower()), gguf_files[0])
+        logging.info(f"[GGUF] Auto-selected file: {filename}")
+
+    local_path = _gguf_local_path(repo_id, filename)
+
+    # Fast path: already mirrored
+    if local_path.exists() and local_path.stat().st_size > 1024:
+        return local_path
+
+    logging.info(f"[GGUF] Ensuring {repo_id}/{filename} is downloaded via huggingface_hub...")
+    try:
+        cached = pathlib.Path(hf_hub_download(repo_id=repo_id, filename=filename))
+    except Exception as e:
+        logging.error(f"Failed to download {repo_id}/{filename}: {e}")
+        raise RuntimeError(f"404 Not Found or invalid repo. Check repo_id and filename. Error: {e}")
+
+    # Mirror into GGUF_DIR so the listing endpoint can see it
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_path.exists() and local_path.stat().st_size != cached.stat().st_size:
+        local_path.unlink()
+    if not local_path.exists():
+        try:
+            # Try a hardlink first (instant, same filesystem on Linux)
+            os.link(cached, local_path)
+        except OSError:
+            shutil.copy2(cached, local_path)
+    logging.info(f"[GGUF] Model mirrored to {local_path}")
+    return local_path
 
 def list_local_gguf_models() -> List[Dict[str, Any]]:
-    models = []
+    models: List[Dict[str, Any]] = []
+    if not GGUF_DIR.exists():
+        return models
+
     for f in sorted(GGUF_DIR.glob("*.gguf")):
-        size_mb = f.stat().st_size / (1024 * 1024)
-        stem = f.stem  # repo_id__filename without .gguf
-        # Try to split back into repo_id / filename
-        # Format: {org}__{model_name}__{filename.gguf}
+        try:
+            size_mb = f.stat().st_size / (1024 * 1024)
+        except OSError:
+            continue
+        stem = f.stem  # e.g. "Manojb__Qwen_Qwen3.5-0.8B-Q4_K_M.gguf__Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
         parts = stem.split("__")
-        filename_part = parts[-1]
-        repo_part = "/".join(parts[:-1]) if len(parts) > 1 else stem
+        if len(parts) >= 2:
+            filename_part = parts[-1]
+            repo_part = "/".join(parts[:-1])
+        else:
+            filename_part = stem
+            repo_part = stem
         models.append({
             "name": stem,
             "repo_id": repo_part,
-            "filename": filename_part,
+            "filename": filename_part + ".gguf",
             "size_mb": round(size_mb, 1),
             "path": str(f),
         })
-    return models
+    # De-duplicate by (repo_id, filename)
+    seen = set()
+    unique = []
+    for m in models:
+        key = (m["repo_id"], m["filename"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(m)
+    return unique
 
 # ===========================================================================
 # Hayai OCR (Japanese) — YOLO detection + Hayai recognition
@@ -540,13 +592,13 @@ def get_qwen():
                 logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename}")
     return _global_qwen
 
-def switch_qwen_model(repo_id: str, filename: str):
+def switch_qwen_model(repo_id: str, filename: Optional[str] = None):
     """Download (if needed) and switch to a new GGUF model. Thread-safe."""
     global _global_qwen, _current_qwen_repo_id, _current_qwen_filename, _current_qwen_path
     path = download_gguf(repo_id, filename)
     with _qwen_model_lock:
         _current_qwen_repo_id = repo_id
-        _current_qwen_filename = filename
+        _current_qwen_filename = filename or path.name
         _current_qwen_path = path
         _global_qwen = None  # unload old model
     logging.info(f"[Qwen] Switched to {repo_id}/{filename}, preloading...")
@@ -978,7 +1030,7 @@ class AIResolveRequest(BaseModel):
 
 class ChangeModelRequest(BaseModel):
     repo_id: str
-    filename: str
+    filename: Optional[str] = None
 
 # ===========================================================================
 # Embedded HTML Testing UI
@@ -1036,8 +1088,8 @@ async def root_ui():
                     <select id="ggufSelect" style="min-width:350px;"></select>
                     <button onclick="loadModelList()">Refresh List</button>
                     <button onclick="changeModel()">Switch Model</button>
-                    <input type="text" id="customRepo" placeholder="repo_id (e.g. Manojb/Qwen_Qwen3.5-0.8B-Q4_K_M.gguf)" style="min-width:300px;">
-                    <input type="text" id="customFile" placeholder="filename.gguf" style="min-width:180px;">
+                    <input type="text" id="customRepo" placeholder="repo_id (e.g. hugging-quants/Llama-3.2-1B-Instruct-GGUF)" style="min-width:300px;">
+                    <input type="text" id="customFile" placeholder="filename (leave blank to auto-find)" style="min-width:220px;">
                     <button onclick="changeModelCustom()">Switch (custom)</button>
                 </div>
                 <div id="modelStatus" style="margin-top:6px; color:#666;"></div>
@@ -1133,16 +1185,16 @@ async def root_ui():
                 const repo = document.getElementById('customRepo').value.trim();
                 const file = document.getElementById('customFile').value.trim();
                 const status = document.getElementById('modelStatus');
-                if (!repo || !file) {
-                    alert("Provide both repo_id and filename.");
+                if (!repo) {
+                    alert("Provide at least the repo_id.");
                     return;
                 }
-                status.innerText = `Downloading/Switching to ${repo}/${file}...`;
+                status.innerText = `Downloading/Switching to ${repo}/${file || 'auto'}...`;
                 try {
                     const res = await fetch('/v1/changemodel', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({repo_id: repo, filename: file})
+                        body: JSON.stringify({repo_id: repo, filename: file || null})
                     });
                     const data = await res.json();
                     if (res.ok) {
@@ -1426,7 +1478,7 @@ async def v1_change_model(req: ChangeModelRequest):
         loop = asyncio.get_running_loop()
         # Run in executor to avoid blocking the event loop while downloading/loading
         await loop.run_in_executor(None, switch_qwen_model, req.repo_id, req.filename)
-        return {"status": "ok", "repo_id": req.repo_id, "filename": req.filename}
+        return {"status": "ok", "repo_id": req.repo_id, "filename": _current_qwen_filename}
     except Exception as e:
         logging.error(f"Failed to switch model: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, detail=str(e))
