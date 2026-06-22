@@ -526,6 +526,38 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
 # ===========================================================================
 # Text wrapping & auto-fit (binary search)
 # ===========================================================================
+import functools  # ← also add to your top-level imports if not present
+
+@functools.lru_cache(maxsize=256)
+def _get_font_cached(font_path: str, size: int) -> ImageFont.FreeTypeFont:
+    """Return a cached FreeTypeFont for (font_path, size).
+
+    PIL's ImageFont.truetype re-parses the TTF file on every call. During
+    binary-search auto-fit (sizes 8..96) that's ~7 disk reads per text box,
+    per image. This cache keeps one ImageFont object per (path,size) pair in
+    memory so the disk hit happens at most once per size ever used.
+
+    lru_cache is thread-safe under the GIL for lookups; a rare double-load
+    on first miss is harmless (only the winner is stored).
+    """
+    try:
+        return ImageFont.truetype(font_path, size)
+    except Exception:
+        # Don't poison the cache with the fallback default — a later
+        # successful load at the same key would be skipped. Return a fresh
+        # default each time the truetype call fails.
+        return ImageFont.load_default()
+
+
+def clear_font_cache() -> None:
+    """Drop all cached font objects (call after hot-swapping the TTF file)."""
+    _get_font_cached.cache_clear()
+
+
+def get_font(font_path, size: int) -> ImageFont.FreeTypeFont:
+    """Public accessor — accepts str or pathlib.Path, normalizes to str key."""
+    return _get_font_cached(str(font_path), size)
+
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
               max_width: int, allow_break: bool = False) -> Optional[List[str]]:
     """Wrap text to fit within max_width.
@@ -616,10 +648,7 @@ def fit_font_and_wrap(draw: ImageDraw.ImageDraw, text: str,
     
     while lo <= hi:
         mid = (lo + hi) // 2
-        try:
-            font = ImageFont.truetype(font_path, mid)
-        except Exception:
-            font = ImageFont.load_default()
+        font = get_font(font_path, mid)
         
         # Try wrapping without breaking any word
         lines = wrap_text(draw, text, font, box_w - 4, allow_break=False)
@@ -642,10 +671,8 @@ def fit_font_and_wrap(draw: ImageDraw.ImageDraw, text: str,
     # --- Absolute fallback: no font size produced clean word-wrapping ---
     # Use min_size and allow character breaking as last resort
     if best_lines is None:
-        try:
-            font = ImageFont.truetype(font_path, min_size)
-        except Exception:
-            font = ImageFont.load_default()
+        font = get_font(font_path, min_size)
+
         fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True)
         best_lines = fallback_lines if fallback_lines else [text]
         heights, _, _ = _measure_block(draw, best_lines, font)
@@ -772,10 +799,7 @@ async def detect_translate_inpaint(pil_img: Image.Image,
         text_rgb, outline_rgb = detect_text_and_bg_colors(img_bgr, (x1,y1,x2,y2))
         box_w, box_h = x2 - x1, y2 - y1
         font_size, lines, heights = fit_font_and_wrap(draw, trans, box_w, box_h, str(FONT_PATH))
-        try:
-            font = ImageFont.truetype(str(FONT_PATH), font_size)
-        except Exception:
-            font = ImageFont.load_default()
+        font = get_font(FONT_PATH, font_size)
 
         total_h = sum(heights)
         cur_y = y1 + max(0, (box_h - total_h) // 2)
@@ -1039,6 +1063,13 @@ async def get_model():
 # ===========================================================================
 # Endpoints (root-level, matching the spec you pasted)
 # ===========================================================================
+
+@app.post("/reloadfont")
+async def reload_font():
+    """Clear the font cache so a swapped TTF is picked up."""
+    clear_font_cache()
+    return {"status": "ok", "font": str(FONT_PATH), "exists": FONT_PATH.exists()}
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "ts": time.time()}
