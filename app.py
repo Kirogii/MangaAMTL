@@ -136,14 +136,31 @@ Qwen_MODEL_FILENAME = "Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
 
 INPAINT_RADIUS_CV2 = 3
 
-# Font path prioritization
+
 FONT_DIR = ROOT_DIR / "fonts"
 FONT_DIR.mkdir(parents=True, exist_ok=True)
-FONT_PATH = FONT_DIR / "animeace2_reg.ttf"
+
+FONT_PATH = FONT_DIR / "NotoCJK.ttc"
+FONT_URL = "https://github.com/Kirogii/MangaAMTL/releases/download/Packages/NotoCJK.ttc"
 
 if not FONT_PATH.exists():
-    logging.warning(f"Custom font {FONT_PATH} not found. Falling back to arial.ttf or PIL default.")
-    FONT_PATH = pathlib.Path("arial.ttf")
+    try:
+        logging.info(f"Downloading font from {FONT_URL}")
+        r = requests.get(FONT_URL, timeout=60)
+        r.raise_for_status()
+
+        with open(FONT_PATH, "wb") as f:
+            f.write(r.content)
+
+        logging.info(f"Font downloaded: {FONT_PATH}")
+
+    except Exception as e:
+        logging.warning(f"Failed to download font: {e}")
+        logging.warning("Falling back to NotoCJK.ttf or PIL default.")
+        FONT_PATH = pathlib.Path("NotoCJK.ttf")
+
+if not FONT_PATH.exists():
+    logging.warning(f"Fallback font {FONT_PATH} not found. PIL default will be used.")
 
 DEFAULT_LANG       = "en"
 BUILD_ID           = "manga-v1-2025.01"
@@ -580,7 +597,7 @@ LANG_MAP = {
     "ko": "Korean",
     "id": "Indonesian",
     "ru": "Russian",
-    "es": "Spanish"
+    "es": "Spanish",
     "cz": "Chinese"
 }
 
