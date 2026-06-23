@@ -14,3 +14,4 @@ unidic-lite
 paddleocr
 paddlepaddle
 python-multipart
+ultralytics
