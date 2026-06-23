@@ -697,6 +697,7 @@ def cv2_inpaint_fallback(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
 # ===========================================================================
 # Text color detection (per box)
 # ===========================================================================
+
 def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
                               ) -> Tuple[Tuple[int,int,int], Tuple[int,int,int]]:
     x1,y1,x2,y2 = bbox
@@ -705,39 +706,43 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
         return (0,0,0), (255,255,255)
     if region.shape[0] > 120 or region.shape[1] > 120:
         region = cv2.resize(region, (120, 120), interpolation=cv2.INTER_AREA)
+    
     pixels = region.reshape(-1, 3).astype(np.float32)
     if len(pixels) < 8:
         return (0,0,0), (255,255,255)
-    quant = (pixels / 32).astype(np.int32)
-    keys = quant[:,0] * 64 + quant[:,1] * 8 + quant[:,2]
-    counts = np.bincount(keys)
-    bg_key = int(np.argmax(counts))
-    bg_bgr = np.array([bg_key // 64, (bg_key // 8) % 8, bg_key % 8], dtype=np.float32) * 32 + 16
-    dists = np.linalg.norm(pixels - bg_bgr, axis=1)
-    thresh = max(60.0, float(np.percentile(dists, 75)))
-    text_mask = dists > thresh
-    if int(text_mask.sum()) < 5:
-        bg_lum = float(bg_bgr.mean())
-        ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
-    else:
-        text_pixels = pixels[text_mask]
-        text_dists = np.linalg.norm(text_pixels - bg_bgr, axis=1)
-        ext_t = float(np.percentile(text_dists, 70))
-        ext_mask = text_dists >= ext_t
-        if int(ext_mask.sum()) >= 3:
-            ink_bgr = np.median(text_pixels[ext_mask], axis=0)
-        else:
-            ink_bgr = np.median(text_pixels, axis=0)
+
+    # Use K-means clustering to find the two dominant colors (background and text)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    K = 2
+    _, labels, centers = cv2.kmeans(pixels, K, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+
+    # The background is the most frequent cluster
+    bg_idx = np.argmax(np.bincount(labels.flatten()))
+    ink_idx = 1 - bg_idx
+
+    bg_bgr = centers[bg_idx]
+    ink_bgr = centers[ink_idx]
+
+    # Calculate luminance to fix gray-on-black or low contrast issues
+    bg_lum = 0.299 * bg_bgr[2] + 0.587 * bg_bgr[1] + 0.114 * bg_bgr[0]
+    ink_lum = 0.299 * ink_bgr[2] + 0.587 * ink_bgr[1] + 0.114 * ink_bgr[0]
+
     def snap(c):
         c = np.asarray(c, dtype=np.float32)
         if np.all(c < 40):  return np.array([0,0,0], dtype=np.float32)
         if np.all(c > 215): return np.array([255,255,255], dtype=np.float32)
         return c
+
+    bg_bgr = snap(bg_bgr)
     ink_bgr = snap(ink_bgr)
-    bg_bgr  = snap(bg_bgr)
-    if float(np.linalg.norm(ink_bgr - bg_bgr)) < 80:
-        bg_lum = float(bg_bgr.mean())
-        ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
+
+    # If the contrast is too low (e.g. gray text on black), force pure black or white ink
+    if abs(bg_lum - ink_lum) < 60:
+        if bg_lum > 127:
+            ink_bgr = np.array([0,0,0], dtype=np.float32)
+        else:
+            ink_bgr = np.array([255,255,255], dtype=np.float32)
+
     text_rgb    = (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0]))
     outline_rgb = (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
     return text_rgb, outline_rgb
@@ -760,7 +765,12 @@ def clear_font_cache() -> None:
 def get_font(font_path, size: int) -> ImageFont.FreeTypeFont:
     return _get_font_cached(str(font_path), size)
 
-def wrap_text(draw, text, font, max_width, allow_break=False):
+def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False):
+    if is_vertical:
+        # For vertical text, we don't split by spaces. Return as a single block.
+        # fit_font_and_wrap will handle splitting it into columns based on height.
+        return [text] if text else [""]
+
     words = text.split()
     if not words:
         return [""]
@@ -808,12 +818,107 @@ def _measure_block(draw, lines, font):
     return heights, total_h, max_w
 
 def fit_font_and_wrap(draw, text, box_w, box_h,
-                      font_path=str(FONT_PATH), max_size=96, min_size=8):
+                      font_path=str(FONT_PATH), max_size=96, min_size=8, is_vertical=False):
     if not text.strip():
         return min_size, [""], [0]
+    
     if not hasattr(fit_font_and_wrap, '_cache'):
         fit_font_and_wrap._cache = {}
     cache = fit_font_and_wrap._cache
+
+    # --- Vertical Text Layout ---
+    if is_vertical:
+        lo, hi = min_size, max_size
+        best_size, best_cols, best_col_widths = None, None, None
+
+        # Remove spaces for vertical CJK to avoid awkward gaps
+        clean_v_text = text.replace(" ", "").replace("\n", "")
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            key = (font_path, mid)
+            if key not in cache:
+                try:
+                    cache[key] = ImageFont.truetype(font_path, mid)
+                except Exception:
+                    cache[key] = ImageFont.load_default()
+            font = cache[key]
+
+            cols = []
+            cur_col = ""
+            cur_h = 0
+            
+            # Approximate character height
+            bb = draw.textbbox((0,0), "字", font=font) # Use CJK char for height reference
+            char_h = (bb[3] - bb[1]) * 1.2
+            if char_h == 0:
+                char_h = mid
+
+            for ch in clean_v_text:
+                if cur_h + char_h > box_h and cur_col:
+                    cols.append(cur_col)
+                    cur_col = ch
+                    cur_h = char_h
+                else:
+                    cur_col += ch
+                    cur_h += char_h
+            if cur_col:
+                cols.append(cur_col)
+
+            if not cols:
+                cols = [clean_v_text]
+
+            # Estimate total width: cols * char width
+            max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else mid
+            col_w = max(max_char_w, mid * 0.8)
+            total_w = len(cols) * col_w
+
+            if total_w <= box_w - 4:
+                best_size = mid
+                best_cols = cols
+                best_col_widths = [col_w] * len(cols)
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if best_cols is None:
+            # Fallback to min_size
+            key = (font_path, min_size)
+            if key not in cache:
+                try:
+                    cache[key] = ImageFont.truetype(font_path, min_size)
+                except Exception:
+                    cache[key] = ImageFont.load_default()
+            font = cache[key]
+
+            bb = draw.textbbox((0,0), "字", font=font)
+            char_h = (bb[3] - bb[1]) * 1.2
+            if char_h == 0:
+                char_h = min_size
+
+            cols = []
+            cur_col = ""
+            cur_h = 0
+            for ch in clean_v_text:
+                if cur_h + char_h > box_h and cur_col:
+                    cols.append(cur_col)
+                    cur_col = ch
+                    cur_h = char_h
+                else:
+                    cur_col += ch
+                    cur_h += char_h
+            if cur_col:
+                cols.append(cur_col)
+
+            best_cols = cols if cols else [text]
+            max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else min_size
+            best_col_widths = [max_char_w] * len(best_cols)
+            best_size = min_size
+            logging.warning(f"Vertical text could not fit cleanly even at min_size={min_size} in box ({box_w}x{box_h}).")
+
+        return best_size, best_cols, best_col_widths
+
+    # --- Horizontal Text Layout (Existing Logic) ---
     lo, hi = min_size, max_size
     best_size = None
     best_lines = None
@@ -827,7 +932,7 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-        lines = wrap_text(draw, text, font, box_w - 4, allow_break=False)
+        lines = wrap_text(draw, text, font, box_w - 4, allow_break=False, is_vertical=False)
         if lines is None:
             hi = mid - 1
             continue
@@ -845,7 +950,7 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-        fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True)
+        fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True, is_vertical=False)
         best_lines = fallback_lines if fallback_lines else [text]
         heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
@@ -868,6 +973,9 @@ async def detect_translate_inpaint(pil_img: Image.Image,
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
     loop = asyncio.get_running_loop()
+
+    # Determine if the target language requires vertical rendering
+    is_vertical = target_lang in ("ja", "ko", "cz")
 
     # --- OCR ---
     with _ocr_model_lock:
@@ -982,7 +1090,9 @@ async def detect_translate_inpaint(pil_img: Image.Image,
 
         text_rgb, outline_rgb = detect_text_and_bg_colors(inpainted, (x1,y1,x2,y2))
         box_w, box_h = x2 - x1, y2 - y1
-        font_size, lines, heights = fit_font_and_wrap(draw, trans, box_w, box_h, str(FONT_PATH))
+        
+        font_size, lines, heights = fit_font_and_wrap(draw, trans, box_w, box_h, str(FONT_PATH), is_vertical=is_vertical)
+        
         key = (str(FONT_PATH), font_size)
         if key not in cache:
             try:
@@ -990,15 +1100,50 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-        total_h = sum(heights)
-        cur_y = y1 + max(0, (box_h - total_h) // 2)
+        
         outline_w = max(1, int(font_size * 0.08))
-        for ln, hln in zip(lines, heights):
-            tw = draw.textlength(ln, font=font)
-            pos_x = x1 + max(0, int((box_w - tw) // 2))
-            draw_text_outline(draw, (pos_x, cur_y), ln, font,
-                              fill=text_rgb, outline=outline_rgb, outline_width=outline_w)
-            cur_y += hln
+
+        if is_vertical:
+            # lines represent columns, heights represent column widths
+            col_widths = heights
+            total_w = sum(col_widths)
+            # Start from the right edge of the text bounding box, going left
+            cur_x_right = x2 - max(0, (box_w - total_w) // 2)
+
+            for col, col_w in zip(lines, col_widths):
+                # Measure actual column height to center it vertically inside box_h
+                col_total_h = 0
+                char_heights = []
+                for ch in col:
+                    bb_ch = draw.textbbox((0,0), ch, font=font)
+                    ch_h = (bb_ch[3] - bb_ch[1]) * 1.2
+                    if ch_h == 0: ch_h = font_size
+                    char_heights.append(ch_h)
+                    col_total_h += ch_h
+
+                cur_y = y1 + max(0, (box_h - col_total_h) // 2)
+                cur_x_left = cur_x_right - col_w
+
+                for ch, ch_h in zip(col, char_heights):
+                    bb_ch = draw.textbbox((0,0), ch, font=font)
+                    ch_w = bb_ch[2] - bb_ch[0]
+                    # Center character horizontally within its column
+                    pos_x = cur_x_left + max(0, (col_w - ch_w) / 2)
+                    draw_text_outline(draw, (pos_x, cur_y), ch, font,
+                                      fill=text_rgb, outline=outline_rgb, outline_width=outline_w)
+                    cur_y += ch_h
+                cur_x_right = cur_x_left # Move left for the next column
+        else:
+            # Horizontal Text Rendering (Existing logic)
+            total_h = sum(heights)
+            cur_y = y1 + max(0, (box_h - total_h) // 2)
+            for ln, hln in zip(lines, heights):
+                tw = draw.textlength(ln, font=font)
+                pos_x = x1 + max(0, int((box_w - tw) // 2))
+                draw_text_outline(draw, (pos_x, cur_y), ln, font,
+                                  fill=text_rgb, outline=outline_rgb, outline_width=outline_w)
+                cur_y += hln
+
         boxes_info.append({
             "bbox": c["bbox"], "orig": c["text"], "trans": trans,
             "font_size": font_size, "text_color": text_rgb, "outline_color": outline_rgb,
