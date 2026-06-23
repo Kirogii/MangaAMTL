@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import bisect
 import io
 import os
 import pathlib
@@ -28,6 +29,7 @@ import urllib.request
 import uuid
 import logging
 import threading
+import functools
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
@@ -93,6 +95,9 @@ _ALLOWED_RANGES = (
     (0xFF00, 0xFFEF),   # Halfwidth and Fullwidth Forms
 )
 
+_ALLOWED_LOWS  = tuple(r[0] for r in _ALLOWED_RANGES)
+_ALLOWED_HIGHS = tuple(r[1] for r in _ALLOWED_RANGES)
+
 _PUNCT_MAP = {
     0x2018: "'", 0x2019: "'",
     0x201C: '"', 0x201D: '"',
@@ -103,25 +108,28 @@ _PUNCT_MAP = {
     0x2122: '(TM)', 0x00A9: '(c)', 0x00AE: '(R)',
 }
 
+def _is_allowed_cp(cp: int) -> bool:
+    idx = bisect.bisect_right(_ALLOWED_LOWS, cp) - 1
+    return idx >= 0 and cp <= _ALLOWED_HIGHS[idx]
+
 def clean_text_for_font(text: str) -> str:
     if not text:
         return ""
     if not hasattr(clean_text_for_font, '_trans_table'):
-        table = {chr(cp): rep for cp, rep in _PUNCT_MAP.items()}
-        drop_chars = set()
-        for cp in range(0x110000):
-            if cp < 0x20 and chr(cp) not in '\t\n':
-                drop_chars.add(chr(cp))
-                continue
-            if not any(lo <= cp <= hi for lo, hi in _ALLOWED_RANGES):
-                drop_chars.add(chr(cp))
-        for ch in drop_chars:
-            table[ch] = None
-        clean_text_for_font._trans_table = str.maketrans(table)
-    result = text.translate(clean_text_for_font._trans_table)
-    result = re.sub(r'[ \t]+', ' ', result)
-    result = re.sub(r'\n+', ' ', result)
-    return result.strip()
+        clean_text_for_font._punct_table = str.maketrans(
+            {chr(cp): rep for cp, rep in _PUNCT_MAP.items()}
+        )
+        clean_text_for_font._re_space = re.compile(r'[ \t]+')
+        clean_text_for_font._re_nl   = re.compile(r'\n+')
+    
+    out = text.translate(clean_text_for_font._punct_table)
+    out = ''.join(
+        ch for ch in out
+        if (ch in '\t\n') or (0x20 <= ord(ch) and _is_allowed_cp(ord(ch)))
+    )
+    out = clean_text_for_font._re_space.sub(' ', out)
+    out = clean_text_for_font._re_nl.sub(' ', out)
+    return out.strip()
 
 
 # --- Config ----------------------------------------------------------------
@@ -136,7 +144,6 @@ Qwen_MODEL_FILENAME = "Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
 
 INPAINT_RADIUS_CV2 = 3
 
-
 FONT_DIR = ROOT_DIR / "fonts"
 FONT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -146,14 +153,8 @@ FONT_URL = "https://github.com/Kirogii/MangaAMTL/releases/download/Packages/Noto
 if not FONT_PATH.exists():
     try:
         logging.info(f"Downloading font from {FONT_URL}")
-        r = requests.get(FONT_URL, timeout=60)
-        r.raise_for_status()
-
-        with open(FONT_PATH, "wb") as f:
-            f.write(r.content)
-
+        urllib.request.urlretrieve(FONT_URL, FONT_PATH)
         logging.info(f"Font downloaded: {FONT_PATH}")
-
     except Exception as e:
         logging.warning(f"Failed to download font: {e}")
         logging.warning("Falling back to NotoCJK.ttf or PIL default.")
@@ -203,11 +204,10 @@ logging.getLogger("uvicorn.access").addHandler(log_handler)
 # --- Globals ---------------------------------------------------------------
 app = FastAPI(title="Manga Translation API", version="1.0.0")
 
-# Allow the extension (chrome-extension://<id>) and any web page to call us
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",        # wide-open for local dev
-    allow_credentials=False,        # must be False when using regex wildcard
+    allow_origin_regex=".*",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -219,29 +219,24 @@ _global_qwen       = None
 _hayai_ocr_model   = None
 _paddle_ocr_model  = None
 
-# Current OCR model: "ja" (Hayai + YOLO) or "ko" (PaddleOCR)
 _current_ocr_model = "ja"
 _ocr_model_lock = threading.Lock()
 
-# Colorizer globals
 _colorizer_session = None
 _colorizer_sam_session = None
 _colorizer_lock = threading.Lock()
-_colorize_enabled = False  # global default toggle
+_colorize_enabled = False
 
-# Qwen model-switching globals
 _current_qwen_repo_id = Qwen_REPO_ID
 _current_qwen_filename = Qwen_MODEL_FILENAME
 _current_qwen_path: Optional[pathlib.Path] = None
 _qwen_model_lock = threading.Lock()
 
-# Job queue
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_lock = asyncio.Lock()
 _job_queue: Optional[asyncio.Queue] = None
 _worker_task = None
 
-# LLM Concurrency Control
 _llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
 _llm_lock = threading.Lock()
 
@@ -264,10 +259,11 @@ def ensure_yolo():
     return YOLO_MODEL_PATH
 
 # ===========================================================================
-# Image utils
+# Image utils (Optimized: no-copy conversion)
 # ===========================================================================
 def pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    arr = np.asarray(pil_img.convert("RGB"))
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 def cv2_to_pil(cv2_img: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB))
@@ -276,10 +272,8 @@ def cv2_to_pil(cv2_img: np.ndarray) -> Image.Image:
 # Colorizer (ONNX) — Manga Light Colorizer v6
 # ===========================================================================
 def ensure_colorizer_models():
-    """Download colorizer ONNX models if missing or corrupt."""
     import shutil
     
-    # Download Generator
     if not COLORIZER_GENERATOR_PATH.exists() or COLORIZER_GENERATOR_PATH.stat().st_size < 10000:
         logging.info(f"[Colorizer] Downloading generator via HuggingFace...")
         try:
@@ -289,7 +283,6 @@ def ensure_colorizer_models():
         except ImportError:
             download_if_missing(COLORIZER_GENERATOR_URL, COLORIZER_GENERATOR_PATH)
             
-    # Download SAM Encoder
     if not COLORIZER_SAM_PATH.exists() or COLORIZER_SAM_PATH.stat().st_size < 10000:
         logging.info(f"[Colorizer] Downloading SAM encoder via HuggingFace...")
         try:
@@ -300,7 +293,6 @@ def ensure_colorizer_models():
             download_if_missing(COLORIZER_SAM_URL, COLORIZER_SAM_PATH)
 
 def get_colorizer_sessions():
-    """Lazily load and cache the colorizer ONNX sessions."""
     global _colorizer_session, _colorizer_sam_session
     if ort is None:
         raise RuntimeError("onnxruntime not installed: pip install onnxruntime")
@@ -323,11 +315,9 @@ def get_colorizer_sessions():
     return _colorizer_session, _colorizer_sam_session
 
 def _denormalize_rgb(rgb_norm: np.ndarray) -> np.ndarray:
-    """[-1, 1] -> [0, 255] uint8."""
     return np.clip((rgb_norm + 1.0) * 127.5, 0, 255).astype(np.uint8)
 
 def _extract_sam_features_onnx(sam_session, L_bw_norm: np.ndarray):
-    """Extract SAM features via ONNX. WD14 disabled (zeros)."""
     L_01 = (L_bw_norm + 1.0) / 2.0
     L_1024 = cv2.resize(L_01, (1024, 1024), interpolation=cv2.INTER_LINEAR)
     rgb_sam = np.stack([L_1024, L_1024, L_1024], axis=0)[np.newaxis].astype(np.float32)
@@ -338,7 +328,6 @@ def _extract_sam_features_onnx(sam_session, L_bw_norm: np.ndarray):
     return sam_level0, sam_level1, wd14_embedding
 
 def _colorize_onnx(session, L_bw, sam_level0, sam_level1, wd14_embedding) -> np.ndarray:
-    """Run generator ONNX. Returns RGB (H, W, 3) in [0, 255]."""
     L_norm = (L_bw.astype(np.float32) / 127.5) - 1.0
     L_tensor = L_norm[np.newaxis, np.newaxis, :, :]
     ort_inputs = {
@@ -353,12 +342,6 @@ def _colorize_onnx(session, L_bw, sam_level0, sam_level1, wd14_embedding) -> np.
 
 def colorize_pil(pil_img: Image.Image,
                  infer_size: int = COLORIZER_DEFAULT_INFER_SIZE) -> Image.Image:
-    """
-    Colorize a manga image using local ONNX models.
-    Input is converted to grayscale, colorized at infer_size, then resized
-    back to the original resolution.
-    Returns an RGB PIL Image.
-    """
     session, sam_session = get_colorizer_sessions()
     gray = np.array(pil_img.convert("L"))
     orig_H, orig_W = gray.shape
@@ -374,11 +357,11 @@ def colorize_pil(pil_img: Image.Image,
         wd14_embedding = np.zeros((1, 1024), dtype=np.float32)
 
     rgb_output = _colorize_onnx(session, L_bw, sam_level0, sam_level1, wd14_embedding)
-    rgb_output = cv2.resize(rgb_output, (orig_W, orig_H), interpolation=cv2.INTER_LANCZOS4)
+    rgb_output = cv2.resize(rgb_output, (orig_W, orig_H), interpolation=cv2.INTER_CUBIC)
     return Image.fromarray(rgb_output)
 
 # ===========================================================================
-# GGUF model management (download / list / switch)
+# GGUF model management
 # ===========================================================================
 def _gguf_local_path(repo_id: str, filename: str) -> pathlib.Path:
     safe = repo_id.replace("/", "__") + "__" + filename
@@ -387,7 +370,6 @@ def _gguf_local_path(repo_id: str, filename: str) -> pathlib.Path:
 import shutil
 
 def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
-    """Download a GGUF model and mirror it into GGUF_DIR so list_local_gguf_models finds it."""
     try:
         from huggingface_hub import hf_hub_download, list_repo_files
     except ImportError:
@@ -404,7 +386,6 @@ def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
 
     local_path = _gguf_local_path(repo_id, filename)
 
-    # Fast path: already mirrored
     if local_path.exists() and local_path.stat().st_size > 1024:
         return local_path
 
@@ -415,13 +396,11 @@ def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
         logging.error(f"Failed to download {repo_id}/{filename}: {e}")
         raise RuntimeError(f"404 Not Found or invalid repo. Check repo_id and filename. Error: {e}")
 
-    # Mirror into GGUF_DIR so the listing endpoint can see it
     local_path.parent.mkdir(parents=True, exist_ok=True)
     if local_path.exists() and local_path.stat().st_size != cached.stat().st_size:
         local_path.unlink()
     if not local_path.exists():
         try:
-            # Try a hardlink first (instant, same filesystem on Linux)
             os.link(cached, local_path)
         except OSError:
             shutil.copy2(cached, local_path)
@@ -438,7 +417,7 @@ def list_local_gguf_models() -> List[Dict[str, Any]]:
             size_mb = f.stat().st_size / (1024 * 1024)
         except OSError:
             continue
-        stem = f.stem  # e.g. "Manojb__Qwen_Qwen3.5-0.8B-Q4_K_M.gguf__Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
+        stem = f.stem
         parts = stem.split("__")
         if len(parts) >= 2:
             filename_part = parts[-1]
@@ -453,7 +432,6 @@ def list_local_gguf_models() -> List[Dict[str, Any]]:
             "size_mb": round(size_mb, 1),
             "path": str(f),
         })
-    # De-duplicate by (repo_id, filename)
     seen = set()
     unique = []
     for m in models:
@@ -465,8 +443,10 @@ def list_local_gguf_models() -> List[Dict[str, Any]]:
     return unique
 
 # ===========================================================================
-# Hayai OCR (Japanese) — YOLO detection + Hayai recognition
+# Hayai OCR (Japanese) — Optimized with Parallel Box OCR
 # ===========================================================================
+_OCR_BOX_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ocr-box")
+
 def get_hayai_ocr():
     global _hayai_ocr_model
     if _hayai_ocr_model is None:
@@ -498,6 +478,7 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     img_area = h * w
     mocr = get_hayai_ocr()
 
+    boxes = []
     for b in r.boxes:
         xy = b.xyxy[0].cpu().numpy()
         x1, y1 = max(0, int(xy[0])), max(0, int(xy[1]))
@@ -506,15 +487,22 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
         box_area = (x2 - x1) * (y2 - y1)
         if box_area > 0.8 * img_area or box_area < 100:
             continue
+        boxes.append((x1, y1, x2, y2))
+    
+    if not boxes:
+        return []
 
+    def _ocr_one(bbox):
+        x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
         try:
-            text = mocr(crop).strip()
+            return bbox, mocr(crop).strip()
         except Exception as e:
-            logging.error(f"Hayai OCR failed on box ({x1},{y1},{x2},{y2}): {e}")
-            text = ""
+            logging.error(f"Hayai OCR failed on {bbox}: {e}")
+            return bbox, ""
 
-        out.append({"text": text, "bbox": (x1, y1, x2, y2)})
+    for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
+        out.append({"text": text, "bbox": bbox})
     return out
 
 # ===========================================================================
@@ -588,9 +576,8 @@ def _parse_paddle_result(result) -> List[Dict[str, Any]]:
     return out
 
 # ===========================================================================
-# Qwen GGUF translator (switchable)
+# Qwen GGUF translator (Optimized max_tokens & stops)
 # ===========================================================================
-# --- Language Map ---
 LANG_MAP = {
     "en": "English",
     "ja": "Japanese",
@@ -630,43 +617,40 @@ def get_qwen():
     return _global_qwen
 
 def switch_qwen_model(repo_id: str, filename: Optional[str] = None):
-    """Download (if needed) and switch to a new GGUF model. Thread-safe."""
     global _global_qwen, _current_qwen_repo_id, _current_qwen_filename, _current_qwen_path
     path = download_gguf(repo_id, filename)
     with _qwen_model_lock:
         _current_qwen_repo_id = repo_id
         _current_qwen_filename = filename or path.name
         _current_qwen_path = path
-        _global_qwen = None  # unload old model
+        _global_qwen = None
     logging.info(f"[Qwen] Switched to {repo_id}/{filename}, preloading...")
-    get_qwen()  # preload in this thread
+    get_qwen()
 
 def qwen_translate(text: str, target_lang: str = "en") -> str:
-    if not text.strip():
+    text = text.strip()
+    if not text:
         return ""
     
     lang_name = LANG_MAP.get(target_lang, "English")
-    dynamic_prompt = SYSTEM_PROMPT.format(lang=lang_name)
-    
-    # ADDED LOG: Look at your FastAPI terminal when translating to see this!
-    logging.info(f"[LLM] Translating to {lang_name}: '{text}'")
+    max_tok = max(16, min(96, len(text) + 16))
     
     llm = get_qwen()
     msgs = [
-        {"role": "system", "content": dynamic_prompt},
+        {"role": "system", "content": SYSTEM_PROMPT.format(lang=lang_name)},
         {"role": "user",   "content": text},
     ]
     with _llm_lock:
         out = llm.create_chat_completion(
             messages=msgs,
-            max_tokens=128,
+            max_tokens=max_tok,
             temperature=0.2,
             top_p=0.9,
             stop=["<|im_end|>", "</s>"],
         )
     try:
         raw = out["choices"][0]["message"]["content"].strip()
-        for tok in ("<|im_start|>", "<|im_end|>", "</s>", "¥", "×"):
+        for tok in ("<|im_start|>", "<|im_end|>", "</s>"):
             if tok in raw:
                 raw = raw.replace(tok, "")
         return clean_text_for_font(raw)
@@ -695,63 +679,54 @@ def cv2_inpaint_fallback(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return cv2.inpaint(img_bgr, mask, INPAINT_RADIUS_CV2, cv2.INPAINT_TELEA)
 
 # ===========================================================================
-# Text color detection (per box)
+# Text color detection (Optimized: Median + Threshold vs K-means)
 # ===========================================================================
-
 def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
                               ) -> Tuple[Tuple[int,int,int], Tuple[int,int,int]]:
-    x1,y1,x2,y2 = bbox
-    region = img_bgr[max(0,y1):y2, max(0,x1):x2]
+    x1, y1, x2, y2 = bbox
+    region = img_bgr[max(0, y1):y2, max(0, x1):x2]
     if region.size == 0:
-        return (0,0,0), (255,255,255)
-    if region.shape[0] > 120 or region.shape[1] > 120:
-        region = cv2.resize(region, (120, 120), interpolation=cv2.INTER_AREA)
-    
-    pixels = region.reshape(-1, 3).astype(np.float32)
-    if len(pixels) < 8:
-        return (0,0,0), (255,255,255)
+        return (0, 0, 0), (255, 255, 255)
 
-    # Use K-means clustering to find the two dominant colors (background and text)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    K = 2
-    _, labels, centers = cv2.kmeans(pixels, K, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    h_r, w_r = region.shape[:2]
+    if h_r > 80 or w_r > 80:
+        scale = 80.0 / max(h_r, w_r)
+        region = cv2.resize(region, (max(1, int(w_r * scale)), max(1, int(h_r * scale))),
+                            interpolation=cv2.INTER_AREA)
 
-    # The background is the most frequent cluster
-    bg_idx = np.argmax(np.bincount(labels.flatten()))
-    ink_idx = 1 - bg_idx
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    bg_val = int(np.median(gray))
 
-    bg_bgr = centers[bg_idx]
-    ink_bgr = centers[ink_idx]
+    diff = np.abs(gray.astype(np.int16) - bg_val)
+    ink_mask = diff > 60
+    flat = region.reshape(-1, 3).astype(np.float32)
+    ink_flat = ink_mask.reshape(-1)
 
-    # Calculate luminance to fix gray-on-black or low contrast issues
-    bg_lum = 0.299 * bg_bgr[2] + 0.587 * bg_bgr[1] + 0.114 * bg_bgr[0]
-    ink_lum = 0.299 * ink_bgr[2] + 0.587 * ink_bgr[1] + 0.114 * ink_bgr[0]
+    if ink_flat.sum() >= 4:
+        ink_bgr = flat[ink_flat].mean(axis=0)
+        bg_bgr  = flat[~ink_flat].mean(axis=0)
+    else:
+        bg_bgr = flat.mean(axis=0)
+        ink_bgr = np.array([0, 0, 0] if bg_val > 127 else [255, 255, 255], dtype=np.float32)
 
     def snap(c):
         c = np.asarray(c, dtype=np.float32)
-        if np.all(c < 40):  return np.array([0,0,0], dtype=np.float32)
-        if np.all(c > 215): return np.array([255,255,255], dtype=np.float32)
+        if np.all(c < 40):  return np.array([0, 0, 0], dtype=np.float32)
+        if np.all(c > 215): return np.array([255, 255, 255], dtype=np.float32)
         return c
 
-    bg_bgr = snap(bg_bgr)
-    ink_bgr = snap(ink_bgr)
-
-    # If the contrast is too low (e.g. gray text on black), force pure black or white ink
+    bg_bgr, ink_bgr = snap(bg_bgr), snap(ink_bgr)
+    bg_lum  = 0.299 * bg_bgr[2]  + 0.587 * bg_bgr[1]  + 0.114 * bg_bgr[0]
+    ink_lum = 0.299 * ink_bgr[2] + 0.587 * ink_bgr[1] + 0.114 * ink_bgr[0]
     if abs(bg_lum - ink_lum) < 60:
-        if bg_lum > 127:
-            ink_bgr = np.array([0,0,0], dtype=np.float32)
-        else:
-            ink_bgr = np.array([255,255,255], dtype=np.float32)
+        ink_bgr = np.array([0, 0, 0] if bg_lum > 127 else [255, 255, 255], dtype=np.float32)
 
-    text_rgb    = (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0]))
-    outline_rgb = (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
-    return text_rgb, outline_rgb
+    return (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0])), \
+           (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
 
 # ===========================================================================
-# Text wrapping & auto-fit (binary search)
+# Text wrapping & auto-fit (Optimized: Precomputed word widths)
 # ===========================================================================
-import functools
-
 @functools.lru_cache(maxsize=256)
 def _get_font_cached(font_path: str, size: int) -> ImageFont.FreeTypeFont:
     try:
@@ -767,10 +742,7 @@ def get_font(font_path, size: int) -> ImageFont.FreeTypeFont:
 
 def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False):
     if is_vertical:
-        # For vertical text, we don't split by spaces. Return as a single block.
-        # fit_font_and_wrap will handle splitting it into columns based on height.
         return [text] if text else [""]
-
     words = text.split()
     if not words:
         return [""]
@@ -808,11 +780,22 @@ def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False)
     return lines
 
 def _measure_block(draw, lines, font):
-    heights, total_h, max_w = [], 0, 0
+    # Use fixed font metrics for line height to prevent glyph overlap.
+    # PIL's textbbox varies per line depending on ascenders/descenders, 
+    # which causes clipping when lines are stacked.
+    try:
+        ascent, descent = font.getmetrics()
+        line_h = int(ascent + descent)
+    except Exception:
+        line_h = int(font.size * 1.2)
+    
+    # Add a tiny bit of breathing room just in case the font has tight internal leading
+    line_h = max(line_h, int(font.size * 1.1))
+    
+    heights = [line_h] * len(lines)
+    total_h = line_h * len(lines)
+    max_w = 0.0
     for ln in lines:
-        bb = draw.textbbox((0,0), ln, font=font)
-        h = bb[3] - bb[1]
-        heights.append(h); total_h += h
         w = draw.textlength(ln, font=font)
         if w > max_w: max_w = w
     return heights, total_h, max_w
@@ -826,33 +809,26 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
         fit_font_and_wrap._cache = {}
     cache = fit_font_and_wrap._cache
 
-    # --- Vertical Text Layout ---
     if is_vertical:
         lo, hi = min_size, max_size
         best_size, best_cols, best_col_widths = None, None, None
-
-        # Remove spaces for vertical CJK to avoid awkward gaps
         clean_v_text = text.replace(" ", "").replace("\n", "")
 
         while lo <= hi:
             mid = (lo + hi) // 2
             key = (font_path, mid)
             if key not in cache:
-                try:
-                    cache[key] = ImageFont.truetype(font_path, mid)
-                except Exception:
-                    cache[key] = ImageFont.load_default()
+                try: cache[key] = ImageFont.truetype(font_path, mid)
+                except Exception: cache[key] = ImageFont.load_default()
             font = cache[key]
 
             cols = []
             cur_col = ""
             cur_h = 0
             
-            # Approximate character height
-            bb = draw.textbbox((0,0), "字", font=font) # Use CJK char for height reference
+            bb = draw.textbbox((0,0), "字", font=font)
             char_h = (bb[3] - bb[1]) * 1.2
-            if char_h == 0:
-                char_h = mid
+            if char_h == 0: char_h = mid
 
             for ch in clean_v_text:
                 if cur_h + char_h > box_h and cur_col:
@@ -862,13 +838,10 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 else:
                     cur_col += ch
                     cur_h += char_h
-            if cur_col:
-                cols.append(cur_col)
+            if cur_col: cols.append(cur_col)
 
-            if not cols:
-                cols = [clean_v_text]
+            if not cols: cols = [clean_v_text]
 
-            # Estimate total width: cols * char width
             max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else mid
             col_w = max(max_char_w, mid * 0.8)
             total_w = len(cols) * col_w
@@ -882,19 +855,15 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 hi = mid - 1
 
         if best_cols is None:
-            # Fallback to min_size
             key = (font_path, min_size)
             if key not in cache:
-                try:
-                    cache[key] = ImageFont.truetype(font_path, min_size)
-                except Exception:
-                    cache[key] = ImageFont.load_default()
+                try: cache[key] = ImageFont.truetype(font_path, min_size)
+                except Exception: cache[key] = ImageFont.load_default()
             font = cache[key]
 
             bb = draw.textbbox((0,0), "字", font=font)
             char_h = (bb[3] - bb[1]) * 1.2
-            if char_h == 0:
-                char_h = min_size
+            if char_h == 0: char_h = min_size
 
             cols = []
             cur_col = ""
@@ -907,8 +876,7 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 else:
                     cur_col += ch
                     cur_h += char_h
-            if cur_col:
-                cols.append(cur_col)
+            if cur_col: cols.append(cur_col)
 
             best_cols = cols if cols else [text]
             max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else min_size
@@ -918,7 +886,6 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
 
         return best_size, best_cols, best_col_widths
 
-    # --- Horizontal Text Layout (Existing Logic) ---
     lo, hi = min_size, max_size
     best_size = None
     best_lines = None
@@ -927,10 +894,8 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
         mid = (lo + hi) // 2
         key = (font_path, mid)
         if key not in cache:
-            try:
-                cache[key] = ImageFont.truetype(font_path, mid)
-            except Exception:
-                cache[key] = ImageFont.load_default()
+            try: cache[key] = ImageFont.truetype(font_path, mid)
+            except Exception: cache[key] = ImageFont.load_default()
         font = cache[key]
         lines = wrap_text(draw, text, font, box_w - 4, allow_break=False, is_vertical=False)
         if lines is None:
@@ -945,10 +910,8 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
     if best_lines is None:
         key = (font_path, min_size)
         if key not in cache:
-            try:
-                cache[key] = ImageFont.truetype(font_path, min_size)
-            except Exception:
-                cache[key] = ImageFont.load_default()
+            try: cache[key] = ImageFont.truetype(font_path, min_size)
+            except Exception: cache[key] = ImageFont.load_default()
         font = cache[key]
         fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True, is_vertical=False)
         best_lines = fallback_lines if fallback_lines else [text]
@@ -964,8 +927,61 @@ def draw_text_outline(draw, pos, text, font, fill, outline, outline_width):
               stroke_width=outline_width, stroke_fill=outline)
 
 # ===========================================================================
-# Core pipeline (Concurrent Inpainting & Translation + optional Colorize)
+# Core pipeline (Highly Concurrent Inpainting, Translation, Render Prep)
 # ===========================================================================
+_BOX_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="box-prep")
+_tls = threading.local()
+
+def _tls_draw():
+    d = getattr(_tls, "draw", None)
+    if d is None:
+        # Using a larger dummy canvas prevents any potential internal PIL clipping metrics
+        d = ImageDraw.Draw(Image.new("RGBA", (2048, 2048)))
+        _tls.draw = d
+    return d
+
+def _prep_one_box(c, trans, inpainted_bgr, target_lang):
+    x1, y1, x2, y2 = c["bbox"]
+    trans = clean_text_for_font(trans)
+    if not trans.strip():
+        return None
+    
+    text_rgb, outline_rgb = detect_text_and_bg_colors(inpainted_bgr, (x1, y1, x2, y2))
+    box_w, box_h = x2 - x1, y2 - y1
+    draw = _tls_draw()
+    
+    font_size, lines, heights = fit_font_and_wrap(
+        draw, trans, box_w, box_h, str(FONT_PATH),
+        is_vertical=(target_lang in ("ja", "ko", "cz"))
+    )
+    return (c["bbox"], trans, text_rgb, outline_rgb, box_w, box_h,
+            font_size, lines, heights)
+
+def _colorize_sam_precompute(pil_img):
+    session, sam_session = get_colorizer_sessions()
+    gray = np.array(pil_img.convert("L"))
+    L_bw = cv2.resize(gray, (COLORIZER_DEFAULT_INFER_SIZE, COLORIZER_DEFAULT_INFER_SIZE), 
+                      interpolation=cv2.INTER_AREA)
+    L_norm = (L_bw.astype(np.float32) / 127.5) - 1.0
+    if sam_session is not None:
+        return _extract_sam_features_onnx(sam_session, L_norm)
+    H_in, W_in = L_bw.shape
+    return (np.zeros((1, 256, H_in//16, W_in//16), dtype=np.float32),
+            np.zeros((1, 256, H_in//32, W_in//32), dtype=np.float32),
+            np.zeros((1, 1024), dtype=np.float32))
+
+def _colorize_generate_only(inpainted_pil, sam_features):
+    session, _ = get_colorizer_sessions()
+    gray = np.array(inpainted_pil.convert("L"))
+    orig_H, orig_W = gray.shape
+    L_bw = cv2.resize(gray, (COLORIZER_DEFAULT_INFER_SIZE, COLORIZER_DEFAULT_INFER_SIZE), 
+                      interpolation=cv2.INTER_AREA)
+    
+    sam_level0, sam_level1, wd14_embedding = sam_features
+    rgb_output = _colorize_onnx(session, L_bw, sam_level0, sam_level1, wd14_embedding)
+    rgb_output = cv2.resize(rgb_output, (orig_W, orig_H), interpolation=cv2.INTER_CUBIC)
+    return Image.fromarray(rgb_output)
+
 async def detect_translate_inpaint(pil_img: Image.Image,
                                    use_lama: bool = True,
                                    colorize: bool = False,
@@ -974,10 +990,8 @@ async def detect_translate_inpaint(pil_img: Image.Image,
     h, w = img_bgr.shape[:2]
     loop = asyncio.get_running_loop()
 
-    # Determine if the target language requires vertical rendering
     is_vertical = target_lang in ("ja", "ko", "cz")
 
-    # --- OCR ---
     with _ocr_model_lock:
         current_model = _current_ocr_model
 
@@ -990,16 +1004,15 @@ async def detect_translate_inpaint(pil_img: Image.Image,
 
     cleaned = []
     for b in blocks:
-        x1,y1,x2,y2 = b["bbox"]
+        x1, y1, x2, y2 = b["bbox"]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w-1, x2), min(h-1, y2)
         if x2 - x1 < 4 or y2 - y1 < 4:
             continue
-        cleaned.append({"text": (b.get("text") or "").strip(), "bbox": (x1,y1,x2,y2)})
+        cleaned.append({"text": (b.get("text") or "").strip(), "bbox": (x1, y1, x2, y2)})
     cleaned.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
 
     if not cleaned:
-        # Even with no text, optionally colorize the raw image
         if colorize and ort is not None:
             try:
                 pil_img = colorize_pil(pil_img)
@@ -1007,29 +1020,34 @@ async def detect_translate_inpaint(pil_img: Image.Image,
                 logging.error(f"Colorization failed: {e}")
         return pil_img, []
 
-    # --- Concurrent Translation and Inpainting ---
+    sam_future = None
+    if colorize:
+        if ort is None:
+            raise RuntimeError("onnxruntime not installed but colorization requested.")
+        sam_future = loop.run_in_executor(None, _colorize_sam_precompute, pil_img)
+
     def _do_inpaint():
         mask = np.zeros((h, w), dtype=np.uint8)
         for c in cleaned:
-            x1,y1,x2,y2 = c["bbox"]
-            pad = max(2, int(min(x2-x1, y2-y1) * 0.06))
-            mask[max(0,y1-pad):min(h,y2+pad), max(0,x1-pad):min(w,x2+pad)] = 255
-        mask_area = np.count_nonzero(mask)
-        total_area = h * w
+            x1, y1, x2, y2 = c["bbox"]
+            pad = max(2, int(min(x2 - x1, y2 - y1) * 0.06))
+            y0, y1p = max(0, y1 - pad), min(h, y2 + pad)
+            x0, x1p = max(0, x1 - pad), min(w, x2 + pad)
+            mask[y0:y1p, x0:x1p] = 255
+        mask_area = int(mask.sum() // 255)
         try:
             if use_lama and SimpleLama:
                 return lama_inpaint(img_bgr, mask)
-            elif mask_area > 0.25 * total_area:
-                logging.warning("Mask too large for cv2.inpaint. Filling boxes with solid colors.")
+            if mask_area > 0.25 * h * w:
+                logging.warning("Mask too large for cv2.inpaint; solid-filling boxes.")
                 filled = img_bgr.copy()
                 for c in cleaned:
-                    x1,y1,x2,y2 = c["bbox"]
-                    _, bg_rgb = detect_text_and_bg_colors(img_bgr, (x1,y1,x2,y2))
-                    bg_bgr = (bg_rgb[2], bg_rgb[1], bg_rgb[0])
-                    cv2.rectangle(filled, (x1, y1), (x2, y2), bg_bgr, -1)
+                    x1, y1, x2, y2 = c["bbox"]
+                    _, bg_rgb = detect_text_and_bg_colors(img_bgr, (x1, y1, x2, y2))
+                    cv2.rectangle(filled, (x1, y1), (x2, y2),
+                                  (bg_rgb[2], bg_rgb[1], bg_rgb[0]), -1)
                 return filled
-            else:
-                return cv2_inpaint_fallback(img_bgr, mask)
+            return cv2_inpaint_fallback(img_bgr, mask)
         except Exception as e:
             logging.error(f"Inpainting failed, falling back to cv2: {e}")
             return cv2_inpaint_fallback(img_bgr, mask)
@@ -1041,36 +1059,36 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             if not t.strip():
                 tasks.append(asyncio.sleep(0, result=""))
             else:
-                # Pass target_lang to qwen_translate
                 tasks.append(loop.run_in_executor(_llm_executor, qwen_translate, t, target_lang))
         return await asyncio.gather(*tasks)
 
     inpaint_task = loop.run_in_executor(None, _do_inpaint)
     translation_task = _do_translation()
 
+    futures = [inpaint_task, translation_task]
+    if sam_future:
+        futures.append(sam_future)
+    
     try:
-        inpainted, translations = await asyncio.wait_for(
-            asyncio.gather(inpaint_task, translation_task),
-            timeout=120.0
-        )
+        results = await asyncio.wait_for(asyncio.gather(*futures), timeout=120.0)
+        inpainted, translations = results[0], results[1]
+        sam_features = results[2] if sam_future else None
     except asyncio.TimeoutError:
         logging.error("Pipeline timed out after 120s")
         raise RuntimeError("Translation pipeline timed out")
 
-    # --- Optional: Colorize the inpainted (text-free) image ---
-    if colorize:
-        if ort is None:
-            raise RuntimeError("onnxruntime not installed but colorization requested. Run: pip install onnxruntime")
+    if colorize and sam_features is not None:
         try:
             inpainted_pil = cv2_to_pil(inpainted)
-            colorized_pil = await loop.run_in_executor(None, colorize_pil, inpainted_pil)
+            colorized_pil = await loop.run_in_executor(
+                None, _colorize_generate_only, inpainted_pil, sam_features
+            )
             inpainted = pil_to_cv2(colorized_pil)
             logging.info("Colorization applied to inpainted image.")
         except Exception as e:
             logging.error(f"Colorization failed, using non-colorized: {e}")
             raise RuntimeError(f"Colorization ONNX failed: {e}")
 
-    # --- Render translated text on top of (possibly colorized) inpainted image ---
     base_pil = cv2_to_pil(inpainted).convert("RGBA")
     out = base_pil.copy()
     draw = ImageDraw.Draw(out)
@@ -1079,39 +1097,37 @@ async def detect_translate_inpaint(pil_img: Image.Image,
         fit_font_and_wrap._cache = {}
     cache = fit_font_and_wrap._cache
 
-    boxes_info: List[Dict] = []
-    for c, trans in zip(cleaned, translations):
-        x1,y1,x2,y2 = c["bbox"]
-        trans = clean_text_for_font(trans)
-        if not trans.strip():
-            boxes_info.append({"bbox": c["bbox"], "orig": c["text"], "trans": "",
-                               "font_size": 0, "text_color": None, "outline_color": None})
-            continue
+    prep_args = [(c, trans, inpainted, target_lang) for c, trans in zip(cleaned, translations)]
+    prepped = list(_BOX_EXECUTOR.map(lambda args: _prep_one_box(*args), prep_args))
 
-        text_rgb, outline_rgb = detect_text_and_bg_colors(inpainted, (x1,y1,x2,y2))
-        box_w, box_h = x2 - x1, y2 - y1
-        
-        font_size, lines, heights = fit_font_and_wrap(draw, trans, box_w, box_h, str(FONT_PATH), is_vertical=is_vertical)
+    boxes_info: List[Dict] = []
+    
+    for p, c in zip(prepped, cleaned):
+        if p is None:
+            boxes_info.append({
+                "bbox": c["bbox"], "orig": c["text"], "trans": "",
+                "font_size": 0, "text_color": None, "outline_color": None
+            })
+            continue
+            
+        (bbox, trans, text_rgb, outline_rgb, 
+         box_w, box_h, font_size, lines, heights) = p
+        x1, y1, x2, y2 = bbox
         
         key = (str(FONT_PATH), font_size)
         if key not in cache:
-            try:
-                cache[key] = ImageFont.truetype(str(FONT_PATH), font_size)
-            except Exception:
-                cache[key] = ImageFont.load_default()
+            try: cache[key] = ImageFont.truetype(str(FONT_PATH), font_size)
+            except Exception: cache[key] = ImageFont.load_default()
         font = cache[key]
         
         outline_w = max(1, int(font_size * 0.08))
 
         if is_vertical:
-            # lines represent columns, heights represent column widths
             col_widths = heights
             total_w = sum(col_widths)
-            # Start from the right edge of the text bounding box, going left
             cur_x_right = x2 - max(0, (box_w - total_w) // 2)
 
             for col, col_w in zip(lines, col_widths):
-                # Measure actual column height to center it vertically inside box_h
                 col_total_h = 0
                 char_heights = []
                 for ch in col:
@@ -1127,14 +1143,12 @@ async def detect_translate_inpaint(pil_img: Image.Image,
                 for ch, ch_h in zip(col, char_heights):
                     bb_ch = draw.textbbox((0,0), ch, font=font)
                     ch_w = bb_ch[2] - bb_ch[0]
-                    # Center character horizontally within its column
                     pos_x = cur_x_left + max(0, (col_w - ch_w) / 2)
                     draw_text_outline(draw, (pos_x, cur_y), ch, font,
                                       fill=text_rgb, outline=outline_rgb, outline_width=outline_w)
                     cur_y += ch_h
-                cur_x_right = cur_x_left # Move left for the next column
+                cur_x_right = cur_x_left
         else:
-            # Horizontal Text Rendering (Existing logic)
             total_h = sum(heights)
             cur_y = y1 + max(0, (box_h - total_h) // 2)
             for ln, hln in zip(lines, heights):
@@ -1145,13 +1159,14 @@ async def detect_translate_inpaint(pil_img: Image.Image,
                 cur_y += hln
 
         boxes_info.append({
-            "bbox": c["bbox"], "orig": c["text"], "trans": trans,
+            "bbox": bbox, "orig": c["text"], "trans": trans,
             "font_size": font_size, "text_color": text_rgb, "outline_color": outline_rgb,
         })
+        
     return out, boxes_info
 
 # ===========================================================================
-# Job queue / worker
+# Job queue / worker (Optimized PNG Compression)
 # ===========================================================================
 def _cleanup_old_jobs():
     now = time.time()
@@ -1179,15 +1194,15 @@ async def job_worker():
             colorize = job.get("_colorize", False)
             target_lang = job.get("_target_lang", "en")
             
-            # Run translation pipeline with the target language
             result_img, boxes = await detect_translate_inpaint(
-                pil, 
-                use_lama=use_lama, 
-                colorize=colorize, 
-                target_lang=target_lang
+                pil, use_lama=use_lama, colorize=colorize, target_lang=target_lang
             )
             buf = io.BytesIO()
-            result_img.convert("RGB").save(buf, format="PNG")
+            try:
+                result_img.convert("RGB").save(buf, format="PNG", optimize=False, compress_level=1)
+            except Exception:
+                buf = io.BytesIO()
+                result_img.convert("RGB").save(buf, format="PNG")
             job["image_bytes"] = buf.getvalue()
             job["boxes"] = boxes
             job["status"] = "done"
@@ -1207,10 +1222,14 @@ async def _start_worker():
     _job_queue = asyncio.Queue()
     _worker_task = asyncio.create_task(job_worker())
     
-    # Preload Qwen model in the background to avoid timeout on the very first request
-    logging.info("[Startup] Preloading Qwen translation model in background...")
+    logging.info("[Startup] Preloading models in background...")
     loop = asyncio.get_running_loop()
     loop.run_in_executor(_llm_executor, get_qwen)
+    loop.run_in_executor(None, get_yolo)
+    if _current_ocr_model == "ko":
+        loop.run_in_executor(None, get_paddle_ocr)
+    else:
+        loop.run_in_executor(None, get_hayai_ocr)
 
 # ===========================================================================
 # API models
@@ -1220,7 +1239,7 @@ class TranslateRequest(BaseModel):
     use_lama: bool = True
     lang: str = DEFAULT_LANG
     source: Optional[str] = None
-    colorize: bool = False  # per-request colorize toggle
+    colorize: bool = False
 
 class AIResolveRequest(BaseModel):
     provider: Optional[str] = None
@@ -1603,7 +1622,6 @@ async def v1_translate_upload(
     use_lama_bool = use_lama.lower() in ("true", "1", "on", "yes")
     colorize_bool = colorize.lower() in ("true", "1", "on", "yes")
     
-    # Validate language
     if lang not in LANG_MAP:
         lang = "en"
     
@@ -1623,7 +1641,7 @@ async def v1_translate_upload(
         "id": job_id, "status": "queued", "created_at": time.time(),
         "_pil": pil, "_use_lama": use_lama_bool,
         "_colorize": colorize_bool or _colorize_enabled,
-        "_target_lang": lang,  # <--- ADD THIS
+        "_target_lang": lang,
     }
     if _job_queue is None:
         raise HTTPException(503, "Server is still starting up, please try again in a moment.")
@@ -1637,7 +1655,7 @@ async def v1_translate_status(job_id: str, wait: float = Query(0, ge=0, le=25)):
     job = _jobs[job_id]
     deadline = time.time() + wait
     while wait > 0 and job["status"] in ("queued", "running") and time.time() < deadline:
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.1)
         job = _jobs[job_id]
     resp = {"id": job_id, "status": job["status"]}
     if job["status"] == "done":
@@ -1668,7 +1686,11 @@ async def v1_translate_image(job_id: str):
     job = _jobs[job_id]
     if job["status"] != "done":
         raise HTTPException(409, f"job status={job['status']}")
-    return Response(content=job["image_bytes"], media_type="image/png")
+    return Response(
+        content=job["image_bytes"], 
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=600, immutable"}
+    )
 
 # ===========================================================================
 # GGUF Model Management Endpoints
@@ -1678,7 +1700,6 @@ async def v1_change_model(req: ChangeModelRequest):
     """Switch the active Qwen GGUF translation model."""
     try:
         loop = asyncio.get_running_loop()
-        # Run in executor to avoid blocking the event loop while downloading/loading
         await loop.run_in_executor(None, switch_qwen_model, req.repo_id, req.filename)
         return {"status": "ok", "repo_id": req.repo_id, "filename": _current_qwen_filename}
     except Exception as e:
