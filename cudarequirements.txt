@@ -15,3 +15,5 @@ unidic-lite
 paddleocr
 paddlepaddle
 python-multipart
+uvicorn
+hayai-ocr
