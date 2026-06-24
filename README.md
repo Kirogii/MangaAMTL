@@ -19,8 +19,7 @@ ________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
 
 #  Localhost Setup
-- 1: Download C++ Buildtools
-- https://visualstudio.microsoft.com/visual-cpp-build-tools/<sub> Make sure to select c++ buildtools</sub>
+- 1: Download C++ Buildtools: https://visualstudio.microsoft.com/visual-cpp-build-tools/<sub> Make sure to select c++ buildtools</sub>
 - 3: Download Latest Release: [Latest Version](https://github.com/Kirogii/MangaAMTL/releases/latest)
 - 4: Cd inside
 `cd MangaAMTL`
