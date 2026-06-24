@@ -19,13 +19,15 @@ ________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
 
 #  Localhost Setup
-- 1: Clone the repository
-`git clone https://github.com/Kirogii/MangaAMTL.git`
-- 2: Cd inside
+- 1: Download C++ Buildtools
+- https://visualstudio.microsoft.com/visual-cpp-build-tools/<sub> Make sure to select c++ buildtools</sub>
+- 3: Download Latest Release
+[Latest Version](https://github.com/Kirogii/MangaAMTL/releases/latest)
+- 4: Cd inside
 `cd MangaAMTL`
-- 3: Install dependencies
-`pip install -r requirements.txt`
-- 4: Run the development server
+- 5: Install dependencies
+`pip install -r requirements.txt` or for cuda `pip install -r cudarequirements.txt`
+- 6: Run the development server
 `python app.py`
 
 ` The application will start on:
@@ -34,7 +36,7 @@ ________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
 
-# Huggingface Setup
+# Huggingface Setup (Dead for now)
 - Clone the space https://huggingface.co/spaces/Kirogii/Manga_AMTL
 
 
