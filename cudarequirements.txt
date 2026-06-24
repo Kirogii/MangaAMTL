@@ -1,0 +1,17 @@
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+
+fastapi
+pydantic
+pillow==9.5.0
+numpy==1.26.4
+opencv-python==4.10.0.84
+llama-cpp-python==0.3.16
+ultralytics==8.3.190
+simple-lama-inpainting==0.1.2
+onnxruntime-gpu
+huggingface-hub
+fugashi
+unidic-lite
+paddleocr
+paddlepaddle
+python-multipart
