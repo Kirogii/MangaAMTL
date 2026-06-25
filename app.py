@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
-Manga translation service (FastAPI, OpenAI-style /v1/ endpoints).
-
-- OCR: Hayai OCR (Japanese, with YOLO text box detection) /
-       PaddleOCR korean_PP-OCRv5_mobile_rec (Korean, end-to-end).
-- Translation: Qwen 0.8B GGUF  (switchable via /v1/changemodel).
-- Inpainting: SimpleLama (preferred) with cv2.inpaint fallback.
-- Colorizer: Manga Light Colorizer v6 (ONNX) — optional per-request or global.
-- Text render: auto-fit binary-search font sizing + per-box ink-color sampling.
 - API: /health /version /meta /warmup /setmodel /getmodel
        /v1/translate /v1/translate/{id} /v1/translate/{id}/image
        /v1/changemodel /v1/listmodels /v1/colorize
        /v1/ai/resolve /v1/ai/prompt/default
-- UI: Embedded HTML testing interface at /
 - Logs: /console endpoint to view all backend logs and errors
 """
 
