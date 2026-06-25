@@ -43,10 +43,29 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Req
 from fastapi.responses import JSONResponse, Response, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+# --- GPU / Device helpers --------------------------------------------------
+import torch
 
+def has_cuda() -> bool:
+    """True if a CUDA-capable GPU is available to PyTorch."""
+    try:
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+def get_torch_device() -> str:
+    """Return 'cuda' if available, otherwise 'cpu'."""
+    return "cuda" if has_cuda() else "cpu"
+
+def get_llm_gpu_layers() -> int:
+    """Return number of layers to offload to GPU for llama-cpp-python.
+    -1 = offload all, 0 = CPU only."""
+    return -1 if has_cuda() else 0
+
+# Log once at import time so it shows in /console
+logging.info(f"[Device] CUDA available: {has_cuda()} -> device='{get_torch_device()}'")
 
 # --- VARCO OCR Config (transformers) ---
-import torch
 
 _varco_ocr_model = None
 _varco_ocr_processor = None
@@ -60,7 +79,7 @@ except Exception:
     YOLO = None
 
 try:
-    from simple_lama_inpainting import SimpleLama
+    from simple_lama import SimpleLama
 except Exception:
     SimpleLama = None
 
@@ -731,16 +750,25 @@ def get_hayai_ocr():
     if _hayai_ocr_model is None:
         if HayaiOcr is None:
             raise RuntimeError("hayai-ocr not installed: pip install hayai-ocr")
-        logging.info("[Hayai OCR] Loading model (may take a few minutes on first run)...")
-        _hayai_ocr_model = HayaiOcr()
-        logging.info("[Hayai OCR] Model loaded.")
+        device = get_torch_device()
+        logging.info(f"[Hayai OCR] Loading model on device: {device} (may take a few minutes on first run)...")
+        try:
+            _hayai_ocr_model = HayaiOcr(device=device)
+        except TypeError:
+            # Older HayaiOcr versions don't accept device=; rely on autodetect.
+            _hayai_ocr_model = HayaiOcr()
+        logging.info(f"[Hayai OCR] Model loaded (device={device}).")
     return _hayai_ocr_model
 
 def get_yolo():
     global _global_yolo
     if _global_yolo is None:
         ensure_yolo()
+        device = get_torch_device()
+        logging.info(f"[YOLO] Loading model on device: {device}")
         _global_yolo = YOLO(str(YOLO_MODEL_PATH))
+        _global_yolo.to(device)
+        logging.info(f"[YOLO] Ready on {device}.")
     return _global_yolo
 
 def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
@@ -749,7 +777,7 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     yolo = get_yolo()
 
     logging.info(f"[OCR] Running YOLO text detection on {w}x{h} image...")
-    results = yolo(img_bgr, verbose=False, conf=0.4)
+    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
     if not results:
         return []
 
@@ -795,22 +823,24 @@ def get_varco_ocr():
             from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
         except ImportError:
             raise RuntimeError("transformers not installed: pip install transformers accelerate torch")
-        
-        # Check if a GPU is actually available. If not, use float32 for CPU.
-        has_gpu = torch.cuda.is_available()
+
+        has_gpu = has_cuda()
         dtype = torch.float16 if has_gpu else torch.float32
-        
-        logging.info(f"[VARCO OCR] Loading model {VARCO_OCR_REPO} (Device: {'GPU' if has_gpu else 'CPU'}, Dtype: {dtype})...")
+        device = "cuda" if has_gpu else "cpu"
+
+        logging.info(f"[VARCO OCR] Loading {VARCO_OCR_REPO} (device={device}, dtype={dtype})...")
         with _varco_ocr_lock:
             if _varco_ocr_model is None:
                 _varco_ocr_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
                     VARCO_OCR_REPO,
                     torch_dtype=dtype,
                     attn_implementation="sdpa",
-                    device_map="auto",
+                    device_map="auto" if has_gpu else {"": "cpu"},
                 )
                 _varco_ocr_processor = AutoProcessor.from_pretrained(VARCO_OCR_REPO)
-                logging.info("[VARCO OCR] Model loaded.")
+                if not has_gpu:
+                    _varco_ocr_model = _varco_ocr_model.to("cpu")
+                logging.info(f"[VARCO OCR] Model loaded on {device}.")
     return _varco_ocr_model, _varco_ocr_processor
 
 def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
@@ -945,13 +975,15 @@ def get_qwen():
                         f"Delete it and restart, or call /v1/changemodel with a valid repo."
                     )
 
-                logging.info(f"[Qwen] loading {path} ...")
+                use_gpu = has_cuda()
+                n_gpu_layers = -1 if use_gpu else 0
+                logging.info(f"[Qwen] loading {path} (GPU layers: {n_gpu_layers}, device={'cuda' if use_gpu else 'cpu'}) ...")
                 try:
                     _global_qwen = Llama(
                         model_path=str(path),
                         n_ctx=2048,
                         n_threads=max(4, os.cpu_count() or 4),
-                        n_gpu_layers=0,  # <--- CHANGED TO 0: Force CPU to prevent GPU hangs
+                        n_gpu_layers=n_gpu_layers,  # -1 = all layers on GPU if CUDA, else CPU
                         verbose=False,
                     )
                 except Exception as e:
@@ -961,10 +993,11 @@ def get_qwen():
                         f"This is likely a version mismatch, not a corrupt file. "
                         f"Run: pip uninstall llama-cpp-python -y && "
                         f"pip install llama-cpp-python --extra-index-url "
-                        f"https://abetlen.github.io/llama-cpp-python/whl/cpu"
+                        f"https://abetlen.github.io/llama-cpp-python/whl/{'cu121' if use_gpu else 'cpu'}"
                     )
 
-                logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename}")
+                logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename} "
+                             f"(device={'cuda' if use_gpu else 'cpu'})")
     return _global_qwen
 
 def switch_qwen_model(repo_id: str, filename: Optional[str] = None):
@@ -1019,7 +1052,20 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
 def load_lama():
     global _simple_lama_model
     if _simple_lama_model is None and SimpleLama is not None:
+        device = get_torch_device()
+        logging.info(f"[SimpleLama] Loading on device: {device}")
         _simple_lama_model = SimpleLama()
+        # SimpleLama wraps a torch model; try to move it to GPU if available.
+        if device == "cuda":
+            try:
+                inner = getattr(_simple_lama_model, "model", None)
+                if inner is not None and hasattr(inner, "to"):
+                    inner.to("cuda")
+                    logging.info("[SimpleLama] Model moved to CUDA.")
+                else:
+                    logging.warning("[SimpleLama] Could not access .model to move to CUDA; running on default device.")
+            except Exception as e:
+                logging.warning(f"[SimpleLama] Failed moving to CUDA: {e}")
     return _simple_lama_model
 
 def lama_inpaint(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
