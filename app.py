@@ -748,6 +748,7 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     h, w = img_bgr.shape[:2]
     yolo = get_yolo()
 
+    logging.info(f"[OCR] Running YOLO text detection on {w}x{h} image...")
     results = yolo(img_bgr, verbose=False, conf=0.4)
     if not results:
         return []
@@ -795,12 +796,16 @@ def get_varco_ocr():
         except ImportError:
             raise RuntimeError("transformers not installed: pip install transformers accelerate torch")
         
-        logging.info(f"[VARCO OCR] Loading model {VARCO_OCR_REPO} via transformers...")
+        # Check if a GPU is actually available. If not, use float32 for CPU.
+        has_gpu = torch.cuda.is_available()
+        dtype = torch.float16 if has_gpu else torch.float32
+        
+        logging.info(f"[VARCO OCR] Loading model {VARCO_OCR_REPO} (Device: {'GPU' if has_gpu else 'CPU'}, Dtype: {dtype})...")
         with _varco_ocr_lock:
             if _varco_ocr_model is None:
                 _varco_ocr_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
                     VARCO_OCR_REPO,
-                    torch_dtype=torch.float16,
+                    torch_dtype=dtype,
                     attn_implementation="sdpa",
                     device_map="auto",
                 )
@@ -815,8 +820,10 @@ def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
     
     # 1. Use YOLO to find text boxes
     yolo = get_yolo()
+    logging.info(f"[VARCO OCR] Running YOLO text detection on {w}x{h} image...")
     results = yolo(img_bgr, verbose=False, conf=0.4)
     if not results:
+        logging.info("[VARCO OCR] No text boxes found by YOLO.")
         return []
 
     r = results[0]
@@ -832,16 +839,20 @@ def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         boxes.append((x1, y1, x2, y2))
     
     if not boxes:
+        logging.info("[VARCO OCR] YOLO found boxes, but none passed size filters.")
         return []
+
+    logging.info(f"[VARCO OCR] Found {len(boxes)} valid text boxes. Running VARCO OCR on each...")
 
     # 2. Use VARCO to read text in each box
     def _ocr_one(bbox):
         x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
         
-        # VARCO guide recommends upscaling to 2304px
+        # Reduced from 2304 to 1024 to prevent CPU hanging.
+        # 2304px on a 1.7B VLM on CPU takes minutes per bubble.
+        target_size = 1024 
         cw, ch = crop.size
-        target_size = 2304
         if max(cw, ch) < target_size:
             scale = target_size / max(cw, ch)
             if scale > 4.0: 
@@ -866,9 +877,10 @@ def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
                     tokenize=True,
                     return_dict=True,
                     return_tensors="pt"
-                ).to(model.device, torch.float16)
+                ).to(model.device, model.dtype) # <--- Changed from torch.float16 to model.dtype
 
-                generate_ids = model.generate(**inputs, max_new_tokens=512)
+                logging.info(f"[VARCO OCR] Running VLM generation on box {bbox}...")
+                generate_ids = model.generate(**inputs, max_new_tokens=128)
                 
                 # Trim the input prompt from the output
                 generate_ids_trimmed = [
@@ -878,6 +890,7 @@ def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
                 
             for tok in ["<|im_end|>", "</s>"]:
                 text = text.replace(tok, "")
+            logging.info(f"[VARCO OCR] Box {bbox} read: '{text[:30]}'")
             return bbox, text.strip()
         except Exception as e:
             logging.error(f"VARCO OCR failed on {bbox}: {e}")
@@ -921,7 +934,6 @@ def get_qwen():
                     path = download_gguf(_current_qwen_repo_id, _current_qwen_filename)
                     _current_qwen_path = path
 
-                # Resolve symlinks — on Windows without Developer Mode these are real files
                 try:
                     path = path.resolve()
                 except Exception:
@@ -939,7 +951,7 @@ def get_qwen():
                         model_path=str(path),
                         n_ctx=2048,
                         n_threads=max(4, os.cpu_count() or 4),
-                        n_gpu_layers=-1,
+                        n_gpu_layers=0,  # <--- CHANGED TO 0: Force CPU to prevent GPU hangs
                         verbose=False,
                     )
                 except Exception as e:
@@ -974,27 +986,32 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
     lang_name = LANG_MAP.get(target_lang, "English")
     max_tok = max(16, min(96, len(text) + 16))
     
+    logging.info(f"[LLM] Starting translation for: '{text[:40]}' -> {lang_name}")
+    
     llm = get_qwen()
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT.format(lang=lang_name)},
         {"role": "user",   "content": text},
     ]
-    with _llm_lock:
-        out = llm.create_chat_completion(
-            messages=msgs,
-            max_tokens=max_tok,
-            temperature=0.2,
-            top_p=0.9,
-            stop=["<|im_end|>", "</s>"],
-        )
     try:
+        with _llm_lock:
+            out = llm.create_chat_completion(
+                messages=msgs,
+                max_tokens=max_tok,
+                temperature=0.2,
+                top_p=0.9,
+                stop=["<|im_end|>", "</s>"],
+            )
         raw = out["choices"][0]["message"]["content"].strip()
         for tok in ("<|im_start|>", "<|im_end|>", "</s>"):
             if tok in raw:
                 raw = raw.replace(tok, "")
+        logging.info(f"[LLM] Translated to: '{raw[:40]}'")
         return clean_text_for_font(raw)
-    except Exception:
+    except Exception as e:
+        logging.error(f"[LLM] Translation failed: {e}")
         return ""
+
 
 # ===========================================================================
 # Inpainting
