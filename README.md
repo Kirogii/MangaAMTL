@@ -23,15 +23,12 @@ ________________________________________________________________________________
 Python 3.12 Is Needed for this
 
 - 1: Download C++ Buildtools: https://visualstudio.microsoft.com/visual-cpp-build-tools/<sub> Make sure to select c++ buildtools</sub>
-- 3: Download Latest Release: [Latest Version](https://github.com/Kirogii/MangaAMTL/releases/latest)
-- 2: Install seperate llama_cpp_python
--`set CMAKE_ARGS=-DGGML_CUDA=on ` (run the set command for cuda support)
-`pip install llama-cpp-python --no-cache-dir --no-binary :all: --upgrade`
-- 4: Cd inside
+- 2: Download Latest Release: [Latest Version](https://github.com/Kirogii/MangaAMTL/releases/latest)
+- 3: Cd inside
 `cd MangaAMTL`
-- 5: Install dependencies
+- 4: Install dependencies
 `pip install -r requirements.txt` or for cuda `pip install -r cudarequirements.txt`
-- 6: Run the development server
+- 5: Run the development server
 `python app.py`
 
 ` The application will start on:
