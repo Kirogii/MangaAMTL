@@ -15,7 +15,6 @@ Manga translation service (FastAPI, OpenAI-style /v1/ endpoints).
 - UI: Embedded HTML testing interface at /
 - Logs: /console endpoint to view all backend logs and errors
 """
-from __future__ import annotations
 
 import asyncio
 import base64
@@ -44,6 +43,16 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Req
 from fastapi.responses import JSONResponse, Response, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+
+
+# --- VARCO OCR Config (transformers) ---
+import torch
+
+_varco_ocr_model = None
+_varco_ocr_processor = None
+_varco_ocr_lock = threading.Lock() # Transformers models are not thread-safe
+VARCO_OCR_REPO = "OpenLLM-Korea/VARCO-VISION-2.0-1.7B-OCR"
+
 # --- Optional deps ---------------------------------------------------------
 try:
     from ultralytics import YOLO
@@ -64,11 +73,6 @@ try:
     from hayai_ocr import HayaiOcr
 except Exception:
     HayaiOcr = None
-
-try:
-    from paddleocr import PaddleOCR
-except Exception:
-    PaddleOCR = None
 
 try:
     import onnxruntime as ort
@@ -781,73 +785,108 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     return out
 
 # ===========================================================================
-# PaddleOCR (Korean)
+# VARCO OCR (Korean - transformers)
 # ===========================================================================
-def get_paddle_ocr():
-    global _paddle_ocr_model
-    if _paddle_ocr_model is None:
-        if PaddleOCR is None:
-            raise RuntimeError("paddleocr not installed: pip install paddleocr paddlepaddle")
-        logging.info("[PaddleOCR] Loading Korean model (korean_PP-OCRv5_mobile_rec)...")
-        for attempt_kwargs in [
-            dict(lang='korean', use_textline_orientation=False,
-                 use_doc_orientation_classify=False, use_doc_unwarping=False,
-                 text_rec_model_name='korean_PP-OCRv5_mobile_rec'),
-            dict(lang='korean', use_textline_orientation=False,
-                 use_doc_orientation_classify=False, use_doc_unwarping=False),
-            dict(lang='korean', use_angle_cls=False, show_log=False,
-                 rec_model_name='korean_PP-OCRv5_mobile_rec'),
-            dict(lang='korean'),
-        ]:
-            try:
-                _paddle_ocr_model = PaddleOCR(**attempt_kwargs)
-                logging.info(f"[PaddleOCR] Model loaded with kwargs: {attempt_kwargs}")
-                return _paddle_ocr_model
-            except (ValueError, TypeError) as e:
-                logging.warning(f"[PaddleOCR] Failed with {attempt_kwargs}: {e}")
-        raise RuntimeError("Failed to initialize PaddleOCR with any known API variant")
-    return _paddle_ocr_model
+def get_varco_ocr():
+    global _varco_ocr_model, _varco_ocr_processor
+    if _varco_ocr_model is None:
+        try:
+            from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
+        except ImportError:
+            raise RuntimeError("transformers not installed: pip install transformers accelerate torch")
+        
+        logging.info(f"[VARCO OCR] Loading model {VARCO_OCR_REPO} via transformers...")
+        with _varco_ocr_lock:
+            if _varco_ocr_model is None:
+                _varco_ocr_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+                    VARCO_OCR_REPO,
+                    torch_dtype=torch.float16,
+                    attn_implementation="sdpa",
+                    device_map="auto",
+                )
+                _varco_ocr_processor = AutoProcessor.from_pretrained(VARCO_OCR_REPO)
+                logging.info("[VARCO OCR] Model loaded.")
+    return _varco_ocr_model, _varco_ocr_processor
 
-def paddle_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
+def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
+    model, processor = get_varco_ocr()
     img_bgr = pil_to_cv2(pil_img)
-    paddle = get_paddle_ocr()
-    try:
-        result = paddle.ocr(img_bgr, cls=False)
-    except (ValueError, TypeError):
-        result = paddle.ocr(img_bgr)
-    return _parse_paddle_result(result)
+    h, w = img_bgr.shape[:2]
+    
+    # 1. Use YOLO to find text boxes
+    yolo = get_yolo()
+    results = yolo(img_bgr, verbose=False, conf=0.4)
+    if not results:
+        return []
 
-def _parse_paddle_result(result) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    if not result:
-        return out
-    first = result[0] if isinstance(result, list) else result
-    if first is None:
-        return out
-    if isinstance(first, list):
-        for line in first:
-            try:
-                box_pts, (text, conf) = line
-                if not text or not text.strip():
-                    continue
-                xs = [p[0] for p in box_pts]
-                ys = [p[1] for p in box_pts]
-                x1, y1 = int(min(xs)), int(min(ys))
-                x2, y2 = int(max(xs)), int(max(ys))
-                out.append({"text": text.strip(), "bbox": (x1, y1, x2, y2)})
-            except (ValueError, TypeError):
-                continue
-    elif hasattr(first, 'rec_texts') and hasattr(first, 'rec_polys'):
-        texts = first.rec_texts
-        polys = first.rec_polys
-        for text, poly in zip(texts, polys):
-            if not text or not text.strip():
-                continue
-            xs = [p[0] for p in poly]
-            ys = [p[1] for p in poly]
-            x1, y1 = int(min(xs)), int(min(ys))
-            x2, y2 = int(max(xs)), int(max(ys))
-            out.append({"text": text.strip(), "bbox": (x1, y1, x2, y2)})
+    r = results[0]
+    img_area = h * w
+    boxes = []
+    for b in r.boxes:
+        xy = b.xyxy[0].cpu().numpy()
+        x1, y1 = max(0, int(xy[0])), max(0, int(xy[1]))
+        x2, y2 = min(w - 1, int(xy[2])), min(h - 1, int(xy[3]))
+        box_area = (x2 - x1) * (y2 - y1)
+        if box_area > 0.8 * img_area or box_area < 100:
+            continue
+        boxes.append((x1, y1, x2, y2))
+    
+    if not boxes:
+        return []
+
+    # 2. Use VARCO to read text in each box
+    def _ocr_one(bbox):
+        x1, y1, x2, y2 = bbox
+        crop = pil_img.crop((x1, y1, x2, y2))
+        
+        # VARCO guide recommends upscaling to 2304px
+        cw, ch = crop.size
+        target_size = 2304
+        if max(cw, ch) < target_size:
+            scale = target_size / max(cw, ch)
+            if scale > 4.0: 
+                scale = 4.0
+            crop = crop.resize((int(cw * scale), int(ch * scale)), Image.LANCZOS)
+            
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": crop},
+                    {"type": "text", "text": "<ocr>"},
+                ],
+            },
+        ]
+        
+        try:
+            with _varco_ocr_lock:
+                inputs = processor.apply_chat_template(
+                    conversation,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt"
+                ).to(model.device, torch.float16)
+
+                generate_ids = model.generate(**inputs, max_new_tokens=512)
+                
+                # Trim the input prompt from the output
+                generate_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generate_ids)
+                ]
+                text = processor.decode(generate_ids_trimmed[0], skip_special_tokens=False)
+                
+            for tok in ["<|im_end|>", "</s>"]:
+                text = text.replace(tok, "")
+            return bbox, text.strip()
+        except Exception as e:
+            logging.error(f"VARCO OCR failed on {bbox}: {e}")
+            return bbox, ""
+
+    out = []
+    for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
+        if text:
+            out.append({"text": text, "bbox": bbox})
     return out
 
 # ===========================================================================
@@ -1223,8 +1262,24 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
 
 def draw_text_outline(draw, pos, text, font, fill, outline, outline_width):
     x, y = pos
-    draw.text((x, y), text, font=font, fill=fill,
+    
+    # 1. Draw the outline ONCE behind the text. 
+    # PIL draws strokes centered on the glyph, so a thick stroke eats the text.
+    # Drawing it first prevents the black outline from covering the core.
+    draw.text((x, y), text, font=font, fill=outline,
               stroke_width=outline_width, stroke_fill=outline)
+    
+    # 2. Draw the text fill multiple times with 1px offsets.
+    # This "fakes" a heavy/bold font weight by expanding the core glyph outward,
+    # ensuring the fill color stays thick and vibrant on top of the outline.
+    offsets = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+    
+    # Add diagonal offsets for even heavier weight if the outline is thick
+    if outline_width > 2:
+        offsets.extend([(1, 1), (-1, 1), (1, -1), (-1, -1)])
+        
+    for dx, dy in offsets:
+        draw.text((x + dx, y + dy), text, font=font, fill=fill)
 
 # ===========================================================================
 # Core pipeline (Highly Concurrent Inpainting, Translation, Render Prep)
@@ -1296,8 +1351,8 @@ async def detect_translate_inpaint(pil_img: Image.Image,
         current_model = _current_ocr_model
 
     if current_model == "ko":
-        logging.info("Using PaddleOCR for Korean...")
-        blocks = await loop.run_in_executor(None, paddle_ocr_korean, pil_img)
+        logging.info("Using VARCO-VISION (transformers) for Korean (with YOLO bbox)...")
+        blocks = await loop.run_in_executor(None, varco_ocr_korean, pil_img)
     else:
         logging.info("Using Hayai OCR + YOLO for Japanese...")
         blocks = await loop.run_in_executor(None, hayai_ocr_with_yolo, pil_img)
@@ -1420,7 +1475,7 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             except Exception: cache[key] = ImageFont.load_default()
         font = cache[key]
         
-        outline_w = max(1, int(font_size * 0.08))
+        outline_w = max(1, int(font_size * 0.14))
 
         if is_vertical:
             col_widths = heights
@@ -1527,7 +1582,7 @@ async def _start_worker():
     loop.run_in_executor(_llm_executor, get_qwen)
     loop.run_in_executor(None, get_yolo)
     if _current_ocr_model == "ko":
-        loop.run_in_executor(None, get_paddle_ocr)
+        loop.run_in_executor(None, get_varco_ocr)
     else:
         loop.run_in_executor(None, get_hayai_ocr)
 
