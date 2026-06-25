@@ -363,8 +363,204 @@ def colorize_pil(pil_img: Image.Image,
 # ===========================================================================
 # GGUF model management
 # ===========================================================================
+
+def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
+    """Find a specific file in the HF Hub cache.
+
+    Cache layout: <cache>/models--{org}--{repo}/snapshots/{hash}/{filename}
+    Snapshot files are symlinks to blobs/.
+    """
+    cache_dir = _hf_hub_cache_dir()
+    if cache_dir is None:
+        return None
+    org, sep, name = repo_id.partition("/")
+    repo_dir_name = f"models--{org}--{name}" if sep else f"models--{name}"
+    repo_dir = cache_dir / repo_dir_name
+    snapshots = repo_dir / "snapshots"
+    if not snapshots.exists():
+        return None
+
+    # Prefer the commit hash from refs/main, but fall back to any snapshot
+    preferred_hash: Optional[str] = None
+    ref_file = repo_dir / "refs" / "main"
+    if ref_file.exists():
+        try:
+            preferred_hash = ref_file.read_text().strip()
+        except OSError:
+            pass
+
+    candidates: List[pathlib.Path] = []
+    if preferred_hash:
+        p = snapshots / preferred_hash / filename
+        if p.exists():
+            candidates.append(p)
+    for snap in sorted(snapshots.iterdir()):
+        p = snap / filename
+        if p.exists() and p not in candidates:
+            candidates.append(p)
+
+    for c in candidates:
+        try:
+            real = c.resolve()
+            if real.exists() and _is_valid_gguf(real):
+                return c  # return symlink path; caller can .resolve() if needed
+        except OSError:
+            continue
+    return None
+
+
+def _scan_hf_cache_for_ggufs() -> List[Dict[str, Any]]:
+    """Scan the HF Hub cache directory for all valid .gguf files."""
+    models: List[Dict[str, Any]] = []
+    cache_dir = _hf_hub_cache_dir()
+    if cache_dir is None:
+        return models
+    for repo_dir in cache_dir.iterdir():
+        if not repo_dir.is_dir() or not repo_dir.name.startswith("models--"):
+            continue
+        # Reconstruct repo_id: models--{org}--{name}  =>  org/name
+        stripped = repo_dir.name[len("models--"):]
+        parts = stripped.split("--")
+        repo_id = "/".join(parts) if len(parts) >= 2 else parts[0]
+        snapshots = repo_dir / "snapshots"
+        if not snapshots.exists():
+            continue
+        for snap in snapshots.iterdir():
+            if not snap.is_dir():
+                continue
+            for f in snap.glob("*.gguf"):
+                if not _is_valid_gguf(f):
+                    continue
+                try:
+                    size_mb = f.stat().st_size / (1024 * 1024)
+                except OSError:
+                    continue
+                models.append({
+                    "name": f"{repo_id.replace('/', '__')}__{f.name}",
+                    "repo_id": repo_id,
+                    "filename": f.name,
+                    "size_mb": round(size_mb, 1),
+                    "path": str(f.resolve()),
+                })
+    return models
+
+def _is_valid_gguf(path: pathlib.Path) -> bool:
+    """Return True only if the file exists, is reasonably sized, and starts with
+    the GGUF magic header ('GGUF' = 0x46554747 little-endian)."""
+    try:
+        if not path.exists():
+            return False
+        if path.stat().st_size < 1024:  # GGUFs are always much larger
+            return False
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        return magic == b"GGUF"
+    except OSError:
+        return False
+
+def _hf_hub_cache_dir() -> Optional[pathlib.Path]:
+    """Return the HuggingFace Hub local cache root, if it exists."""
+    for env_var in ("HF_HOME", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+        val = os.environ.get(env_var)
+        if val:
+            p = pathlib.Path(val)
+            if env_var == "HF_HOME":
+                p = p / "hub"
+            if p.exists():
+                return p
+    default = pathlib.Path.home() / ".cache" / "huggingface" / "hub"
+    return default if default.exists() else None
+
+
+def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
+    """Find a specific file in the HF Hub cache."""
+    cache_dir = _hf_hub_cache_dir()
+    if cache_dir is None:
+        return None
+    org, sep, name = repo_id.partition("/")
+    repo_dir_name = f"models--{org}--{name}" if sep else f"models--{name}"
+    repo_dir = cache_dir / repo_dir_name
+    snapshots = repo_dir / "snapshots"
+    if not snapshots.exists():
+        return None
+
+    preferred_hash: Optional[str] = None
+    ref_file = repo_dir / "refs" / "main"
+    if ref_file.exists():
+        try:
+            preferred_hash = ref_file.read_text().strip()
+        except OSError:
+            pass
+
+    candidates: List[pathlib.Path] = []
+    if preferred_hash:
+        p = snapshots / preferred_hash / filename
+        if p.exists():
+            candidates.append(p)
+    for snap in sorted(snapshots.iterdir()):
+        p = snap / filename
+        if p.exists() and p not in candidates:
+            candidates.append(p)
+
+    for c in candidates:
+        try:
+            real = c.resolve()
+            if real.exists() and _is_valid_gguf(real):
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def _scan_hf_cache_for_ggufs() -> List[Dict[str, Any]]:
+    """Scan the HF Hub cache directory for all valid .gguf files."""
+    models: List[Dict[str, Any]] = []
+    cache_dir = _hf_hub_cache_dir()
+    if cache_dir is None:
+        return models
+    for repo_dir in cache_dir.iterdir():
+        if not repo_dir.is_dir() or not repo_dir.name.startswith("models--"):
+            continue
+        stripped = repo_dir.name[len("models--"):]
+        parts = stripped.split("--")
+        repo_id = "/".join(parts) if len(parts) >= 2 else parts[0]
+        snapshots = repo_dir / "snapshots"
+        if not snapshots.exists():
+            continue
+        for snap in snapshots.iterdir():
+            if not snap.is_dir():
+                continue
+            for f in snap.glob("*.gguf"):
+                if not _is_valid_gguf(f):
+                    continue
+                try:
+                    size_mb = f.stat().st_size / (1024 * 1024)
+                except OSError:
+                    continue
+                models.append({
+                    "name": f"{repo_id.replace('/', '__')}__{f.name}",
+                    "repo_id": repo_id,
+                    "filename": f.name,
+                    "size_mb": round(size_mb, 1),
+                    "path": str(f.resolve()),
+                })
+    return models
+
 def _gguf_local_path(repo_id: str, filename: str) -> pathlib.Path:
-    safe = repo_id.replace("/", "__") + "__" + filename
+    repo_clean = repo_id.rstrip("/").replace("/", "__")
+    if repo_clean.lower().endswith(".gguf"):
+        repo_clean = repo_clean[:-5]
+    
+    file_stem = pathlib.Path(filename).stem
+    
+    # FIX: If the repo name already ends with the file stem, avoid doubling the name.
+    # E.g., "Manojb__Qwen_Qwen3.5-0.8B-Q4_K_M" + "Qwen_Qwen3.5-0.8B-Q4_K_M.gguf" 
+    # becomes "Manojb__Qwen_Qwen3.5-0.8B-Q4_K_M.gguf" instead of duplicating it.
+    if repo_clean.lower().endswith(file_stem.lower()):
+        safe = f"{repo_clean}.gguf"
+    else:
+        safe = f"{repo_clean}__{filename}"
+        
     return GGUF_DIR / safe
 
 import shutil
@@ -386,52 +582,131 @@ def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
 
     local_path = _gguf_local_path(repo_id, filename)
 
-    if local_path.exists() and local_path.stat().st_size > 1024:
+    # Clean up legacy doubled filenames
+    legacy_doubled = GGUF_DIR / f"{local_path.stem}__{filename}"
+    if legacy_doubled.exists() and legacy_doubled != local_path:
+        logging.warning(f"[GGUF] Removing legacy doubled file to save space: {legacy_doubled}")
+        try:
+            legacy_doubled.unlink()
+        except OSError as e:
+            logging.warning(f"[GGUF] Could not remove legacy file: {e}")
+
+    # 1) Check HuggingFace Hub Cache FIRST — use it directly, skip mirroring
+    #    (Windows often can't hardlink across drives, so we just use the resolved path)
+    hf_cached_path = _hf_cache_model_path(repo_id, filename)
+    if hf_cached_path is not None:
+        resolved = hf_cached_path.resolve()
+        logging.info(f"[GGUF] Using HF cache directly: {resolved}")
+        return resolved
+
+    # 2) If our local mirror is already a valid GGUF, use it.
+    if _is_valid_gguf(local_path):
         return local_path
 
-    logging.info(f"[GGUF] Ensuring {repo_id}/{filename} is downloaded via huggingface_hub...")
+    # Otherwise delete the stale/corrupt mirror if present.
+    if local_path.exists():
+        logging.warning(f"[GGUF] Local mirror {local_path} is missing/invalid — removing it.")
+        try:
+            local_path.unlink()
+        except OSError as e:
+            logging.warning(f"[GGUF] Could not remove stale mirror: {e}")
+
+    # 3) Pull from HF Hub via API
+    logging.info(f"[GGUF] Downloading {repo_id}/{filename} via huggingface_hub...")
     try:
         cached = pathlib.Path(hf_hub_download(repo_id=repo_id, filename=filename))
     except Exception as e:
-        logging.error(f"Failed to download {repo_id}/{filename}: {e}")
-        raise RuntimeError(f"404 Not Found or invalid repo. Check repo_id and filename. Error: {e}")
+        raise RuntimeError(
+            f"Failed to download {repo_id}/{filename}. "
+            f"Check repo_id/filename (HTTP 404 / LFS pointer / network). Error: {e}"
+        )
 
+    if not _is_valid_gguf(cached):
+        try:
+            with open(cached, "rb") as f:
+                head = f.read(64)
+            raise RuntimeError(
+                f"HF cache file is not a valid GGUF (bad magic). "
+                f"First 64 bytes: {head!r}. "
+                f"You may need `huggingface-cli download {repo_id} {filename} "
+                f"--local-dir ./models/gguf --force-download`."
+            )
+        except OSError:
+            raise RuntimeError("HF cache file is not a valid GGUF and could not be inspected.")
+
+    # 4) Return the HF cache path directly (skip mirroring to avoid cross-drive issues)
+    resolved = cached.resolve()
+    logging.info(f"[GGUF] Download complete, using HF cache path: {resolved}")
+    return resolved
+
+    if not _is_valid_gguf(cached):
+        try:
+            with open(cached, "rb") as f:
+                head = f.read(64)
+            raise RuntimeError(
+                f"HF cache file is not a valid GGUF (bad magic). "
+                f"First 64 bytes: {head!r}. "
+                f"You may need `huggingface-cli download {repo_id} {filename} "
+                f"--local-dir ./models/gguf --force-download`."
+            )
+        except OSError:
+            raise RuntimeError("HF cache file is not a valid GGUF and could not be inspected.")
+
+    # 4) Mirror to local_path
     local_path.parent.mkdir(parents=True, exist_ok=True)
     if local_path.exists() and local_path.stat().st_size != cached.stat().st_size:
-        local_path.unlink()
+        try: local_path.unlink()
+        except OSError: pass
     if not local_path.exists():
         try:
             os.link(cached, local_path)
+            logging.info(f"[GGUF] Hardlinked HF cache -> {local_path}")
         except OSError:
-            shutil.copy2(cached, local_path)
-    logging.info(f"[GGUF] Model mirrored to {local_path}")
+            try:
+                shutil.copy2(cached, local_path)
+                logging.info(f"[GGUF] Copied HF cache -> {local_path}")
+            except OSError as e:
+                logging.warning(f"[GGUF] Mirroring failed ({e}); using HF cache path: {cached}")
+                return cached
+
+    if not _is_valid_gguf(local_path):
+        logging.warning(f"[GGUF] Mirror {local_path} failed validation; using HF cache: {cached}")
+        return cached
+
     return local_path
 
 def list_local_gguf_models() -> List[Dict[str, Any]]:
     models: List[Dict[str, Any]] = []
-    if not GGUF_DIR.exists():
-        return models
+    
+    # 1. Scan hardcoded local models directory
+    if GGUF_DIR.exists():
+        for f in sorted(GGUF_DIR.glob("*.gguf")):
+            if not _is_valid_gguf(f):
+                continue
+            try:
+                size_mb = f.stat().st_size / (1024 * 1024)
+            except OSError:
+                continue
+            stem = f.stem
+            parts = stem.split("__")
+            if len(parts) >= 2:
+                filename_part = parts[-1]
+                repo_part = "/".join(parts[:-1])
+            else:
+                filename_part = stem
+                repo_part = stem
+            models.append({
+                "name": stem,
+                "repo_id": repo_part,
+                "filename": filename_part + ".gguf",
+                "size_mb": round(size_mb, 1),
+                "path": str(f),
+            })
+            
+    # 2. Scan HuggingFace Hub cache directory
+    models.extend(_scan_hf_cache_for_ggufs())
 
-    for f in sorted(GGUF_DIR.glob("*.gguf")):
-        try:
-            size_mb = f.stat().st_size / (1024 * 1024)
-        except OSError:
-            continue
-        stem = f.stem
-        parts = stem.split("__")
-        if len(parts) >= 2:
-            filename_part = parts[-1]
-            repo_part = "/".join(parts[:-1])
-        else:
-            filename_part = stem
-            repo_part = stem
-        models.append({
-            "name": stem,
-            "repo_id": repo_part,
-            "filename": filename_part + ".gguf",
-            "size_mb": round(size_mb, 1),
-            "path": str(f),
-        })
+    # Deduplicate by (repo_id, filename) in case it exists in both places
     seen = set()
     unique = []
     for m in models:
@@ -602,17 +877,42 @@ def get_qwen():
         with _qwen_model_lock:
             if _global_qwen is None:
                 path = _current_qwen_path
-                if path is None or not path.exists():
+                if path is None or not _is_valid_gguf(path):
+                    logging.info(f"[Qwen] Local model missing/invalid, locating via HF cache or download...")
                     path = download_gguf(_current_qwen_repo_id, _current_qwen_filename)
                     _current_qwen_path = path
+
+                # Resolve symlinks — on Windows without Developer Mode these are real files
+                try:
+                    path = path.resolve()
+                except Exception:
+                    pass
+
+                if not _is_valid_gguf(path):
+                    raise RuntimeError(
+                        f"Refusing to load invalid GGUF: {path}. "
+                        f"Delete it and restart, or call /v1/changemodel with a valid repo."
+                    )
+
                 logging.info(f"[Qwen] loading {path} ...")
-                _global_qwen = Llama(
-                    model_path=str(path),
-                    n_ctx=2048,
-                    n_threads=max(4, os.cpu_count() or 4),
-                    n_gpu_layers=-1,
-                    verbose=False,
-                )
+                try:
+                    _global_qwen = Llama(
+                        model_path=str(path),
+                        n_ctx=2048,
+                        n_threads=max(4, os.cpu_count() or 4),
+                        n_gpu_layers=-1,
+                        verbose=False,
+                    )
+                except Exception as e:
+                    logging.error(f"[Qwen] Failed to load GGUF from {path}: {e}")
+                    raise RuntimeError(
+                        f"llama-cpp-python failed to load {path}. "
+                        f"This is likely a version mismatch, not a corrupt file. "
+                        f"Run: pip uninstall llama-cpp-python -y && "
+                        f"pip install llama-cpp-python --extra-index-url "
+                        f"https://abetlen.github.io/llama-cpp-python/whl/cpu"
+                    )
+
                 logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename}")
     return _global_qwen
 
