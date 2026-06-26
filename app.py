@@ -1406,10 +1406,24 @@ async def detect_translate_inpaint(pil_img: Image.Image,
 
     if current_model == "ko":
         logging.info("Using VARCO-VISION (transformers) for Korean (with YOLO bbox)...")
-        blocks = await loop.run_in_executor(None, varco_ocr_korean, pil_img)
+        try:
+            blocks = await asyncio.wait_for(
+                loop.run_in_executor(None, varco_ocr_korean, pil_img),
+                timeout=90.0,
+            )
+        except asyncio.TimeoutError:
+            logging.error("[OCR] VARCO Korean OCR timed out after 90s — aborting job.")
+            raise RuntimeError("Korean OCR timed out (VARCO VLM generation hung)")
     else:
         logging.info("Using Hayai OCR + YOLO for Japanese...")
-        blocks = await loop.run_in_executor(None, hayai_ocr_with_yolo, pil_img)
+        try:
+            blocks = await asyncio.wait_for(
+                loop.run_in_executor(None, hayai_ocr_with_yolo, pil_img),
+                timeout=90.0,
+            )
+        except asyncio.TimeoutError:
+            logging.error("[OCR] Hayai Japanese OCR timed out after 90s — aborting job.")
+            raise RuntimeError("Japanese OCR timed out")
 
     cleaned = []
     for b in blocks:
@@ -1579,6 +1593,8 @@ async def detect_translate_inpaint(pil_img: Image.Image,
 # ===========================================================================
 def _cleanup_old_jobs():
     now = time.time()
+    
+    # 1. Clean up finished jobs older than 10 minutes
     to_remove = [
         jid for jid, j in _jobs.items()
         if j["status"] in ("done", "error")
@@ -1586,6 +1602,21 @@ def _cleanup_old_jobs():
     ]
     for jid in to_remove:
         _jobs.pop(jid, None)
+
+    # 2. Failsafe: Evict jobs stuck in "running" for more than 5 minutes
+    stuck_running = [
+        jid for jid, j in _jobs.items()
+        if j["status"] == "running"
+        and now - j.get("started_at", now) > 300
+    ]
+    for jid in stuck_running:
+        j = _jobs.get(jid)
+        if j:
+            j["status"] = "error"
+            j["error"] = "Job evicted by cleanup (stuck in running for > 5 mins)"
+            j["traceback"] = "Evicted by _cleanup_old_jobs"
+            j["completed_at"] = now
+            logging.error(f"Job {jid} evicted by cleanup (stuck > 300s).")
 
 async def job_worker():
     global _job_queue
@@ -1602,9 +1633,13 @@ async def job_worker():
             use_lama = job["_use_lama"]
             colorize = job.get("_colorize", False)
             target_lang = job.get("_target_lang", "en")
-            
-            result_img, boxes = await detect_translate_inpaint(
-                pil, use_lama=use_lama, colorize=colorize, target_lang=target_lang
+
+            result_img, boxes = await asyncio.wait_for(
+                detect_translate_inpaint(
+                    pil, use_lama=use_lama,
+                    colorize=colorize, target_lang=target_lang,
+                ),
+                timeout=180.0,
             )
             buf = io.BytesIO()
             try:
@@ -1617,6 +1652,11 @@ async def job_worker():
             job["status"] = "done"
             job["completed_at"] = time.time()
             logging.info(f"Job {job_id} completed successfully.")
+        except asyncio.TimeoutError:
+            job["status"] = "error"
+            job["error"] = "Job exceeded 180s wall-clock timeout (likely OCR hang)"
+            job["traceback"] = "TimeoutError in job_worker"
+            logging.error(f"Job {job_id} hard-killed after 180s.")
         except Exception as e:
             job["status"] = "error"
             job["error"] = f"{type(e).__name__}: {e}"
