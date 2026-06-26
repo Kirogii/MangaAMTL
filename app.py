@@ -56,12 +56,12 @@ def get_llm_gpu_layers() -> int:
 # Log once at import time so it shows in /console
 logging.info(f"[Device] CUDA available: {has_cuda()} -> device='{get_torch_device()}'")
 
-# --- VARCO OCR Config (transformers) ---
+# --- GLM OCR Config (transformers) ---
 
-_varco_ocr_model = None
-_varco_ocr_processor = None
-_varco_ocr_lock = threading.Lock() # Transformers models are not thread-safe
-VARCO_OCR_REPO = "OpenLLM-Korea/VARCO-VISION-2.0-1.7B-OCR"
+_glm_ocr_model = None
+_glm_ocr_processor = None
+_glm_ocr_lock = threading.Lock() # Transformers models are not thread-safe
+GLM_OCR_REPO = "zai-org/GLM-OCR"
 
 # --- Optional deps ---------------------------------------------------------
 try:
@@ -805,46 +805,48 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     return out
 
 # ===========================================================================
-# VARCO OCR (Korean - transformers)
+# GLM OCR (Korean - transformers)
 # ===========================================================================
-def get_varco_ocr():
-    global _varco_ocr_model, _varco_ocr_processor
-    if _varco_ocr_model is None:
+def get_glm_ocr():
+    global _glm_ocr_model, _glm_ocr_processor
+    if _glm_ocr_model is None:
         try:
-            from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
+            from transformers import AutoProcessor, AutoModelForImageTextToText
         except ImportError:
             raise RuntimeError("transformers not installed: pip install transformers accelerate torch")
 
-        has_gpu = has_cuda()
-        dtype = torch.float16 if has_gpu else torch.float32
-        device = "cuda" if has_gpu else "cpu"
+        if not has_cuda():
+            raise RuntimeError("PyTorch can't see your CUDA GPU. Did you install the CUDA version of PyTorch?")
 
-        logging.info(f"[VARCO OCR] Loading {VARCO_OCR_REPO} (device={device}, dtype={dtype})...")
-        with _varco_ocr_lock:
-            if _varco_ocr_model is None:
-                _varco_ocr_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-                    VARCO_OCR_REPO,
+        dtype = torch.float16
+        device = "cuda"
+
+        logging.info(f"[GLM OCR] Loading {GLM_OCR_REPO} on GPU (dtype={dtype})...")
+        with _glm_ocr_lock:
+            if _glm_ocr_model is None:
+                # AutoModelForImageTextToText automatically handles the GLM architecture
+                _glm_ocr_model = AutoModelForImageTextToText.from_pretrained(
+                    GLM_OCR_REPO,
                     torch_dtype=dtype,
                     attn_implementation="sdpa",
-                    device_map="auto" if has_gpu else {"": "cpu"},
-                )
-                _varco_ocr_processor = AutoProcessor.from_pretrained(VARCO_OCR_REPO)
-                if not has_gpu:
-                    _varco_ocr_model = _varco_ocr_model.to("cpu")
-                logging.info(f"[VARCO OCR] Model loaded on {device}.")
-    return _varco_ocr_model, _varco_ocr_processor
+                    low_cpu_mem_usage=True,
+                ).to(device)
+                _glm_ocr_model.eval()
+                
+                _glm_ocr_processor = AutoProcessor.from_pretrained(GLM_OCR_REPO)
+                logging.info(f"[GLM OCR] Model loaded on {device}.")
+    return _glm_ocr_model, _glm_ocr_processor
 
-def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
-    model, processor = get_varco_ocr()
+def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
+    model, processor = get_glm_ocr()
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
     
     # 1. Use YOLO to find text boxes
     yolo = get_yolo()
-    logging.info(f"[VARCO OCR] Running YOLO text detection on {w}x{h} image...")
-    results = yolo(img_bgr, verbose=False, conf=0.4)
+    logging.info(f"[GLM OCR] Running YOLO text detection on {w}x{h} image...")
+    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
     if not results:
-        logging.info("[VARCO OCR] No text boxes found by YOLO.")
         return []
 
     r = results[0]
@@ -860,61 +862,67 @@ def varco_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         boxes.append((x1, y1, x2, y2))
     
     if not boxes:
-        logging.info("[VARCO OCR] YOLO found boxes, but none passed size filters.")
         return []
 
-    logging.info(f"[VARCO OCR] Found {len(boxes)} valid text boxes. Running VARCO OCR on each...")
+    logging.info(f"[GLM OCR] Found {len(boxes)} valid text boxes. Running GLM OCR on each...")
 
-    # 2. Use VARCO to read text in each box
+    # 2. Normalize image size for speed/accuracy
+    TARGET_MAX = 1024
+    TARGET_MIN = 384  
+
     def _ocr_one(bbox):
         x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
         
-        # Reduced from 2304 to 1024 to prevent CPU hanging.
-        # 2304px on a 1.7B VLM on CPU takes minutes per bubble.
-        target_size = 1024 
         cw, ch = crop.size
-        if max(cw, ch) < target_size:
-            scale = target_size / max(cw, ch)
-            if scale > 4.0: 
-                scale = 4.0
+        longest = max(cw, ch)
+        if longest > TARGET_MAX:
+            scale = TARGET_MAX / longest
+            crop = crop.resize((int(cw * scale), int(ch * scale)), Image.LANCZOS)
+        elif longest < TARGET_MIN:
+            scale = TARGET_MIN / longest
+            if scale > 3.0: scale = 3.0
             crop = crop.resize((int(cw * scale), int(ch * scale)), Image.LANCZOS)
             
+        # Standard OCR prompt for VLMs
         conversation = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": crop},
-                    {"type": "text", "text": "<ocr>"},
+                    {"type": "text", "text": "Extract all text in the image."},
                 ],
             },
         ]
         
         try:
-            with _varco_ocr_lock:
+            with _glm_ocr_lock, torch.inference_mode():
                 inputs = processor.apply_chat_template(
                     conversation,
                     add_generation_prompt=True,
                     tokenize=True,
                     return_dict=True,
                     return_tensors="pt"
-                ).to(model.device, model.dtype) # <--- Changed from torch.float16 to model.dtype
+                ).to(model.device, model.dtype)
 
-                logging.info(f"[VARCO OCR] Running VLM generation on box {bbox}...")
-                generate_ids = model.generate(**inputs, max_new_tokens=128)
+                generate_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=64,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                )
                 
-                # Trim the input prompt from the output
                 generate_ids_trimmed = [
                     out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generate_ids)
                 ]
-                text = processor.decode(generate_ids_trimmed[0], skip_special_tokens=False)
+                text = processor.decode(generate_ids_trimmed[0], skip_special_tokens=True)
                 
-            for tok in ["<|im_end|>", "</s>"]:
-                text = text.replace(tok, "")
-            logging.info(f"[VARCO OCR] Box {bbox} read: '{text[:30]}'")
-            return bbox, text.strip()
+            text = text.split("<|im_end|>")[0].split("</s>")[0].strip()
+            logging.info(f"[GLM OCR] Box {bbox} read: '{text[:30]}'")
+            return bbox, text
         except Exception as e:
-            logging.error(f"VARCO OCR failed on {bbox}: {e}")
+            logging.error(f"GLM OCR failed on {bbox}: {e}")
             return bbox, ""
 
     out = []
@@ -1405,10 +1413,10 @@ async def detect_translate_inpaint(pil_img: Image.Image,
         current_model = _current_ocr_model
 
     if current_model == "ko":
-        logging.info("Using VARCO-VISION (transformers) for Korean (with YOLO bbox)...")
+        logging.info("Using GLM-OCR (transformers) for Korean (with YOLO bbox)...")
         try:
             blocks = await asyncio.wait_for(
-                loop.run_in_executor(None, varco_ocr_korean, pil_img),
+                loop.run_in_executor(None, glm_ocr_korean, pil_img),
                 timeout=90.0,
             )
         except asyncio.TimeoutError:
@@ -1423,7 +1431,7 @@ async def detect_translate_inpaint(pil_img: Image.Image,
             )
         except asyncio.TimeoutError:
             logging.error("[OCR] Hayai Japanese OCR timed out after 90s — aborting job.")
-            raise RuntimeError("Japanese OCR timed out")
+            raise RuntimeError("Japanese OCR timed out (Hayai+YOLO pipeline hung)")
 
     cleaned = []
     for b in blocks:
@@ -1676,7 +1684,7 @@ async def _start_worker():
     loop.run_in_executor(_llm_executor, get_qwen)
     loop.run_in_executor(None, get_yolo)
     if _current_ocr_model == "ko":
-        loop.run_in_executor(None, get_varco_ocr)
+        loop.run_in_executor(None, get_glm_ocr)
     else:
         loop.run_in_executor(None, get_hayai_ocr)
 
