@@ -1,12 +1,13 @@
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 --extra-index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+
+llama-cpp-python
 
 fastapi
 pydantic
 pillow
 numpy==1.26.4
 opencv-python>=4.11.0.86
-llama-cpp-python==0.3.16
 ultralytics==8.3.190
 simple-lama-inpainting-updated
 onnxruntime-gpu
