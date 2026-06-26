@@ -1,4 +1,6 @@
 #      **           MangaAMTL is an open-source manga translation tool mainly for japanese manga**
+Take note this is mostly a project for myself so if theres any bugs it will be fixed in the next version so im not fixing a bunch of problems (Although im testing the installation/Usage of the program fully so there shouldnt be too many problems for you
+
 <p align="center">
   <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/English.png?raw=true" alt="Preview1" width="45%" />
   <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/Raw.png?raw=true" alt="Preview2" width="45%" />
