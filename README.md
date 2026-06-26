@@ -1,4 +1,4 @@
-#      **           MangaAMTL is an open-source manga translation tool**
+#      **           MangaAMTL is an open-source manga translation tool mainly for japanese manga**
 <p align="center">
   <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/English.png?raw=true" alt="Preview1" width="45%" />
   <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/Raw.png?raw=true" alt="Preview2" width="45%" />
@@ -50,7 +50,7 @@ ________________________________________________________________________________
 - https://huggingface.co/Qwen/Qwen3.5-0.8B
 - https://huggingface.co/sharky172/manga-light-colorizer/
 - https://huggingface.co/Kirogii/Yolo-Manga_Textbox-Region_Detect/
-- https://huggingface.co/OpenLLM-Korea/VARCO-VISION-2.0-1.7B-OCR
+- https://huggingface.co/OpenLLM-Korea/VARCO-VISION-2.0-1.7B-OCR (really slow on my pc note to change later)
 _________________________________________________________________________________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
 _________________________________________________________________________________________________________________________________________________________
