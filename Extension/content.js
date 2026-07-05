@@ -35,14 +35,15 @@
     floatBtn.onclick = (e) => { e.stopPropagation(); toggleFloatPopup(); };
     document.body.appendChild(floatBtn);
 
-    // 2. Popup Menu — now includes Target Language selector
+    // 2. Popup Menu — includes Target Language, Font Boldness, and Model selectors
     floatPopup = document.createElement('div');
     floatPopup.style.cssText = `
       position: fixed; top: 50%; left: 75px; transform: translateY(-50%);
       z-index: 2147483647; padding: 15px; background: #1e1e2e;
       border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-      font-family: Arial, sans-serif; display: none; width: 240px;
+      font-family: Arial, sans-serif; display: none; width: 260px;
       color: #e0e0e0; border: 1px solid #444;
+      max-height: 85vh; overflow-y: auto;
     `;
     floatPopup.innerHTML = `
       <div style="margin-bottom: 8px; font-weight: bold; color: #ffffff;">OCR Language</div>
@@ -70,6 +71,47 @@
         </select>
       </div>
 
+      <div style="margin-bottom: 14px;">
+        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Font Boldness</div>
+        <select id="mtFontWeightSelect" style="
+          width: 100%; padding: 7px 8px; border-radius: 4px;
+          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
+          font-size: 13px; cursor: pointer;
+        ">
+          <option value="0">1 - Thin</option>
+          <option value="1">2 - Light</option>
+          <option value="2" selected>3 - Regular</option>
+          <option value="3">4 - Bold</option>
+          <option value="4">5 - Heavy</option>
+        </select>
+      </div>
+
+      <div style="margin-bottom: 14px;">
+        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Translation Model</div>
+        <select id="mtModelTypeSelect" style="
+          width: 100%; padding: 7px 8px; border-radius: 4px;
+          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
+          font-size: 13px; cursor: pointer; margin-bottom: 8px;
+        ">
+          <option value="local">Local (GGUF)</option>
+          <option value="openrouter">OpenRouter</option>
+        </select>
+        <div id="mtOpenrouterRow" style="display:none; padding: 8px; background: #16161f; border-radius: 4px; border: 1px solid #333;">
+          <input type="text" id="mtOpenrouterModel" placeholder="e.g. openai/gpt-4o-mini" style="
+            width: 100%; padding: 7px 8px; margin-bottom: 6px; box-sizing: border-box;
+            border: 1px solid #555; border-radius: 4px; background: #2a2a3c; color: #e0e0e0; font-size: 12px;">
+          <input type="text" id="mtOpenrouterKey" placeholder="OpenRouter API Key" style="
+            width: 100%; padding: 7px 8px; margin-bottom: 6px; box-sizing: border-box;
+            border: 1px solid #555; border-radius: 4px; background: #2a2a3c; color: #e0e0e0; font-size: 12px;">
+          <button id="mtSetModelBtn" style="
+            width: 100%; padding: 8px; background: #3a3f4b; color: #fff;
+            border: 1px solid #555; border-radius: 4px; cursor: pointer;
+            font-weight: bold; font-size: 12px;
+          ">Set Model</button>
+          <div id="mtModelStatus" style="margin-top: 6px; font-size: 11px; color: #28a745;"></div>
+        </div>
+      </div>
+
       <button id="mtStartBtn" style="
         width: 100%; padding: 10px; background: #28a745; color: white;
         border: none; border-radius: 4px; cursor: pointer;
@@ -83,19 +125,106 @@
     `;
     document.body.appendChild(floatPopup);
 
-    // Restore saved targetLang into the dropdown
-    chrome.storage.local.get(['targetLang'], (data) => {
+    // Restore saved settings into the dropdowns
+    chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel'], (data) => {
       const sel = document.getElementById('mtTargetLangSelect');
       if (sel && data.targetLang) sel.value = data.targetLang;
+
+      const weightSel = document.getElementById('mtFontWeightSelect');
+      if (weightSel && data.fontWeight !== undefined) weightSel.value = data.fontWeight;
+
+      const modelTypeSel = document.getElementById('mtModelTypeSelect');
+      const openrouterRow = document.getElementById('mtOpenrouterRow');
+      if (modelTypeSel) {
+        modelTypeSel.value = data.modelType || 'local';
+        openrouterRow.style.display = modelTypeSel.value === 'openrouter' ? 'block' : 'none';
+      }
+      if (data.openrouterModel) {
+        const orModelInput = document.getElementById('mtOpenrouterModel');
+        if (orModelInput) orModelInput.value = data.openrouterModel;
+      }
     });
 
-    // Translate All button — reads both OCR model and target language from the popup
-    document.getElementById('mtStartBtn').onclick = () => {
-      const selectedModel = document.querySelector('input[name="mtOcrModel"]:checked').value;
-      const selectedLang  = document.getElementById('mtTargetLangSelect').value;
-      // Persist the chosen language so the extension popup stays in sync
-      chrome.storage.local.set({ targetLang: selectedLang });
+    // Toggle OpenRouter fields when model type changes
+    document.getElementById('mtModelTypeSelect').onchange = (e) => {
+      document.getElementById('mtOpenrouterRow').style.display = e.target.value === 'openrouter' ? 'block' : 'none';
+      chrome.storage.local.set({ modelType: e.target.value });
+    };
+
+    // Set OpenRouter model on the server
+    document.getElementById('mtSetModelBtn').onclick = async () => {
+      const statusEl = document.getElementById('mtModelStatus');
+      const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
+      const model = document.getElementById('mtOpenrouterModel').value.trim();
+      const apiKey = document.getElementById('mtOpenrouterKey').value.trim();
+
+      if (!serverUrl) { alert("Please set your FastAPI Server URL in Advanced Settings first!"); return; }
+      if (!model) { alert("Please enter an OpenRouter model ID."); return; }
+
+      statusEl.innerText = 'Setting model...';
+      try {
+        const body = { model_type: 'openrouter', model: model };
+        if (apiKey) body.api_key = apiKey;
+
+        const res = await fetch(`${serverUrl}/SetModelType`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (res.ok) {
+          chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model });
+          statusEl.innerText = `Active: ${data.openrouter_model}`;
+        } else {
+          statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
+        }
+      } catch (e) {
+        statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
+      }
+    };
+
+    // Translate All button — reads OCR model, target language, font weight, and model type
+    document.getElementById('mtStartBtn').onclick = async () => {
+      const selectedModel     = document.querySelector('input[name="mtOcrModel"]:checked').value;
+      const selectedLang      = document.getElementById('mtTargetLangSelect').value;
+      const selectedWeight    = document.getElementById('mtFontWeightSelect').value;
+      const selectedModelType = document.getElementById('mtModelTypeSelect').value;
+
+      // Persist choices so the extension popup stays in sync
+      chrome.storage.local.set({
+        targetLang: selectedLang,
+        fontWeight: selectedWeight,
+        modelType: selectedModelType
+      });
       floatPopup.style.display = 'none';
+
+      const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
+      if (serverUrl) {
+        // Push font boldness to server
+        try {
+          await fetch(`${serverUrl}/SetFont`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stroke_width: parseInt(selectedWeight, 10) })
+          });
+        } catch (e) {
+          console.warn('[MangaTranslator] Failed to push font weight to server:', e);
+        }
+
+        // If Local is selected, ensure server is switched back to local model
+        if (selectedModelType === 'local') {
+          try {
+            await fetch(`${serverUrl}/SetModelType`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model_type: 'local' })
+            });
+          } catch (e) {
+            console.warn('[MangaTranslator] Failed to switch server to local model:', e);
+          }
+        }
+      }
+
       startTranslationProcess(selectedModel, selectedLang);
     };
 
@@ -109,10 +238,24 @@
     if (floatPopup.style.display === 'block') {
       floatPopup.style.display = 'none';
     } else {
-      // Re-sync dropdown with storage every time popup opens
-      chrome.storage.local.get(['targetLang'], (data) => {
+      // Re-sync dropdowns with storage every time popup opens
+      chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel'], (data) => {
         const sel = document.getElementById('mtTargetLangSelect');
         if (sel && data.targetLang) sel.value = data.targetLang;
+
+        const weightSel = document.getElementById('mtFontWeightSelect');
+        if (weightSel && data.fontWeight !== undefined) weightSel.value = data.fontWeight;
+
+        const modelTypeSel = document.getElementById('mtModelTypeSelect');
+        const openrouterRow = document.getElementById('mtOpenrouterRow');
+        if (modelTypeSel) {
+          modelTypeSel.value = data.modelType || 'local';
+          openrouterRow.style.display = modelTypeSel.value === 'openrouter' ? 'block' : 'none';
+        }
+        if (data.openrouterModel) {
+          const orModelInput = document.getElementById('mtOpenrouterModel');
+          if (orModelInput) orModelInput.value = data.openrouterModel;
+        }
       });
       floatPopup.style.display = 'block';
     }
@@ -223,7 +366,7 @@
           style="padding: 10px 15px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">
           Download &amp; Switch
         </button>
-        <div id="mtModelStatus" style="margin-top: 10px; font-size: 14px; color: #28a745;"></div>
+        <div id="mtModelInstallStatus" style="margin-top: 10px; font-size: 14px; color: #28a745;"></div>
       </div>
     `);
 
@@ -288,7 +431,7 @@
             btn.addEventListener('click', async (e) => {
               const repo = e.target.dataset.repo;
               const file = e.target.dataset.file;
-              modal.querySelector('#mtModelStatus').innerText = `Switching to ${repo}/${file}...`;
+              modal.querySelector('#mtModelInstallStatus').innerText = `Switching to ${repo}/${file}...`;
               try {
                 const res  = await fetch(`${serverUrl}/v1/changemodel`, {
                   method: 'POST',
@@ -297,12 +440,12 @@
                 });
                 const data = await res.json();
                 if (res.ok) {
-                  modal.querySelector('#mtModelStatus').innerText = `Active: ${data.repo_id}/${data.filename}`;
+                  modal.querySelector('#mtModelInstallStatus').innerText = `Active: ${data.repo_id}/${data.filename}`;
                 } else {
-                  modal.querySelector('#mtModelStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
+                  modal.querySelector('#mtModelInstallStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
                 }
               } catch (err) {
-                modal.querySelector('#mtModelStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${err}</span>`;
+                modal.querySelector('#mtModelInstallStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${err}</span>`;
               }
             });
           });
@@ -319,7 +462,7 @@
       const repo = modal.querySelector('#mtCustomRepo').value.trim();
       const file = modal.querySelector('#mtCustomFile').value.trim();
       if (!repo) { alert("Please enter a Repo ID."); return; }
-      modal.querySelector('#mtModelStatus').innerText = `Downloading & switching to ${repo}/${file || 'auto'}...`;
+      modal.querySelector('#mtModelInstallStatus').innerText = `Downloading & switching to ${repo}/${file || 'auto'}...`;
       try {
         const res  = await fetch(`${serverUrl}/v1/changemodel`, {
           method: 'POST',
@@ -328,13 +471,13 @@
         });
         const data = await res.json();
         if (res.ok) {
-          modal.querySelector('#mtModelStatus').innerText = `Success! Active: ${data.repo_id}/${data.filename}`;
+          modal.querySelector('#mtModelInstallStatus').innerText = `Success! Active: ${data.repo_id}/${data.filename}`;
           modal.querySelector('#mtRefreshModelsBtn').click();
         } else {
-          modal.querySelector('#mtModelStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
+          modal.querySelector('#mtModelInstallStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
         }
       } catch (err) {
-        modal.querySelector('#mtModelStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${err}</span>`;
+        modal.querySelector('#mtModelInstallStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${err}</span>`;
       }
     });
   }
@@ -374,14 +517,8 @@
       return;
     }
 
-    // Switch OCR model on server
-    try {
-      const resp = await fetch(`${serverUrl}/setmodel?model=${targetOcr}`, { method: "POST" });
-      if (!resp.ok) console.warn(`[MangaTranslator] Server returned ${resp.status} when switching OCR model`);
-      else console.log(`[MangaTranslator] OCR model switched to ${targetOcr}`);
-    } catch (e) {
-      console.warn("[MangaTranslator] Failed to switch OCR model on server:", e);
-    }
+    // Note: OCR language is sent per-request as `ocr_lang` in the /v1/translate
+    // form submission, so no separate "switch OCR model" call is needed here.
 
     let images = findAllTranslatableImages();
     if (images.length === 0) {
@@ -405,7 +542,7 @@
       img.style.outlineOffset = '-4px';
 
       try {
-        await processImage(img, serverUrl, colorize, targetLanguage);
+        await processImage(img, serverUrl, colorize, targetLanguage, targetOcr);
         console.log(`[MangaTranslator] ✅ Done: ${img.dataset.mtTargetSrc}`);
       } catch (e) {
         console.error(`[MangaTranslator] ❌ Failed: ${img.src}`, e);
@@ -523,7 +660,7 @@
   // ========================================================================
   // PROCESS A SINGLE IMAGE
   // ========================================================================
-  async function processImage(img, serverUrl, colorize, targetLang) {
+  async function processImage(img, serverUrl, colorize, targetLang, ocrLang) {
     const targetSrc = img.dataset.mtTargetSrc;
 
     const fetchResponse = await chrome.runtime.sendMessage({ type: "fetchImage", url: targetSrc });
@@ -535,6 +672,7 @@
       base64Data:  fetchResponse.base64,
       colorize:    colorize,
       targetLang:  targetLang,
+      ocrLang:     ocrLang,
     });
 
     if (!submitResponse.success) throw new Error(submitResponse.error || "API submission failed");
