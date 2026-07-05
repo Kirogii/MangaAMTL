@@ -4,6 +4,7 @@
        /v1/translate /v1/translate/{id} /v1/translate/{id}/image
        /v1/changemodel /v1/listmodels /v1/colorize
        /v1/ai/resolve /v1/ai/prompt/default
+       /SetFont /GetFont /SetModelType /GetModelType /SetOpenRouterModel
 - Logs: /console endpoint to view all backend logs and errors
 """
 
@@ -20,6 +21,7 @@ import uuid
 import logging
 import threading
 import functools
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,29 +40,24 @@ from fastapi.middleware.cors import CORSMiddleware
 import torch
 
 def has_cuda() -> bool:
-    """True if a CUDA-capable GPU is available to PyTorch."""
     try:
         return torch.cuda.is_available()
     except Exception:
         return False
 
 def get_torch_device() -> str:
-    """Return 'cuda' if available, otherwise 'cpu'."""
     return "cuda" if has_cuda() else "cpu"
 
 def get_llm_gpu_layers() -> int:
-    """Return number of layers to offload to GPU for llama-cpp-python.
-    -1 = offload all, 0 = CPU only."""
     return -1 if has_cuda() else 0
 
-# Log once at import time so it shows in /console
 logging.info(f"[Device] CUDA available: {has_cuda()} -> device='{get_torch_device()}'")
 
 # --- GLM OCR Config (transformers) ---
 
 _glm_ocr_model = None
 _glm_ocr_processor = None
-_glm_ocr_lock = threading.Lock() # Transformers models are not thread-safe
+_glm_ocr_lock = threading.Lock()
 GLM_OCR_REPO = "zai-org/GLM-OCR"
 
 # --- Optional deps ---------------------------------------------------------
@@ -93,20 +90,20 @@ except Exception:
 import re
 
 _ALLOWED_RANGES = (
-    (0x0020, 0x007E),   # Basic Latin (English)
-    (0x00A0, 0x00FF),   # Latin-1 Supplement (Spanish)
-    (0x0100, 0x017F),   # Latin Extended-A
-    (0x0180, 0x024F),   # Latin Extended-B
-    (0x0400, 0x04FF),   # Cyrillic (Russian)
-    (0x0500, 0x052F),   # Cyrillic Supplement
-    (0x2000, 0x206F),   # General Punctuation
-    (0x3000, 0x303F),   # CJK Symbols and Punctuation
-    (0x3040, 0x309F),   # Japanese Hiragana
-    (0x30A0, 0x30FF),   # Japanese Katakana
-    (0x3400, 0x4DBF),   # CJK Unified Ideographs Extension A
-    (0x4E00, 0x9FFF),   # CJK Unified Ideographs (Kanji/Hanja)
-    (0xAC00, 0xD7AF),   # Korean Hangul Syllables
-    (0xFF00, 0xFFEF),   # Halfwidth and Fullwidth Forms
+    (0x0020, 0x007E),
+    (0x00A0, 0x00FF),
+    (0x0100, 0x017F),
+    (0x0180, 0x024F),
+    (0x0400, 0x04FF),
+    (0x0500, 0x052F),
+    (0x2000, 0x206F),
+    (0x3000, 0x303F),
+    (0x3040, 0x309F),
+    (0x30A0, 0x30FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7AF),
+    (0xFF00, 0xFFEF),
 )
 
 _ALLOWED_LOWS  = tuple(r[0] for r in _ALLOWED_RANGES)
@@ -135,7 +132,6 @@ def clean_text_for_font(text: str) -> str:
         )
         clean_text_for_font._re_space = re.compile(r'[ \t]+')
         clean_text_for_font._re_nl   = re.compile(r'\n+')
-    
     out = text.translate(clean_text_for_font._punct_table)
     out = ''.join(
         ch for ch in out
@@ -156,7 +152,13 @@ YOLO_HF_RAW = "https://huggingface.co/Kirogii/Yolo-Manga_Textbox-Region_Detect/r
 Qwen_REPO_ID = "Manojb/Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
 Qwen_MODEL_FILENAME = "Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
 
-INPAINT_RADIUS_CV2 = 3
+INPAINT_RADIUS_CV2 = 7  # Increased from 5
+INPAINT_TELEA_RADIUS = 10
+INPAINT_NS_RADIUS = 7
+INPAINT_DILATE_PASSES = 2
+INPAINT_FEATHER_PX = 3
+INPAINT_USE_MULTI_PASS = True
+INPAINT_COLOR_MATCH = True
 
 FONT_DIR = ROOT_DIR / "fonts"
 FONT_DIR.mkdir(parents=True, exist_ok=True)
@@ -254,6 +256,21 @@ _worker_task = None
 _llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
 _llm_lock = threading.Lock()
 
+# Inpainting executor (runs in thread pool since it can be slow)
+_inpaint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inpaint")
+_inpaint_lock = threading.Lock()
+
+# --- Font Configuration Globals ---
+_current_font_path: pathlib.Path = FONT_PATH
+_current_stroke_width: int = 0
+_font_config_lock = threading.Lock()
+
+# --- Model Type Configuration Globals ---
+_current_model_type: str = "local"
+_openrouter_api_key: Optional[str] = None
+_openrouter_model: str = "openai/gpt-4o-mini"
+_model_type_lock = threading.Lock()
+
 # ===========================================================================
 # Download helpers
 # ===========================================================================
@@ -273,7 +290,7 @@ def ensure_yolo():
     return YOLO_MODEL_PATH
 
 # ===========================================================================
-# Image utils (Optimized: no-copy conversion)
+# Image utils
 # ===========================================================================
 def pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
     arr = np.asarray(pil_img.convert("RGB"))
@@ -283,11 +300,9 @@ def cv2_to_pil(cv2_img: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB))
 
 # ===========================================================================
-# Colorizer (ONNX) — Manga Light Colorizer v6
+# Colorizer (ONNX)
 # ===========================================================================
 def ensure_colorizer_models():
-    import shutil
-    
     if not COLORIZER_GENERATOR_PATH.exists() or COLORIZER_GENERATOR_PATH.stat().st_size < 10000:
         logging.info(f"[Colorizer] Downloading generator via HuggingFace...")
         try:
@@ -296,7 +311,7 @@ def ensure_colorizer_models():
             shutil.copy(str(p), str(COLORIZER_GENERATOR_PATH))
         except ImportError:
             download_if_missing(COLORIZER_GENERATOR_URL, COLORIZER_GENERATOR_PATH)
-            
+
     if not COLORIZER_SAM_PATH.exists() or COLORIZER_SAM_PATH.stat().st_size < 10000:
         logging.info(f"[Colorizer] Downloading SAM encoder via HuggingFace...")
         try:
@@ -377,94 +392,11 @@ def colorize_pil(pil_img: Image.Image,
 # ===========================================================================
 # GGUF model management
 # ===========================================================================
-
-def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
-    """Find a specific file in the HF Hub cache.
-
-    Cache layout: <cache>/models--{org}--{repo}/snapshots/{hash}/{filename}
-    Snapshot files are symlinks to blobs/.
-    """
-    cache_dir = _hf_hub_cache_dir()
-    if cache_dir is None:
-        return None
-    org, sep, name = repo_id.partition("/")
-    repo_dir_name = f"models--{org}--{name}" if sep else f"models--{name}"
-    repo_dir = cache_dir / repo_dir_name
-    snapshots = repo_dir / "snapshots"
-    if not snapshots.exists():
-        return None
-
-    # Prefer the commit hash from refs/main, but fall back to any snapshot
-    preferred_hash: Optional[str] = None
-    ref_file = repo_dir / "refs" / "main"
-    if ref_file.exists():
-        try:
-            preferred_hash = ref_file.read_text().strip()
-        except OSError:
-            pass
-
-    candidates: List[pathlib.Path] = []
-    if preferred_hash:
-        p = snapshots / preferred_hash / filename
-        if p.exists():
-            candidates.append(p)
-    for snap in sorted(snapshots.iterdir()):
-        p = snap / filename
-        if p.exists() and p not in candidates:
-            candidates.append(p)
-
-    for c in candidates:
-        try:
-            real = c.resolve()
-            if real.exists() and _is_valid_gguf(real):
-                return c  # return symlink path; caller can .resolve() if needed
-        except OSError:
-            continue
-    return None
-
-
-def _scan_hf_cache_for_ggufs() -> List[Dict[str, Any]]:
-    """Scan the HF Hub cache directory for all valid .gguf files."""
-    models: List[Dict[str, Any]] = []
-    cache_dir = _hf_hub_cache_dir()
-    if cache_dir is None:
-        return models
-    for repo_dir in cache_dir.iterdir():
-        if not repo_dir.is_dir() or not repo_dir.name.startswith("models--"):
-            continue
-        # Reconstruct repo_id: models--{org}--{name}  =>  org/name
-        stripped = repo_dir.name[len("models--"):]
-        parts = stripped.split("--")
-        repo_id = "/".join(parts) if len(parts) >= 2 else parts[0]
-        snapshots = repo_dir / "snapshots"
-        if not snapshots.exists():
-            continue
-        for snap in snapshots.iterdir():
-            if not snap.is_dir():
-                continue
-            for f in snap.glob("*.gguf"):
-                if not _is_valid_gguf(f):
-                    continue
-                try:
-                    size_mb = f.stat().st_size / (1024 * 1024)
-                except OSError:
-                    continue
-                models.append({
-                    "name": f"{repo_id.replace('/', '__')}__{f.name}",
-                    "repo_id": repo_id,
-                    "filename": f.name,
-                    "size_mb": round(size_mb, 1),
-                    "path": str(f.resolve()),
-                })
-    return models
-
 def _is_valid_gguf(path: pathlib.Path) -> bool:
-    """Return True only if the file exists, is reasonably sized, and starts with
-    the GGUF magic header ('GGUF' = 0x46554747 little-endian)."""
     try:
         if not path.exists():
             return False
-        if path.stat().st_size < 1024:  # GGUFs are always much larger
+        if path.stat().st_size < 1024:
             return False
         with open(path, "rb") as f:
             magic = f.read(4)
@@ -473,7 +405,6 @@ def _is_valid_gguf(path: pathlib.Path) -> bool:
         return False
 
 def _hf_hub_cache_dir() -> Optional[pathlib.Path]:
-    """Return the HuggingFace Hub local cache root, if it exists."""
     for env_var in ("HF_HOME", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
         val = os.environ.get(env_var)
         if val:
@@ -485,9 +416,7 @@ def _hf_hub_cache_dir() -> Optional[pathlib.Path]:
     default = pathlib.Path.home() / ".cache" / "huggingface" / "hub"
     return default if default.exists() else None
 
-
 def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
-    """Find a specific file in the HF Hub cache."""
     cache_dir = _hf_hub_cache_dir()
     if cache_dir is None:
         return None
@@ -497,7 +426,6 @@ def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
     snapshots = repo_dir / "snapshots"
     if not snapshots.exists():
         return None
-
     preferred_hash: Optional[str] = None
     ref_file = repo_dir / "refs" / "main"
     if ref_file.exists():
@@ -505,7 +433,6 @@ def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
             preferred_hash = ref_file.read_text().strip()
         except OSError:
             pass
-
     candidates: List[pathlib.Path] = []
     if preferred_hash:
         p = snapshots / preferred_hash / filename
@@ -515,7 +442,6 @@ def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
         p = snap / filename
         if p.exists() and p not in candidates:
             candidates.append(p)
-
     for c in candidates:
         try:
             real = c.resolve()
@@ -525,9 +451,7 @@ def _hf_cache_model_path(repo_id: str, filename: str) -> Optional[pathlib.Path]:
             continue
     return None
 
-
 def _scan_hf_cache_for_ggufs() -> List[Dict[str, Any]]:
-    """Scan the HF Hub cache directory for all valid .gguf files."""
     models: List[Dict[str, Any]] = []
     cache_dir = _hf_hub_cache_dir()
     if cache_dir is None:
@@ -564,20 +488,12 @@ def _gguf_local_path(repo_id: str, filename: str) -> pathlib.Path:
     repo_clean = repo_id.rstrip("/").replace("/", "__")
     if repo_clean.lower().endswith(".gguf"):
         repo_clean = repo_clean[:-5]
-    
     file_stem = pathlib.Path(filename).stem
-    
-    # FIX: If the repo name already ends with the file stem, avoid doubling the name.
-    # E.g., "Manojb__Qwen_Qwen3.5-0.8B-Q4_K_M" + "Qwen_Qwen3.5-0.8B-Q4_K_M.gguf" 
-    # becomes "Manojb__Qwen_Qwen3.5-0.8B-Q4_K_M.gguf" instead of duplicating it.
     if repo_clean.lower().endswith(file_stem.lower()):
         safe = f"{repo_clean}.gguf"
     else:
         safe = f"{repo_clean}__{filename}"
-        
     return GGUF_DIR / safe
-
-import shutil
 
 def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
     try:
@@ -596,7 +512,6 @@ def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
 
     local_path = _gguf_local_path(repo_id, filename)
 
-    # Clean up legacy doubled filenames
     legacy_doubled = GGUF_DIR / f"{local_path.stem}__{filename}"
     if legacy_doubled.exists() and legacy_doubled != local_path:
         logging.warning(f"[GGUF] Removing legacy doubled file to save space: {legacy_doubled}")
@@ -605,19 +520,15 @@ def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
         except OSError as e:
             logging.warning(f"[GGUF] Could not remove legacy file: {e}")
 
-    # 1) Check HuggingFace Hub Cache FIRST — use it directly, skip mirroring
-    #    (Windows often can't hardlink across drives, so we just use the resolved path)
     hf_cached_path = _hf_cache_model_path(repo_id, filename)
     if hf_cached_path is not None:
         resolved = hf_cached_path.resolve()
         logging.info(f"[GGUF] Using HF cache directly: {resolved}")
         return resolved
 
-    # 2) If our local mirror is already a valid GGUF, use it.
     if _is_valid_gguf(local_path):
         return local_path
 
-    # Otherwise delete the stale/corrupt mirror if present.
     if local_path.exists():
         logging.warning(f"[GGUF] Local mirror {local_path} is missing/invalid — removing it.")
         try:
@@ -625,7 +536,6 @@ def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
         except OSError as e:
             logging.warning(f"[GGUF] Could not remove stale mirror: {e}")
 
-    # 3) Pull from HF Hub via API
     logging.info(f"[GGUF] Downloading {repo_id}/{filename} via huggingface_hub...")
     try:
         cached = pathlib.Path(hf_hub_download(repo_id=repo_id, filename=filename))
@@ -648,51 +558,12 @@ def download_gguf(repo_id: str, filename: Optional[str] = None) -> pathlib.Path:
         except OSError:
             raise RuntimeError("HF cache file is not a valid GGUF and could not be inspected.")
 
-    # 4) Return the HF cache path directly (skip mirroring to avoid cross-drive issues)
     resolved = cached.resolve()
     logging.info(f"[GGUF] Download complete, using HF cache path: {resolved}")
     return resolved
 
-    if not _is_valid_gguf(cached):
-        try:
-            with open(cached, "rb") as f:
-                head = f.read(64)
-            raise RuntimeError(
-                f"HF cache file is not a valid GGUF (bad magic). "
-                f"First 64 bytes: {head!r}. "
-                f"You may need `huggingface-cli download {repo_id} {filename} "
-                f"--local-dir ./models/gguf --force-download`."
-            )
-        except OSError:
-            raise RuntimeError("HF cache file is not a valid GGUF and could not be inspected.")
-
-    # 4) Mirror to local_path
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    if local_path.exists() and local_path.stat().st_size != cached.stat().st_size:
-        try: local_path.unlink()
-        except OSError: pass
-    if not local_path.exists():
-        try:
-            os.link(cached, local_path)
-            logging.info(f"[GGUF] Hardlinked HF cache -> {local_path}")
-        except OSError:
-            try:
-                shutil.copy2(cached, local_path)
-                logging.info(f"[GGUF] Copied HF cache -> {local_path}")
-            except OSError as e:
-                logging.warning(f"[GGUF] Mirroring failed ({e}); using HF cache path: {cached}")
-                return cached
-
-    if not _is_valid_gguf(local_path):
-        logging.warning(f"[GGUF] Mirror {local_path} failed validation; using HF cache: {cached}")
-        return cached
-
-    return local_path
-
 def list_local_gguf_models() -> List[Dict[str, Any]]:
     models: List[Dict[str, Any]] = []
-    
-    # 1. Scan hardcoded local models directory
     if GGUF_DIR.exists():
         for f in sorted(GGUF_DIR.glob("*.gguf")):
             if not _is_valid_gguf(f):
@@ -716,11 +587,7 @@ def list_local_gguf_models() -> List[Dict[str, Any]]:
                 "size_mb": round(size_mb, 1),
                 "path": str(f),
             })
-            
-    # 2. Scan HuggingFace Hub cache directory
     models.extend(_scan_hf_cache_for_ggufs())
-
-    # Deduplicate by (repo_id, filename) in case it exists in both places
     seen = set()
     unique = []
     for m in models:
@@ -732,7 +599,7 @@ def list_local_gguf_models() -> List[Dict[str, Any]]:
     return unique
 
 # ===========================================================================
-# Hayai OCR (Japanese) — Optimized with Parallel Box OCR
+# Hayai OCR (Japanese)
 # ===========================================================================
 _OCR_BOX_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ocr-box")
 
@@ -742,11 +609,10 @@ def get_hayai_ocr():
         if HayaiOcr is None:
             raise RuntimeError("hayai-ocr not installed: pip install hayai-ocr")
         device = get_torch_device()
-        logging.info(f"[Hayai OCR] Loading model on device: {device} (may take a few minutes on first run)...")
+        logging.info(f"[Hayai OCR] Loading model on device: {device} ...")
         try:
             _hayai_ocr_model = HayaiOcr(device=device)
         except TypeError:
-            # Older HayaiOcr versions don't accept device=; rely on autodetect.
             _hayai_ocr_model = HayaiOcr()
         logging.info(f"[Hayai OCR] Model loaded (device={device}).")
     return _hayai_ocr_model
@@ -766,31 +632,25 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
     yolo = get_yolo()
-
     logging.info(f"[OCR] Running YOLO text detection on {w}x{h} image...")
     results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
     if not results:
         return []
-
     r = results[0]
     out = []
     img_area = h * w
     mocr = get_hayai_ocr()
-
     boxes = []
     for b in r.boxes:
         xy = b.xyxy[0].cpu().numpy()
         x1, y1 = max(0, int(xy[0])), max(0, int(xy[1]))
         x2, y2 = min(w - 1, int(xy[2])), min(h - 1, int(xy[3]))
-
         box_area = (x2 - x1) * (y2 - y1)
         if box_area > 0.8 * img_area or box_area < 100:
             continue
         boxes.append((x1, y1, x2, y2))
-    
     if not boxes:
         return []
-
     def _ocr_one(bbox):
         x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
@@ -799,7 +659,6 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
         except Exception as e:
             logging.error(f"Hayai OCR failed on {bbox}: {e}")
             return bbox, ""
-
     for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
         out.append({"text": text, "bbox": bbox})
     return out
@@ -814,25 +673,17 @@ def get_glm_ocr():
             from transformers import AutoProcessor, AutoModelForImageTextToText
         except ImportError:
             raise RuntimeError("transformers not installed: pip install transformers accelerate torch")
-
         if not has_cuda():
-            raise RuntimeError("PyTorch can't see your CUDA GPU. Did you install the CUDA version of PyTorch?")
-
+            raise RuntimeError("PyTorch can't see your CUDA GPU.")
         dtype = torch.float16
         device = "cuda"
-
         logging.info(f"[GLM OCR] Loading {GLM_OCR_REPO} on GPU (dtype={dtype})...")
         with _glm_ocr_lock:
             if _glm_ocr_model is None:
-                # AutoModelForImageTextToText automatically handles the GLM architecture
                 _glm_ocr_model = AutoModelForImageTextToText.from_pretrained(
-                    GLM_OCR_REPO,
-                    torch_dtype=dtype,
-                    attn_implementation="sdpa",
-                    low_cpu_mem_usage=True,
+                    GLM_OCR_REPO, torch_dtype=dtype, attn_implementation="sdpa", low_cpu_mem_usage=True,
                 ).to(device)
                 _glm_ocr_model.eval()
-                
                 _glm_ocr_processor = AutoProcessor.from_pretrained(GLM_OCR_REPO)
                 logging.info(f"[GLM OCR] Model loaded on {device}.")
     return _glm_ocr_model, _glm_ocr_processor
@@ -841,14 +692,11 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
     model, processor = get_glm_ocr()
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
-    
-    # 1. Use YOLO to find text boxes
     yolo = get_yolo()
     logging.info(f"[GLM OCR] Running YOLO text detection on {w}x{h} image...")
     results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
     if not results:
         return []
-
     r = results[0]
     img_area = h * w
     boxes = []
@@ -860,20 +708,14 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         if box_area > 0.8 * img_area or box_area < 100:
             continue
         boxes.append((x1, y1, x2, y2))
-    
     if not boxes:
         return []
-
     logging.info(f"[GLM OCR] Found {len(boxes)} valid text boxes. Running GLM OCR on each...")
-
-    # 2. Normalize image size for speed/accuracy
     TARGET_MAX = 1024
-    TARGET_MIN = 384  
-
+    TARGET_MIN = 384
     def _ocr_one(bbox):
         x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
-        
         cw, ch = crop.size
         longest = max(cw, ch)
         if longest > TARGET_MAX:
@@ -883,48 +725,28 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
             scale = TARGET_MIN / longest
             if scale > 3.0: scale = 3.0
             crop = crop.resize((int(cw * scale), int(ch * scale)), Image.LANCZOS)
-            
-        # Standard OCR prompt for VLMs
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": crop},
-                    {"type": "text", "text": "Extract all text in the image."},
-                ],
-            },
-        ]
-        
+        conversation = [{"role": "user", "content": [
+            {"type": "image", "image": crop},
+            {"type": "text", "text": "Extract all text in the image."},
+        ]}]
         try:
             with _glm_ocr_lock, torch.inference_mode():
                 inputs = processor.apply_chat_template(
-                    conversation,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt"
+                    conversation, add_generation_prompt=True, tokenize=True,
+                    return_dict=True, return_tensors="pt"
                 ).to(model.device, model.dtype)
-
                 generate_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=64,
-                    do_sample=False,
-                    use_cache=True,
-                    pad_token_id=processor.tokenizer.pad_token_id,
+                    **inputs, max_new_tokens=64, do_sample=False,
+                    use_cache=True, pad_token_id=processor.tokenizer.pad_token_id,
                 )
-                
-                generate_ids_trimmed = [
-                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generate_ids)
-                ]
+                generate_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generate_ids)]
                 text = processor.decode(generate_ids_trimmed[0], skip_special_tokens=True)
-                
             text = text.split("<|im_end|>")[0].split("</s>")[0].strip()
             logging.info(f"[GLM OCR] Box {bbox} read: '{text[:30]}'")
             return bbox, text
         except Exception as e:
             logging.error(f"GLM OCR failed on {bbox}: {e}")
             return bbox, ""
-
     out = []
     for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
         if text:
@@ -932,16 +754,11 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
     return out
 
 # ===========================================================================
-# Qwen GGUF translator (Optimized max_tokens & stops)
+# Qwen GGUF translator
 # ===========================================================================
 LANG_MAP = {
-    "en": "English",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "id": "Indonesian",
-    "ru": "Russian",
-    "es": "Spanish",
-    "cz": "Chinese"
+    "en": "English", "ja": "Japanese", "ko": "Korean",
+    "id": "Indonesian", "ru": "Russian", "es": "Spanish", "cz": "Chinese"
 }
 
 SYSTEM_PROMPT = (
@@ -962,41 +779,25 @@ def get_qwen():
                     logging.info(f"[Qwen] Local model missing/invalid, locating via HF cache or download...")
                     path = download_gguf(_current_qwen_repo_id, _current_qwen_filename)
                     _current_qwen_path = path
-
                 try:
                     path = path.resolve()
                 except Exception:
                     pass
-
                 if not _is_valid_gguf(path):
-                    raise RuntimeError(
-                        f"Refusing to load invalid GGUF: {path}. "
-                        f"Delete it and restart, or call /v1/changemodel with a valid repo."
-                    )
-
+                    raise RuntimeError(f"Refusing to load invalid GGUF: {path}.")
                 use_gpu = has_cuda()
                 n_gpu_layers = -1 if use_gpu else 0
-                logging.info(f"[Qwen] loading {path} (GPU layers: {n_gpu_layers}, device={'cuda' if use_gpu else 'cpu'}) ...")
+                logging.info(f"[Qwen] loading {path} (GPU layers: {n_gpu_layers}) ...")
                 try:
                     _global_qwen = Llama(
-                        model_path=str(path),
-                        n_ctx=2048,
+                        model_path=str(path), n_ctx=2048,
                         n_threads=max(4, os.cpu_count() or 4),
-                        n_gpu_layers=n_gpu_layers,  # -1 = all layers on GPU if CUDA, else CPU
-                        verbose=False,
+                        n_gpu_layers=n_gpu_layers, verbose=False,
                     )
                 except Exception as e:
                     logging.error(f"[Qwen] Failed to load GGUF from {path}: {e}")
-                    raise RuntimeError(
-                        f"llama-cpp-python failed to load {path}. "
-                        f"This is likely a version mismatch, not a corrupt file. "
-                        f"Run: pip uninstall llama-cpp-python -y && "
-                        f"pip install llama-cpp-python --extra-index-url "
-                        f"https://abetlen.github.io/llama-cpp-python/whl/{'cu121' if use_gpu else 'cpu'}"
-                    )
-
-                logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename} "
-                             f"(device={'cuda' if use_gpu else 'cpu'})")
+                    raise RuntimeError(f"llama-cpp-python failed to load {path}. Error: {e}")
+                logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename}")
     return _global_qwen
 
 def switch_qwen_model(repo_id: str, filename: Optional[str] = None):
@@ -1014,12 +815,9 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
     text = text.strip()
     if not text:
         return ""
-    
     lang_name = LANG_MAP.get(target_lang, "English")
     max_tok = max(16, min(96, len(text) + 16))
-    
     logging.info(f"[LLM] Starting translation for: '{text[:40]}' -> {lang_name}")
-    
     llm = get_qwen()
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT.format(lang=lang_name)},
@@ -1028,10 +826,7 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
     try:
         with _llm_lock:
             out = llm.create_chat_completion(
-                messages=msgs,
-                max_tokens=max_tok,
-                temperature=0.2,
-                top_p=0.9,
+                messages=msgs, max_tokens=max_tok, temperature=0.2, top_p=0.9,
                 stop=["<|im_end|>", "</s>"],
             )
         raw = out["choices"][0]["message"]["content"].strip()
@@ -1044,9 +839,267 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
         logging.error(f"[LLM] Translation failed: {e}")
         return ""
 
+# ===========================================================================
+# OpenRouter Translation
+# ===========================================================================
+
+async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", max_retries: int = 5) -> List[str]:
+    """Translate a list of texts in a SINGLE OpenRouter API call using a numbered list format."""
+    import aiohttp
+    import random
+
+    with _model_type_lock:
+        api_key = _openrouter_api_key
+        model = _openrouter_model
+
+    if not api_key:
+        logging.error("[OpenRouter] API key not configured")
+        return [""] * len(texts)
+
+    # Filter out empty texts but keep their original indices
+    indexed_texts = [(i, t) for i, t in enumerate(texts) if t.strip()]
+    if not indexed_texts:
+        return [""] * len(texts)
+
+    lang_name = LANG_MAP.get(target_lang, "English")
+    
+    # Scale max_tokens based on total input length to prevent truncation
+    total_chars = sum(len(t) for _, t in indexed_texts)
+    max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 20)))
+
+    # Build the numbered list prompt
+    prompt_lines = [f"{idx + 1}. {text}" for idx, (orig_i, text) in enumerate(indexed_texts)]
+    batch_text = "\n".join(prompt_lines)
+
+    batch_system_prompt = (
+        f"You are a manga translation engine. Translate the user's numbered list of texts into {lang_name}. "
+        "Output ONLY the translated list, one per line, keeping the exact same numbers. "
+        "No explanations, no notes, no quotes."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000",
+        "X-Title": "Manga Translation API"
+    }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": batch_system_prompt},
+            {"role": "user", "content": batch_text},
+        ],
+        "max_tokens": max_tok,
+        "temperature": 0.2,
+        "top_p": 0.9,
+    }
+
+    logging.info(f"[OpenRouter Batch] Sending {len(indexed_texts)} texts in one request to {model}...")
+
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+            logging.info(f"[OpenRouter Batch] Retry {attempt}/{max_retries} after {wait_time:.1f}s wait...")
+            await asyncio.sleep(wait_time)
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=120) # Longer timeout for batches
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload
+                ) as response:
+                    if response.status == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        wait = float(retry_after) if retry_after else 10.0
+                        logging.warning(f"[OpenRouter Batch] Rate limited (429). Waiting {wait:.1f}s...")
+                        await asyncio.sleep(wait)
+                        continue
+
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logging.error(f"[OpenRouter Batch] API error {response.status} on attempt {attempt}: {error_text[:200]}")
+                        continue
+
+                    data = await response.json()
+
+                    raw = None
+                    try:
+                        if (data and isinstance(data.get("choices"), list) 
+                            and len(data["choices"]) > 0 
+                            and isinstance(data["choices"][0].get("message"), dict)):
+                            raw = data["choices"][0]["message"].get("content")
+                    except (IndexError, KeyError, TypeError) as e:
+                        logging.warning(f"[OpenRouter Batch] Unexpected structure on attempt {attempt}: {e}")
+
+                    if not raw or not isinstance(raw, str):
+                        logging.warning(f"[OpenRouter Batch] Empty/None content on attempt {attempt}")
+                        continue
+
+                    # Parse the numbered list back out
+                    results = [""] * len(texts)
+                    parsed_lines = raw.split('\n')
+                    for line in parsed_lines:
+                        match = re.match(r"^\s*(\d+)\.\s*(.*)$", line)
+                        if match:
+                            num = int(match.group(1)) - 1 # Convert to 0-based index
+                            trans = match.group(2).strip()
+                            # Map back to the original text index
+                            if 0 <= num < len(indexed_texts):
+                                orig_idx = indexed_texts[num][0]
+                                results[orig_idx] = clean_text_for_font(trans)
+
+                    # Verify we got most of them
+                    success_count = sum(1 for r in results if r)
+                    logging.info(f"[OpenRouter Batch] Parsed {success_count}/{len(indexed_texts)} translations.")
+                    
+                    if success_count > 0:
+                        return results
+                    else:
+                        logging.warning(f"[OpenRouter Batch] Failed to parse any numbered lines from response.")
+                        continue
+
+        except asyncio.TimeoutError:
+            logging.warning(f"[OpenRouter Batch] Timeout on attempt {attempt}/{max_retries}")
+            continue
+        except Exception as e:
+            logging.error(f"[OpenRouter Batch] Error on attempt {attempt}/{max_retries}: {e}")
+            continue
+
+    logging.error(f"[OpenRouter Batch] FAILED after {max_retries} retries. Falling back to sequential.")
+    return [""] * len(texts) # Signal to fallback to sequential
+
+async def openrouter_translate(text: str, target_lang: str = "en", max_retries: int = 5) -> str:
+    """Translate text using OpenRouter API with retries and rate-limit handling."""
+    import aiohttp
+    import random
+
+    with _model_type_lock:
+        api_key = _openrouter_api_key
+        model = _openrouter_model
+
+    if not api_key:
+        logging.error("[OpenRouter] API key not configured")
+        return ""
+
+    if not text.strip():
+        return ""
+
+    lang_name = LANG_MAP.get(target_lang, "English")
+    max_tok = max(16, min(96, len(text) + 16))
+
+    logging.info(f"[OpenRouter] Translating '{text[:40]}' -> {lang_name} using {model}")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000",
+        "X-Title": "Manga Translation API"
+    }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT.format(lang=lang_name)},
+            {"role": "user", "content": text},
+        ],
+        "max_tokens": max_tok,
+        "temperature": 0.2,
+        "top_p": 0.9,
+    }
+
+    for attempt in range(1, max_retries + 1):
+        # Exponential backoff: 2s, 4s, 8s, 16s, 32s
+        if attempt > 1:
+            wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+            logging.info(f"[OpenRouter] Retry {attempt}/{max_retries} after {wait_time:.1f}s wait...")
+            await asyncio.sleep(wait_time)
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=90)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload
+                ) as response:
+                    # Handle rate limiting (429) specially
+                    if response.status == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        if retry_after:
+                            wait = float(retry_after)
+                        else:
+                            wait = 10.0
+                        logging.warning(f"[OpenRouter] Rate limited (429). Waiting {wait:.1f}s...")
+                        await asyncio.sleep(wait)
+                        continue
+
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logging.error(f"[OpenRouter] API error {response.status} on attempt {attempt}/{max_retries}: {error_text[:200]}")
+                        continue
+
+                    data = await response.json()
+
+                    # Safely extract content
+                    raw = None
+                    try:
+                        if (data
+                            and isinstance(data.get("choices"), list)
+                            and len(data["choices"]) > 0
+                            and isinstance(data["choices"][0].get("message"), dict)):
+                            raw = data["choices"][0]["message"].get("content")
+                    except (IndexError, KeyError, TypeError) as e:
+                        logging.warning(f"[OpenRouter] Unexpected response structure on attempt {attempt}: {e}")
+
+                    if not raw or not isinstance(raw, str):
+                        logging.warning(f"[OpenRouter] Empty/None content on attempt {attempt}/{max_retries} for '{text[:30]}'")
+                        continue
+
+                    result = clean_text_for_font(raw)
+                    logging.info(f"[OpenRouter] Translated to: '{result[:40]}'")
+                    return result
+
+        except asyncio.TimeoutError:
+            logging.warning(f"[OpenRouter] Timeout on attempt {attempt}/{max_retries}")
+            continue
+        except Exception as e:
+            logging.error(f"[OpenRouter] Error on attempt {attempt}/{max_retries}: {e}")
+            continue
+
+    logging.error(f"[OpenRouter] FAILED after {max_retries} retries for: '{text[:40]}'")
+    return ""
+
+def translate_with_current_backend(text: str, target_lang: str = "en") -> str:
+    with _model_type_lock:
+        model_type = _current_model_type
+    if model_type == "openrouter":
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(openrouter_translate(text, target_lang))
+                return result
+            finally:
+                loop.close()
+        except Exception as e:
+            logging.error(f"[OpenRouter] Failed to run async translation: {e}")
+            return ""
+    else:
+        return qwen_translate(text, target_lang)
+
+async def translate_with_current_backend_async(text: str, target_lang: str = "en") -> str:
+    with _model_type_lock:
+        model_type = _current_model_type
+    if model_type == "openrouter":
+        return await openrouter_translate(text, target_lang)
+    else:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_llm_executor, qwen_translate, text, target_lang)
 
 # ===========================================================================
-# Inpainting
+# Inpainting (SimpleLama + cv2 fallback)
 # ===========================================================================
 def load_lama():
     global _simple_lama_model
@@ -1054,7 +1107,6 @@ def load_lama():
         device = get_torch_device()
         logging.info(f"[SimpleLama] Loading on device: {device}")
         _simple_lama_model = SimpleLama()
-        # SimpleLama wraps a torch model; try to move it to GPU if available.
         if device == "cuda":
             try:
                 inner = getattr(_simple_lama_model, "model", None)
@@ -1062,25 +1114,118 @@ def load_lama():
                     inner.to("cuda")
                     logging.info("[SimpleLama] Model moved to CUDA.")
                 else:
-                    logging.warning("[SimpleLama] Could not access .model to move to CUDA; running on default device.")
+                    logging.warning("[SimpleLama] Could not access .model to move to CUDA.")
             except Exception as e:
                 logging.warning(f"[SimpleLama] Failed moving to CUDA: {e}")
     return _simple_lama_model
 
-def lama_inpaint(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    sl = load_lama()
-    if sl is None:
-        raise RuntimeError("SimpleLama unavailable")
-    pil_img  = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    pil_mask = Image.fromarray(mask).convert("L")
-    out_pil  = sl(pil_img, pil_mask)
-    return cv2.cvtColor(np.array(out_pil), cv2.COLOR_RGB2BGR)
+def _lama_inpaint_sync(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Thread-safe SimpleLama inpainting."""
+    with _inpaint_lock:
+        sl = load_lama()
+        if sl is None:
+            raise RuntimeError("SimpleLama unavailable")
+        pil_img  = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        pil_mask = Image.fromarray(mask).convert("L")
+        out_pil  = sl(pil_img, pil_mask)
+        return cv2.cvtColor(np.array(out_pil), cv2.COLOR_RGB2BGR)
 
-def cv2_inpaint_fallback(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    return cv2.inpaint(img_bgr, mask, INPAINT_RADIUS_CV2, cv2.INPAINT_TELEA)
+def _cv2_inpaint_sync(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Thread-safe cv2 inpainting."""
+    with _inpaint_lock:
+        return cv2.inpaint(img_bgr, mask, INPAINT_RADIUS_CV2, cv2.INPAINT_TELEA)
+
+async def inpaint_image_async(img_bgr: np.ndarray, mask: np.ndarray, use_lama: bool = True) -> np.ndarray:
+    """Run inpainting in a thread pool so it doesn't block the event loop.
+    
+    Tries SimpleLama first (if use_lama=True and available), falls back to cv2.inpaint.
+    """
+    if use_lama and SimpleLama is not None:
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(_inpaint_executor, _lama_inpaint_sync, img_bgr, mask)
+            logging.info("[Inpaint] SimpleLama inpainting complete.")
+            return result
+        except Exception as e:
+            logging.warning(f"[Inpaint] SimpleLama failed ({e}), falling back to cv2.inpaint")
+    
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_inpaint_executor, _cv2_inpaint_sync, img_bgr, mask)
+    logging.info("[Inpaint] cv2.inpaint fallback complete.")
+    return result
+
+def build_inpaint_mask(img_shape: Tuple[int, int, int],
+                       bboxes: List[Tuple[int, int, int, int]],
+                       padding: int = 6,
+                       dilate_kernel: int = 7,
+                       feather_pixels: int = 3,
+                       adaptive_dilate: bool = True) -> np.ndarray:
+    """Build a high-quality binary mask from bounding boxes with padding, 
+    adaptive dilation, and feathered edges for smoother inpainting.
+    
+    Args:
+        img_shape: (H, W, C) of the image
+        bboxes: list of (x1, y1, x2, y2) tuples
+        padding: pixels to expand each box
+        dilate_kernel: kernel size for morphological dilation
+        feather_pixels: pixels to feather the mask edges (gradient)
+        adaptive_dilate: if True, scale dilation based on box size
+    
+    Returns:
+        uint8 mask, 255 = inpaint region, 0 = keep
+    """
+    h, w = img_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    for x1, y1, x2, y2 in bboxes:
+        box_w = x2 - x1
+        box_h = y2 - y1
+        box_size = max(box_w, box_h)
+        
+        # Adaptive padding based on text box size
+        adaptive_pad = padding + max(0, (box_size - 50) // 20)
+        
+        # Apply padding, clamped to image bounds
+        px1 = max(0, x1 - adaptive_pad)
+        py1 = max(0, y1 - adaptive_pad)
+        px2 = min(w, x2 + adaptive_pad)
+        py2 = min(h, y2 + adaptive_pad)
+        mask[py1:py2, px1:px2] = 255
+    
+    # Multi-pass dilation with different kernels for better coverage
+    if dilate_kernel > 0:
+        # First pass: small kernel to catch edge details
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.dilate(mask, kernel_small, iterations=1)
+        
+        # Second pass: larger kernel for broader coverage
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel, dilate_kernel))
+        mask = cv2.dilate(mask, kernel_large, iterations=1)
+        
+        # Optional third pass for larger text areas
+        if adaptive_dilate:
+            kernel_xl = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel + 2, dilate_kernel + 2))
+            mask = cv2.dilate(mask, kernel_xl, iterations=1)
+    
+    # Feather edges using Gaussian blur for smoother transitions
+    if feather_pixels > 0:
+        # Convert to float for smooth gradient
+        mask_float = mask.astype(np.float32) / 255.0
+        # Apply Gaussian blur to create gradient at edges
+        blurred = cv2.GaussianBlur(mask_float, (feather_pixels * 2 + 1, feather_pixels * 2 + 1), 0)
+        # Threshold back to binary but with anti-aliased edges
+        mask = (blurred * 255).astype(np.uint8)
+        # Re-threshold to keep it mostly binary but with smoother edges
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    
+    # Close small holes in the mask
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    
+    return mask
 
 # ===========================================================================
-# Text color detection (Optimized: Median + Threshold vs K-means)
+# Text color detection
 # ===========================================================================
 def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
                               ) -> Tuple[Tuple[int,int,int], Tuple[int,int,int]]:
@@ -1088,45 +1233,38 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
     region = img_bgr[max(0, y1):y2, max(0, x1):x2]
     if region.size == 0:
         return (0, 0, 0), (255, 255, 255)
-
     h_r, w_r = region.shape[:2]
     if h_r > 80 or w_r > 80:
         scale = 80.0 / max(h_r, w_r)
         region = cv2.resize(region, (max(1, int(w_r * scale)), max(1, int(h_r * scale))),
                             interpolation=cv2.INTER_AREA)
-
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
     bg_val = int(np.median(gray))
-
     diff = np.abs(gray.astype(np.int16) - bg_val)
     ink_mask = diff > 60
     flat = region.reshape(-1, 3).astype(np.float32)
     ink_flat = ink_mask.reshape(-1)
-
     if ink_flat.sum() >= 4:
         ink_bgr = flat[ink_flat].mean(axis=0)
         bg_bgr  = flat[~ink_flat].mean(axis=0)
     else:
         bg_bgr = flat.mean(axis=0)
         ink_bgr = np.array([0, 0, 0] if bg_val > 127 else [255, 255, 255], dtype=np.float32)
-
     def snap(c):
         c = np.asarray(c, dtype=np.float32)
         if np.all(c < 40):  return np.array([0, 0, 0], dtype=np.float32)
         if np.all(c > 215): return np.array([255, 255, 255], dtype=np.float32)
         return c
-
     bg_bgr, ink_bgr = snap(bg_bgr), snap(ink_bgr)
     bg_lum  = 0.299 * bg_bgr[2]  + 0.587 * bg_bgr[1]  + 0.114 * bg_bgr[0]
     ink_lum = 0.299 * ink_bgr[2] + 0.587 * ink_bgr[1] + 0.114 * ink_bgr[0]
     if abs(bg_lum - ink_lum) < 60:
         ink_bgr = np.array([0, 0, 0] if bg_lum > 127 else [255, 255, 255], dtype=np.float32)
-
     return (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0])), \
            (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
 
 # ===========================================================================
-# Text wrapping & auto-fit (Optimized: Precomputed word widths)
+# Text wrapping & auto-fit
 # ===========================================================================
 @functools.lru_cache(maxsize=256)
 def _get_font_cached(font_path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -1140,6 +1278,11 @@ def clear_font_cache() -> None:
 
 def get_font(font_path, size: int) -> ImageFont.FreeTypeFont:
     return _get_font_cached(str(font_path), size)
+
+def get_current_font(size: int) -> ImageFont.FreeTypeFont:
+    with _font_config_lock:
+        font_path = _current_font_path
+    return get_font(font_path, size)
 
 def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False):
     if is_vertical:
@@ -1181,18 +1324,12 @@ def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False)
     return lines
 
 def _measure_block(draw, lines, font):
-    # Use fixed font metrics for line height to prevent glyph overlap.
-    # PIL's textbbox varies per line depending on ascenders/descenders, 
-    # which causes clipping when lines are stacked.
     try:
         ascent, descent = font.getmetrics()
         line_h = int(ascent + descent)
     except Exception:
         line_h = int(font.size * 1.2)
-    
-    # Add a tiny bit of breathing room just in case the font has tight internal leading
     line_h = max(line_h, int(font.size * 1.1))
-    
     heights = [line_h] * len(lines)
     total_h = line_h * len(lines)
     max_w = 0.0
@@ -1202,10 +1339,13 @@ def _measure_block(draw, lines, font):
     return heights, total_h, max_w
 
 def fit_font_and_wrap(draw, text, box_w, box_h,
-                      font_path=str(FONT_PATH), max_size=96, min_size=8, is_vertical=False):
+                      font_path=None,
+                      max_size=96, min_size=8, is_vertical=False):
+    if font_path is None:
+        with _font_config_lock:
+            font_path = str(_current_font_path)
     if not text.strip():
         return min_size, [""], [0]
-    
     if not hasattr(fit_font_and_wrap, '_cache'):
         fit_font_and_wrap._cache = {}
     cache = fit_font_and_wrap._cache
@@ -1214,7 +1354,6 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
         lo, hi = min_size, max_size
         best_size, best_cols, best_col_widths = None, None, None
         clean_v_text = text.replace(" ", "").replace("\n", "")
-
         while lo <= hi:
             mid = (lo + hi) // 2
             key = (font_path, mid)
@@ -1222,15 +1361,12 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 try: cache[key] = ImageFont.truetype(font_path, mid)
                 except Exception: cache[key] = ImageFont.load_default()
             font = cache[key]
-
             cols = []
             cur_col = ""
             cur_h = 0
-            
             bb = draw.textbbox((0,0), "字", font=font)
             char_h = (bb[3] - bb[1]) * 1.2
             if char_h == 0: char_h = mid
-
             for ch in clean_v_text:
                 if cur_h + char_h > box_h and cur_col:
                     cols.append(cur_col)
@@ -1240,13 +1376,10 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                     cur_col += ch
                     cur_h += char_h
             if cur_col: cols.append(cur_col)
-
             if not cols: cols = [clean_v_text]
-
             max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else mid
             col_w = max(max_char_w, mid * 0.8)
             total_w = len(cols) * col_w
-
             if total_w <= box_w - 4:
                 best_size = mid
                 best_cols = cols
@@ -1254,18 +1387,15 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 lo = mid + 1
             else:
                 hi = mid - 1
-
         if best_cols is None:
             key = (font_path, min_size)
             if key not in cache:
                 try: cache[key] = ImageFont.truetype(font_path, min_size)
                 except Exception: cache[key] = ImageFont.load_default()
             font = cache[key]
-
             bb = draw.textbbox((0,0), "字", font=font)
             char_h = (bb[3] - bb[1]) * 1.2
             if char_h == 0: char_h = min_size
-
             cols = []
             cur_col = ""
             cur_h = 0
@@ -1278,13 +1408,10 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                     cur_col += ch
                     cur_h += char_h
             if cur_col: cols.append(cur_col)
-
             best_cols = cols if cols else [text]
             max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else min_size
             best_col_widths = [max_char_w] * len(best_cols)
             best_size = min_size
-            logging.warning(f"Vertical text could not fit cleanly even at min_size={min_size} in box ({box_w}x{box_h}).")
-
         return best_size, best_cols, best_col_widths
 
     lo, hi = min_size, max_size
@@ -1319,889 +1446,595 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
         heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
         best_heights = heights
-        logging.warning(f"Text could not fit cleanly even at min_size={min_size} in box ({box_w}x{box_h}).")
     return best_size, best_lines, best_heights
 
-def draw_text_outline(draw, pos, text, font, fill, outline, outline_width):
-    x, y = pos
-    
-    # 1. Draw the outline ONCE behind the text. 
-    # PIL draws strokes centered on the glyph, so a thick stroke eats the text.
-    # Drawing it first prevents the black outline from covering the core.
-    draw.text((x, y), text, font=font, fill=outline,
-              stroke_width=outline_width, stroke_fill=outline)
-    
-    # 2. Draw the text fill multiple times with 1px offsets.
-    # This "fakes" a heavy/bold font weight by expanding the core glyph outward,
-    # ensuring the fill color stays thick and vibrant on top of the outline.
-    offsets = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
-    
-    # Add diagonal offsets for even heavier weight if the outline is thick
-    if outline_width > 2:
-        offsets.extend([(1, 1), (-1, 1), (1, -1), (-1, -1)])
-        
-    for dx, dy in offsets:
-        draw.text((x + dx, y + dy), text, font=font, fill=fill)
-
 # ===========================================================================
-# Core pipeline (Highly Concurrent Inpainting, Translation, Render Prep)
+# Text drawing with configurable stroke
 # ===========================================================================
-_BOX_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="box-prep")
-_tls = threading.local()
-
-def _tls_draw():
-    d = getattr(_tls, "draw", None)
-    if d is None:
-        # Using a larger dummy canvas prevents any potential internal PIL clipping metrics
-        d = ImageDraw.Draw(Image.new("RGBA", (2048, 2048)))
-        _tls.draw = d
-    return d
-
-def _prep_one_box(c, trans, inpainted_bgr, target_lang):
-    x1, y1, x2, y2 = c["bbox"]
-    trans = clean_text_for_font(trans)
-    if not trans.strip():
-        return None
-    
-    text_rgb, outline_rgb = detect_text_and_bg_colors(inpainted_bgr, (x1, y1, x2, y2))
-    box_w, box_h = x2 - x1, y2 - y1
-    draw = _tls_draw()
-    
-    font_size, lines, heights = fit_font_and_wrap(
-        draw, trans, box_w, box_h, str(FONT_PATH),
-        is_vertical=(target_lang in ("ja", "ko", "cz"))
-    )
-    return (c["bbox"], trans, text_rgb, outline_rgb, box_w, box_h,
-            font_size, lines, heights)
-
-def _colorize_sam_precompute(pil_img):
-    session, sam_session = get_colorizer_sessions()
-    gray = np.array(pil_img.convert("L"))
-    L_bw = cv2.resize(gray, (COLORIZER_DEFAULT_INFER_SIZE, COLORIZER_DEFAULT_INFER_SIZE), 
-                      interpolation=cv2.INTER_AREA)
-    L_norm = (L_bw.astype(np.float32) / 127.5) - 1.0
-    if sam_session is not None:
-        return _extract_sam_features_onnx(sam_session, L_norm)
-    H_in, W_in = L_bw.shape
-    return (np.zeros((1, 256, H_in//16, W_in//16), dtype=np.float32),
-            np.zeros((1, 256, H_in//32, W_in//32), dtype=np.float32),
-            np.zeros((1, 1024), dtype=np.float32))
-
-def _colorize_generate_only(inpainted_pil, sam_features):
-    session, _ = get_colorizer_sessions()
-    gray = np.array(inpainted_pil.convert("L"))
-    orig_H, orig_W = gray.shape
-    L_bw = cv2.resize(gray, (COLORIZER_DEFAULT_INFER_SIZE, COLORIZER_DEFAULT_INFER_SIZE), 
-                      interpolation=cv2.INTER_AREA)
-    
-    sam_level0, sam_level1, wd14_embedding = sam_features
-    rgb_output = _colorize_onnx(session, L_bw, sam_level0, sam_level1, wd14_embedding)
-    rgb_output = cv2.resize(rgb_output, (orig_W, orig_H), interpolation=cv2.INTER_CUBIC)
-    return Image.fromarray(rgb_output)
-
-async def detect_translate_inpaint(pil_img: Image.Image,
-                                   use_lama: bool = True,
-                                   colorize: bool = False,
-                                   target_lang: str = "en") -> Tuple[Image.Image, List[Dict]]:
-    img_bgr = pil_to_cv2(pil_img)
-    h, w = img_bgr.shape[:2]
-    loop = asyncio.get_running_loop()
-
-    is_vertical = target_lang in ("ja", "ko", "cz")
-
-    with _ocr_model_lock:
-        current_model = _current_ocr_model
-
-    if current_model == "ko":
-        logging.info("Using GLM-OCR (transformers) for Korean (with YOLO bbox)...")
-        try:
-            blocks = await asyncio.wait_for(
-                loop.run_in_executor(None, glm_ocr_korean, pil_img),
-                timeout=90.0,
-            )
-        except asyncio.TimeoutError:
-            logging.error("[OCR] VARCO Korean OCR timed out after 90s — aborting job.")
-            raise RuntimeError("Korean OCR timed out (VARCO VLM generation hung)")
+def draw_text_with_config(draw: ImageDraw.ImageDraw,
+                          position: Tuple[float, float],
+                          text: str,
+                          font: ImageFont.FreeTypeFont,
+                          fill: Tuple[int, int, int],
+                          stroke_fill: Optional[Tuple[int, int, int]] = None,
+                          anchor: Optional[str] = None):
+    with _font_config_lock:
+        stroke_width = _current_stroke_width
+    if stroke_width > 0 and stroke_fill is not None:
+        draw.text(position, text, font=font, fill=fill,
+                  stroke_width=stroke_width, stroke_fill=stroke_fill, anchor=anchor)
     else:
-        logging.info("Using Hayai OCR + YOLO for Japanese...")
-        try:
-            blocks = await asyncio.wait_for(
-                loop.run_in_executor(None, hayai_ocr_with_yolo, pil_img),
-                timeout=90.0,
-            )
-        except asyncio.TimeoutError:
-            logging.error("[OCR] Hayai Japanese OCR timed out after 90s — aborting job.")
-            raise RuntimeError("Japanese OCR timed out (Hayai+YOLO pipeline hung)")
+        draw.text(position, text, font=font, fill=fill, anchor=anchor)
 
-    cleaned = []
-    for b in blocks:
-        x1, y1, x2, y2 = b["bbox"]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w-1, x2), min(h-1, y2)
-        if x2 - x1 < 4 or y2 - y1 < 4:
-            continue
-        cleaned.append({"text": (b.get("text") or "").strip(), "bbox": (x1, y1, x2, y2)})
-    cleaned.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+# ===========================================================================
+# SetFont Endpoint
+# ===========================================================================
+class SetFontRequest(BaseModel):
+    font_path: Optional[str] = None
+    font_url: Optional[str] = None
+    stroke_width: int = 0
 
-    if not cleaned:
-        if colorize and ort is not None:
+@app.post("/SetFont")
+async def set_font(req: SetFontRequest):
+    global _current_font_path, _current_stroke_width
+    with _font_config_lock:
+        if req.font_url and req.font_path:
+            raise HTTPException(400, "Provide either font_path or font_url, not both")
+        if req.font_url:
+            filename = pathlib.Path(req.font_url).name
+            if not filename.lower().endswith(('.ttf', '.otf', '.ttc')):
+                filename += '.ttf'
+            new_path = FONT_DIR / filename
             try:
-                pil_img = colorize_pil(pil_img)
+                logging.info(f"[Font] Downloading from {req.font_url} -> {new_path}")
+                urllib.request.urlretrieve(req.font_url, new_path)
+                _current_font_path = new_path
+                clear_font_cache()
+                logging.info(f"[Font] Downloaded and set: {new_path}")
             except Exception as e:
-                logging.error(f"Colorization failed: {e}")
-        return pil_img, []
+                raise HTTPException(500, f"Failed to download font: {e}")
+        elif req.font_path:
+            p = pathlib.Path(req.font_path).resolve()
+            if not p.exists():
+                raise HTTPException(400, f"Font file not found: {req.font_path}")
+            if not p.suffix.lower() in ('.ttf', '.otf', '.ttc'):
+                raise HTTPException(400, f"Unsupported font format: {p.suffix}")
+            _current_font_path = p
+            clear_font_cache()
+            logging.info(f"[Font] Set to: {_current_font_path}")
+        _current_stroke_width = max(0, min(20, req.stroke_width))
+        logging.info(f"[Font] Stroke width set to: {_current_stroke_width}")
+    return {"status": "ok", "font_path": str(_current_font_path), "stroke_width": _current_stroke_width}
 
-    sam_future = None
-    if colorize:
-        if ort is None:
-            raise RuntimeError("onnxruntime not installed but colorization requested.")
-        sam_future = loop.run_in_executor(None, _colorize_sam_precompute, pil_img)
-
-    def _do_inpaint():
-        mask = np.zeros((h, w), dtype=np.uint8)
-        for c in cleaned:
-            x1, y1, x2, y2 = c["bbox"]
-            pad = max(2, int(min(x2 - x1, y2 - y1) * 0.06))
-            y0, y1p = max(0, y1 - pad), min(h, y2 + pad)
-            x0, x1p = max(0, x1 - pad), min(w, x2 + pad)
-            mask[y0:y1p, x0:x1p] = 255
-        mask_area = int(mask.sum() // 255)
-        try:
-            if use_lama and SimpleLama:
-                return lama_inpaint(img_bgr, mask)
-            if mask_area > 0.25 * h * w:
-                logging.warning("Mask too large for cv2.inpaint; solid-filling boxes.")
-                filled = img_bgr.copy()
-                for c in cleaned:
-                    x1, y1, x2, y2 = c["bbox"]
-                    _, bg_rgb = detect_text_and_bg_colors(img_bgr, (x1, y1, x2, y2))
-                    cv2.rectangle(filled, (x1, y1), (x2, y2),
-                                  (bg_rgb[2], bg_rgb[1], bg_rgb[0]), -1)
-                return filled
-            return cv2_inpaint_fallback(img_bgr, mask)
-        except Exception as e:
-            logging.error(f"Inpainting failed, falling back to cv2: {e}")
-            return cv2_inpaint_fallback(img_bgr, mask)
-
-    async def _do_translation():
-        texts = [c["text"] for c in cleaned]
-        tasks = []
-        for t in texts:
-            if not t.strip():
-                tasks.append(asyncio.sleep(0, result=""))
-            else:
-                tasks.append(loop.run_in_executor(_llm_executor, qwen_translate, t, target_lang))
-        return await asyncio.gather(*tasks)
-
-    inpaint_task = loop.run_in_executor(None, _do_inpaint)
-    translation_task = _do_translation()
-
-    futures = [inpaint_task, translation_task]
-    if sam_future:
-        futures.append(sam_future)
-    
-    try:
-        results = await asyncio.wait_for(asyncio.gather(*futures), timeout=120.0)
-        inpainted, translations = results[0], results[1]
-        sam_features = results[2] if sam_future else None
-    except asyncio.TimeoutError:
-        logging.error("Pipeline timed out after 120s")
-        raise RuntimeError("Translation pipeline timed out")
-
-    if colorize and sam_features is not None:
-        try:
-            inpainted_pil = cv2_to_pil(inpainted)
-            colorized_pil = await loop.run_in_executor(
-                None, _colorize_generate_only, inpainted_pil, sam_features
-            )
-            inpainted = pil_to_cv2(colorized_pil)
-            logging.info("Colorization applied to inpainted image.")
-        except Exception as e:
-            logging.error(f"Colorization failed, using non-colorized: {e}")
-            raise RuntimeError(f"Colorization ONNX failed: {e}")
-
-    base_pil = cv2_to_pil(inpainted).convert("RGBA")
-    out = base_pil.copy()
-    draw = ImageDraw.Draw(out)
-
-    if not hasattr(fit_font_and_wrap, '_cache'):
-        fit_font_and_wrap._cache = {}
-    cache = fit_font_and_wrap._cache
-
-    prep_args = [(c, trans, inpainted, target_lang) for c, trans in zip(cleaned, translations)]
-    prepped = list(_BOX_EXECUTOR.map(lambda args: _prep_one_box(*args), prep_args))
-
-    boxes_info: List[Dict] = []
-    
-    for p, c in zip(prepped, cleaned):
-        if p is None:
-            boxes_info.append({
-                "bbox": c["bbox"], "orig": c["text"], "trans": "",
-                "font_size": 0, "text_color": None, "outline_color": None
-            })
-            continue
-            
-        (bbox, trans, text_rgb, outline_rgb, 
-         box_w, box_h, font_size, lines, heights) = p
-        x1, y1, x2, y2 = bbox
-        
-        key = (str(FONT_PATH), font_size)
-        if key not in cache:
-            try: cache[key] = ImageFont.truetype(str(FONT_PATH), font_size)
-            except Exception: cache[key] = ImageFont.load_default()
-        font = cache[key]
-        
-        outline_w = max(1, int(font_size * 0.14))
-
-        if is_vertical:
-            col_widths = heights
-            total_w = sum(col_widths)
-            cur_x_right = x2 - max(0, (box_w - total_w) // 2)
-
-            for col, col_w in zip(lines, col_widths):
-                col_total_h = 0
-                char_heights = []
-                for ch in col:
-                    bb_ch = draw.textbbox((0,0), ch, font=font)
-                    ch_h = (bb_ch[3] - bb_ch[1]) * 1.2
-                    if ch_h == 0: ch_h = font_size
-                    char_heights.append(ch_h)
-                    col_total_h += ch_h
-
-                cur_y = y1 + max(0, (box_h - col_total_h) // 2)
-                cur_x_left = cur_x_right - col_w
-
-                for ch, ch_h in zip(col, char_heights):
-                    bb_ch = draw.textbbox((0,0), ch, font=font)
-                    ch_w = bb_ch[2] - bb_ch[0]
-                    pos_x = cur_x_left + max(0, (col_w - ch_w) / 2)
-                    draw_text_outline(draw, (pos_x, cur_y), ch, font,
-                                      fill=text_rgb, outline=outline_rgb, outline_width=outline_w)
-                    cur_y += ch_h
-                cur_x_right = cur_x_left
-        else:
-            total_h = sum(heights)
-            cur_y = y1 + max(0, (box_h - total_h) // 2)
-            for ln, hln in zip(lines, heights):
-                tw = draw.textlength(ln, font=font)
-                pos_x = x1 + max(0, int((box_w - tw) // 2))
-                draw_text_outline(draw, (pos_x, cur_y), ln, font,
-                                  fill=text_rgb, outline=outline_rgb, outline_width=outline_w)
-                cur_y += hln
-
-        boxes_info.append({
-            "bbox": bbox, "orig": c["text"], "trans": trans,
-            "font_size": font_size, "text_color": text_rgb, "outline_color": outline_rgb,
-        })
-        
-    return out, boxes_info
+@app.get("/GetFont")
+async def get_font_config():
+    with _font_config_lock:
+        return {"font_path": str(_current_font_path), "stroke_width": _current_stroke_width}
 
 # ===========================================================================
-# Job queue / worker (Optimized PNG Compression)
+# SetModelType Endpoint
 # ===========================================================================
-def _cleanup_old_jobs():
-    now = time.time()
-    
-    # 1. Clean up finished jobs older than 10 minutes
-    to_remove = [
-        jid for jid, j in _jobs.items()
-        if j["status"] in ("done", "error")
-        and now - j.get("completed_at", j.get("created_at", now)) > 600
-    ]
-    for jid in to_remove:
-        _jobs.pop(jid, None)
-
-    # 2. Failsafe: Evict jobs stuck in "running" for more than 5 minutes
-    stuck_running = [
-        jid for jid, j in _jobs.items()
-        if j["status"] == "running"
-        and now - j.get("started_at", now) > 300
-    ]
-    for jid in stuck_running:
-        j = _jobs.get(jid)
-        if j:
-            j["status"] = "error"
-            j["error"] = "Job evicted by cleanup (stuck in running for > 5 mins)"
-            j["traceback"] = "Evicted by _cleanup_old_jobs"
-            j["completed_at"] = now
-            logging.error(f"Job {jid} evicted by cleanup (stuck > 300s).")
-
-async def job_worker():
-    global _job_queue
-    while True:
-        _cleanup_old_jobs()
-        job_id = await _job_queue.get()
-        job = _jobs.get(job_id)
-        if not job:
-            continue
-        job["status"] = "running"
-        job["started_at"] = time.time()
-        try:
-            pil = job["_pil"]
-            use_lama = job["_use_lama"]
-            colorize = job.get("_colorize", False)
-            target_lang = job.get("_target_lang", "en")
-
-            result_img, boxes = await asyncio.wait_for(
-                detect_translate_inpaint(
-                    pil, use_lama=use_lama,
-                    colorize=colorize, target_lang=target_lang,
-                ),
-                timeout=180.0,
-            )
-            buf = io.BytesIO()
-            try:
-                result_img.convert("RGB").save(buf, format="PNG", optimize=False, compress_level=1)
-            except Exception:
-                buf = io.BytesIO()
-                result_img.convert("RGB").save(buf, format="PNG")
-            job["image_bytes"] = buf.getvalue()
-            job["boxes"] = boxes
-            job["status"] = "done"
-            job["completed_at"] = time.time()
-            logging.info(f"Job {job_id} completed successfully.")
-        except asyncio.TimeoutError:
-            job["status"] = "error"
-            job["error"] = "Job exceeded 180s wall-clock timeout (likely OCR hang)"
-            job["traceback"] = "TimeoutError in job_worker"
-            logging.error(f"Job {job_id} hard-killed after 180s.")
-        except Exception as e:
-            job["status"] = "error"
-            job["error"] = f"{type(e).__name__}: {e}"
-            job["traceback"] = traceback.format_exc()
-            logging.error(f"Job {job_id} failed: {e}\n{traceback.format_exc()}")
-        finally:
-            job.pop("_pil", None)
-
-@app.on_event("startup")
-async def _start_worker():
-    global _job_queue, _worker_task
-    _job_queue = asyncio.Queue()
-    _worker_task = asyncio.create_task(job_worker())
-    
-    logging.info("[Startup] Preloading models in background...")
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(_llm_executor, get_qwen)
-    loop.run_in_executor(None, get_yolo)
-    if _current_ocr_model == "ko":
-        loop.run_in_executor(None, get_glm_ocr)
-    else:
-        loop.run_in_executor(None, get_hayai_ocr)
-
-# ===========================================================================
-# API models
-# ===========================================================================
-class TranslateRequest(BaseModel):
-    image_b64: Optional[str] = None
-    use_lama: bool = True
-    lang: str = DEFAULT_LANG
-    source: Optional[str] = None
-    colorize: bool = False
-
-class AIResolveRequest(BaseModel):
-    provider: Optional[str] = None
+class SetModelTypeRequest(BaseModel):
+    model_type: str
+    api_key: Optional[str] = None
     model: Optional[str] = None
-    model_list: Optional[List[str]] = None
 
-class ChangeModelRequest(BaseModel):
-    repo_id: str
-    filename: Optional[str] = None
+@app.post("/SetModelType")
+async def set_model_type(req: SetModelTypeRequest):
+    global _current_model_type, _openrouter_api_key, _openrouter_model
+    model_type = req.model_type.lower().strip()
+    if model_type not in ("local", "openrouter"):
+        raise HTTPException(400, "model_type must be 'local' or 'openrouter'")
+    with _model_type_lock:
+        _current_model_type = model_type
+        if model_type == "openrouter":
+            if req.api_key:
+                _openrouter_api_key = req.api_key
+            if not _openrouter_api_key:
+                raise HTTPException(400, "OpenRouter API key is required. Provide api_key parameter.")
+            if req.model:
+                _openrouter_model = req.model
+            logging.info(f"[ModelType] Set to openrouter, model={_openrouter_model}")
+        else:
+            logging.info(f"[ModelType] Set to local (GGUF)")
+    return {
+        "status": "ok",
+        "model_type": _current_model_type,
+        "local_model": f"{_current_qwen_repo_id}/{_current_qwen_filename}" if _current_model_type == "local" else None,
+        "openrouter_model": _openrouter_model if _current_model_type == "openrouter" else None,
+        "openrouter_configured": _openrouter_api_key is not None
+    }
 
-# ===========================================================================
-# Embedded HTML Testing UI
-# ===========================================================================
-@app.get("/", response_class=HTMLResponse)
-async def root_ui():
-    return r"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Manga Translator Testing UI</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f9; }
-            h2 { color: #333; }
-            .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            .upload-box { margin-bottom: 20px; display: flex; align-items: center; gap: 15px; flex-wrap: wrap; }
-            .images { display: flex; gap: 20px; flex-wrap: wrap; }
-            .image-block { flex: 1; min-width: 300px; }
-            img { max-width: 100%; border: 1px solid #ddd; border-radius: 4px; display: none; }
-            #status { margin: 10px 0; font-weight: bold; color: #0066cc; }
-            pre { background: #eee; padding: 10px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; }
-            button { padding: 10px 20px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; }
-            button:hover { background: #0052a3; }
-            input[type="file"] { margin-right: 10px; }
-            .switcher { margin-bottom: 15px; padding: 10px; background: #eef; border-radius: 5px; }
-            .switcher label { margin-right: 10px; font-weight: bold; }
-            .switcher input { margin-right: 5px; }
-            .model-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
-            select, input[type="text"] { padding: 6px; border-radius: 4px; border: 1px solid #ccc; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Manga Translator API - Testing UI</h2>
-
-            <div class="switcher">
-                <label>OCR Model:</label>
-                <input type="radio" id="ocrJa" name="ocrModel" value="ja" checked onchange="switchModel()">
-                <label for="ocrJa">Japanese (Hayai+YOLO)</label>
-                <input type="radio" id="ocrKo" name="ocrModel" value="ko" onchange="switchModel()" style="margin-left: 20px;">
-                <label for="ocrKo">Korean (PaddleOCR)</label>
-            </div>
-
-            <div class="switcher">
-                <label>Colorize:</label>
-                <input type="checkbox" id="colorizeChk"> <label for="colorizeChk">Enable manga colorization (ONNX v6)</label>
-                <span id="colorizeStatus" style="margin-left:10px; color:#666;"></span>
-            </div>
-
-            <div class="switcher">
-                <label>Translation GGUF Model:</label>
-                <div class="model-row">
-                    <select id="ggufSelect" style="min-width:350px;"></select>
-                    <button onclick="loadModelList()">Refresh List</button>
-                    <button onclick="changeModel()">Switch Model</button>
-                    <input type="text" id="customRepo" placeholder="repo_id (e.g. hugging-quants/Llama-3.2-1B-Instruct-GGUF)" style="min-width:300px;">
-                    <input type="text" id="customFile" placeholder="filename (leave blank to auto-find)" style="min-width:220px;">
-                    <button onclick="changeModelCustom()">Switch (custom)</button>
-                </div>
-                <div id="modelStatus" style="margin-top:6px; color:#666;"></div>
-            </div>
-
-            <div class="upload-box">
-                <input type="file" id="fileInput" accept="image/*">
-                <button onclick="translateImage()">Translate</button>
-            </div>
-            <div id="status"></div>
-            <div class="images">
-                <div class="image-block">
-                    <h3>Original</h3>
-                    <img id="origImg" alt="Original Image">
-                </div>
-                <div class="image-block">
-                    <h3>Translated</h3>
-                    <img id="transImg" alt="Translated Image">
-                </div>
-            </div>
-            <h3>Debug Data (Boxes & Text)</h3>
-            <pre id="boxesInfo">No data yet.</pre>
-        </div>
-
-        <script>
-            async function switchModel() {
-                const selected = document.querySelector('input[name="ocrModel"]:checked').value;
-                try {
-                    const res = await fetch(`/setmodel?model=${selected}`, { method: "POST" });
-                    const data = await res.json();
-                    console.log("Switched OCR model:", data);
-                } catch (e) {
-                    console.error("Failed to switch OCR model:", e);
-                }
-            }
-
-            async function loadModelList() {
-                const sel = document.getElementById('ggufSelect');
-                const status = document.getElementById('modelStatus');
-                status.innerText = "Fetching models...";
-                try {
-                    const res = await fetch('/v1/listmodels');
-                    const data = await res.json();
-                    sel.innerHTML = '';
-                    if (data.models && data.models.length > 0) {
-                        data.models.forEach(m => {
-                            const opt = document.createElement('option');
-                            opt.value = m.name;
-                            opt.textContent = `${m.repo_id}/${m.filename} (${m.size_mb} MB)`;
-                            opt.dataset.repo = m.repo_id;
-                            opt.dataset.file = m.filename;
-                            sel.appendChild(opt);
-                        });
-                        status.innerText = "Models loaded.";
-                    } else {
-                        status.innerText = "No local models found.";
-                    }
-                } catch (e) {
-                    status.innerText = "Error loading models.";
-                    console.error(e);
-                }
-            }
-
-            async function changeModel() {
-                const sel = document.getElementById('ggufSelect');
-                const status = document.getElementById('modelStatus');
-                if (!sel.value) {
-                    alert("Select a model first or refresh list.");
-                    return;
-                }
-                const opt = sel.options[sel.selectedIndex];
-                const repo = opt.dataset.repo;
-                const file = opt.dataset.file;
-                status.innerText = `Switching to ${repo}/${file}...`;
-                try {
-                    const res = await fetch('/v1/changemodel', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({repo_id: repo, filename: file})
-                    });
-                    const data = await res.json();
-                    if (res.ok) {
-                        status.innerText = `Active model: ${data.repo_id}/${data.filename}`;
-                    } else {
-                        status.innerText = `Error: ${data.detail || 'Failed'}`;
-                    }
-                } catch (e) {
-                    status.innerText = "Request failed.";
-                }
-            }
-
-            async function changeModelCustom() {
-                const repo = document.getElementById('customRepo').value.trim();
-                const file = document.getElementById('customFile').value.trim();
-                const status = document.getElementById('modelStatus');
-                if (!repo) {
-                    alert("Provide at least the repo_id.");
-                    return;
-                }
-                status.innerText = `Downloading/Switching to ${repo}/${file || 'auto'}...`;
-                try {
-                    const res = await fetch('/v1/changemodel', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({repo_id: repo, filename: file || null})
-                    });
-                    const data = await res.json();
-                    if (res.ok) {
-                        status.innerText = `Active model: ${data.repo_id}/${data.filename}`;
-                        loadModelList(); // refresh dropdown
-                    } else {
-                        status.innerText = `Error: ${data.detail || 'Failed'}`;
-                    }
-                } catch (e) {
-                    status.innerText = "Request failed.";
-                }
-            }
-
-            async function translateImage() {
-                const fileInput = document.getElementById('fileInput');
-                const statusDiv = document.getElementById('status');
-                const origImg = document.getElementById('origImg');
-                const transImg = document.getElementById('transImg');
-                const boxesInfo = document.getElementById('boxesInfo');
-                const colorizeChk = document.getElementById('colorizeChk').checked;
-
-                if (!fileInput.files[0]) {
-                    alert("Please select an image file.");
-                    return;
-                }
-
-                statusDiv.innerText = "Uploading...";
-                origImg.src = URL.createObjectURL(fileInput.files[0]);
-                origImg.style.display = "block";
-                transImg.style.display = "none";
-                boxesInfo.textContent = "Processing...";
-
-                const formData = new FormData();
-                formData.append("file", fileInput.files[0]);
-                formData.append("colorize", colorizeChk);
-
-                try {
-                    const upRes = await fetch("/v1/translate/upload", { method: "POST", body: formData });
-                    if (!upRes.ok) {
-                        const errBody = await upRes.text();
-                        statusDiv.innerText = `Upload failed (${upRes.status})`;
-                        boxesInfo.textContent = errBody;
-                        return;
-                    }
-                    const upData = await upRes.json();
-                    const jobId = upData.id;
-                    if (!jobId) {
-                        statusDiv.innerText = "Upload returned no job ID";
-                        boxesInfo.textContent = JSON.stringify(upData, null, 2);
-                        return;
-                    }
-                    
-                    statusDiv.innerText = `Job ${jobId} queued. Polling...`;
-                    
-                    let done = false;
-                    let pollCount = 0;
-                    const MAX_POLLS = 30;
-                    
-                    while (!done && pollCount < MAX_POLLS) {
-                        pollCount++;
-                        const pollRes = await fetch(`/v1/translate/${jobId}?wait=20`);
-                        const pollData = await pollRes.json();
-                        
-                        if (pollData.status === "done") {
-                            done = true;
-                            transImg.src = pollData.image_url + "?t=" + Date.now();
-                            transImg.style.display = "block";
-                            statusDiv.innerText = "Done!";
-                            boxesInfo.textContent = JSON.stringify(pollData.boxes, null, 2);
-                        } else if (pollData.status === "error") {
-                            done = true;
-                            statusDiv.innerText = "Error: " + pollData.error;
-                            boxesInfo.textContent = "Error details:\n" + (pollData.error || "Unknown error");
-                        } else {
-                            statusDiv.innerText = `Status: ${pollData.status}. Polling again...`;
-                        }
-                    }
-                    
-                    if (!done) {
-                        statusDiv.innerText = "Timed out waiting for result.";
-                        boxesInfo.textContent = "The request timed out after " + MAX_POLLS + " polls.";
-                    }
-                } catch (e) {
-                    statusDiv.innerText = "Request failed: " + e.message;
-                    boxesInfo.textContent = e.stack;
-                }
-            }
-
-            // Initial load
-            window.onload = () => {
-                loadModelList();
-            };
-        </script>
-    </body>
-    </html>
-    """
+@app.get("/GetModelType")
+async def get_model_type():
+    with _model_type_lock:
+        return {
+            "model_type": _current_model_type,
+            "local_model": f"{_current_qwen_repo_id}/{_current_qwen_filename}" if _current_model_type == "local" else None,
+            "openrouter_model": _openrouter_model if _current_model_type == "openrouter" else None,
+            "openrouter_configured": _openrouter_api_key is not None
+        }
 
 # ===========================================================================
-# Console / Logs
+# SetOpenRouterModel Endpoint
 # ===========================================================================
-@app.get("/console", response_class=PlainTextResponse)
-async def console_logs():
-    """Return all captured backend logs for debugging and error reporting."""
-    return "\n".join(log_handler.get_logs())
+class SetOpenRouterModelRequest(BaseModel):
+    model: str
+    api_key: Optional[str] = None
+
+@app.post("/SetOpenRouterModel")
+async def set_openrouter_model(req: SetOpenRouterModelRequest):
+    global _openrouter_model, _openrouter_api_key
+    if not req.model or not req.model.strip():
+        raise HTTPException(400, "model is required")
+    with _model_type_lock:
+        _openrouter_model = req.model.strip()
+        if req.api_key:
+            _openrouter_api_key = req.api_key
+        logging.info(f"[OpenRouter] Model changed to: {_openrouter_model}")
+    return {
+        "status": "ok",
+        "openrouter_model": _openrouter_model,
+        "api_key_set": _openrouter_api_key is not None,
+        "note": "This only takes effect when model_type is 'openrouter'. Use /SetModelType to switch."
+    }
 
 # ===========================================================================
-# Model Switching Endpoints
+# Health / Meta endpoints
 # ===========================================================================
-@app.post("/setmodel")
-async def set_model(model: str = Query(..., pattern="^(ja|ko)$")):
-    """Change the current OCR model. Accepts 'ja' or 'ko'."""
-    global _current_ocr_model
-    with _ocr_model_lock:
-        _current_ocr_model = model
-    logging.info(f"OCR model switched to: {model}")
-    return {"status": "ok", "current_model": _current_ocr_model}
-
-@app.get("/getmodel")
-async def get_model():
-    """Get the current OCR model being used."""
-    return {"current_model": _current_ocr_model}
-
-# ===========================================================================
-# Root-level endpoints
-# ===========================================================================
-@app.post("/reloadfont")
-async def reload_font():
-    """Clear the font cache so a swapped TTF is picked up."""
-    clear_font_cache()
-    return {"status": "ok", "font": str(FONT_PATH), "exists": FONT_PATH.exists()}
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": time.time()}
+    return {"status": "ok"}
 
 @app.get("/version")
 async def version():
-    return {"version": "1.0.0", "build": BUILD_ID}
+    return {"version": BUILD_ID}
 
 @app.get("/meta")
 async def meta():
     return {
-        "languages": [
-            {"code": "en", "label": "English"},
-            {"code": "ja", "label": "Japanese (source)"},
-            {"code": "ko", "label": "Korean (source)"},
-        ],
-        "sources": ["hayai-yolo", "paddleocr"],
-        "server_ai_key": False,
-        "translation_model": _current_qwen_repo_id,
-        "ocr_backend": "switchable",
-        "current_ocr_model": _current_ocr_model,
-        "colorize_enabled": _colorize_enabled,
+        "version": BUILD_ID,
+        "cuda": has_cuda(),
+        "device": get_torch_device(),
+        "ocr_model": _current_ocr_model,
+        "font_path": str(_current_font_path),
+        "stroke_width": _current_stroke_width,
+        "model_type": _current_model_type,
+        "openrouter_model": _openrouter_model if _current_model_type == "openrouter" else None,
+        "local_model": f"{_current_qwen_repo_id}/{_current_qwen_filename}" if _current_model_type == "local" else None,
+        "inpaint_lama_available": SimpleLama is not None,
     }
 
-@app.get("/warmup")
-async def warmup(lang: Optional[str] = None):
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(_llm_executor, get_qwen)
-    return {"warmed": True, "lang": lang or DEFAULT_LANG}
-
-# ===========================================================================
-# /v1/* endpoints (OpenAI-style)
-# ===========================================================================
-@app.post("/v1/translate")
-async def v1_translate(
-    req: TranslateRequest,
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-):
-    if not req.image_b64:
-        raise HTTPException(400, "image_b64 required")
+@app.post("/warmup")
+async def warmup():
+    errors = []
     try:
-        raw = base64.b64decode(req.image_b64)
-        pil = Image.open(io.BytesIO(raw)).convert("RGB")
+        get_yolo()
     except Exception as e:
-        raise HTTPException(400, f"bad image: {e}")
-
-    if idempotency_key and idempotency_key in _jobs:
-        existing = _jobs[idempotency_key]
-        if existing["status"] in ("queued", "running", "done", "error"):
-            return {"id": idempotency_key, "status": existing["status"],
-                    "hint": "idempotent reuse"}
-
-    job_id = idempotency_key or uuid.uuid4().hex
-    _jobs[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "created_at": time.time(),
-        "_pil": pil,
-        "_use_lama": req.use_lama,
-        "_colorize": req.colorize or _colorize_enabled,
-        "_target_lang": req.lang,
-    }
-    if _job_queue is None:
-        raise HTTPException(503, "Server is still starting up, please try again in a moment.")
-    await _job_queue.put(job_id)
-    return {"id": job_id, "status": "queued", "hint": "poll /v1/translate/{id}?wait=N"}
-
-@app.post("/v1/translate/upload")
-async def v1_translate_upload(
-    file: UploadFile = File(...),
-    use_lama: str = Form("true"),
-    lang: str = Form("en"),
-    colorize: str = Form("false"),
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-):
-    use_lama_bool = use_lama.lower() in ("true", "1", "on", "yes")
-    colorize_bool = colorize.lower() in ("true", "1", "on", "yes")
-    
-    if lang not in LANG_MAP:
-        lang = "en"
-    
-    raw = await file.read()
-    logging.info(f"[Upload] Received lang='{lang}', colorize={colorize_bool}")
-
+        errors.append(f"YOLO: {e}")
     try:
-        pil = Image.open(io.BytesIO(raw)).convert("RGB")
+        get_hayai_ocr()
     except Exception as e:
-        raise HTTPException(400, f"bad image: {e}")
-    
-    if (colorize_bool or _colorize_enabled) and ort is None:
-        raise HTTPException(500, "Colorization requested but 'onnxruntime' is not installed.")
-
-    job_id = idempotency_key or uuid.uuid4().hex
-    _jobs[job_id] = {
-        "id": job_id, "status": "queued", "created_at": time.time(),
-        "_pil": pil, "_use_lama": use_lama_bool,
-        "_colorize": colorize_bool or _colorize_enabled,
-        "_target_lang": lang,
-    }
-    if _job_queue is None:
-        raise HTTPException(503, "Server is still starting up, please try again in a moment.")
-    await _job_queue.put(job_id)
-    return {"id": job_id, "status": "queued"}
-
-@app.get("/v1/translate/{job_id}")
-async def v1_translate_status(job_id: str, wait: float = Query(0, ge=0, le=25)):
-    if job_id not in _jobs:
-        raise HTTPException(404, "job not found")
-    job = _jobs[job_id]
-    deadline = time.time() + wait
-    while wait > 0 and job["status"] in ("queued", "running") and time.time() < deadline:
-        await asyncio.sleep(0.1)
-        job = _jobs[job_id]
-    resp = {"id": job_id, "status": job["status"]}
-    if job["status"] == "done":
-        b64 = base64.b64encode(job["image_bytes"]).decode("ascii")
-        resp.update({
-            "image_b64": b64,
-            "image_url": f"/v1/translate/{job_id}/image",
-            "boxes": [
-                {
-                    "bbox": b["bbox"],
-                    "orig": b["orig"],
-                    "trans": b["trans"],
-                    "font_size": b["font_size"],
-                    "text_color": b["text_color"],
-                    "outline_color": b["outline_color"],
-                } for b in job["boxes"]
-            ],
-            "completed_at": job.get("completed_at"),
-        })
-    elif job["status"] == "error":
-        resp["error"] = job.get("error")
-    return resp
-
-@app.get("/v1/translate/{job_id}/image")
-async def v1_translate_image(job_id: str):
-    if job_id not in _jobs:
-        raise HTTPException(404, "job not found")
-    job = _jobs[job_id]
-    if job["status"] != "done":
-        raise HTTPException(409, f"job status={job['status']}")
-    return Response(
-        content=job["image_bytes"], 
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=600, immutable"}
-    )
+        errors.append(f"Hayai OCR: {e}")
+    try:
+        if _current_model_type == "local":
+            get_qwen()
+    except Exception as e:
+        errors.append(f"Qwen: {e}")
+    try:
+        if SimpleLama is not None:
+            load_lama()
+            logging.info("[Warmup] SimpleLama loaded for inpainting.")
+        else:
+            logging.info("[Warmup] SimpleLama not installed; cv2.inpaint will be used as fallback.")
+    except Exception as e:
+        errors.append(f"SimpleLama: {e}")
+    return {"status": "warmed" if not errors else "partial", "errors": errors}
 
 # ===========================================================================
-# GGUF Model Management Endpoints
+# Console / Logs endpoint
 # ===========================================================================
+@app.get("/console")
+async def console():
+    html = """<!DOCTYPE html>
+<html><head><title>Console Logs</title>
+<style>
+body { background: #1a1a2e; color: #e0e0e0; font-family: 'Consolas', 'Monaco', monospace; padding: 20px; margin: 0; }
+.log-line { padding: 2px 8px; border-bottom: 1px solid #2a2a4a; font-size: 13px; }
+.log-line:hover { background: #2a2a4a; }
+.level-INFO { color: #a0d0ff; }
+.level-WARNING { color: #ffd060; }
+.level-ERROR { color: #ff6060; }
+.level-DEBUG { color: #808080; }
+h1 { color: #60a0ff; margin-bottom: 10px; }
+.controls { margin-bottom: 15px; }
+button { background: #2a4a8a; color: white; border: 1px solid #4080c0; padding: 8px 16px;
+         cursor: pointer; border-radius: 4px; margin-right: 8px; }
+button:hover { background: #3a5a9a; }
+#logs { max-height: calc(100vh - 120px); overflow-y: auto; }
+</style></head><body>
+<h1>Backend Console</h1>
+<div class="controls">
+<button onclick="fetchLogs()">Refresh</button>
+<button onclick="autoRefresh=!autoRefresh;this.textContent=autoRefresh?'Stop Auto':'Auto Refresh'">Auto Refresh</button>
+<span id="count"></span>
+</div>
+<div id="logs"></div>
+<script>
+let autoRefresh = false;
+async function fetchLogs() {
+  const r = await fetch('/console/json');
+  const logs = await r.json();
+  const el = document.getElementById('logs');
+  document.getElementById('count').textContent = logs.length + ' entries';
+  el.innerHTML = logs.map(l => {
+    const cls = 'level-' + (l.match(/\\b(INFO|WARNING|ERROR|DEBUG)\\b/) || ['','INFO'])[1];
+    return '<div class="log-line ' + cls + '">' + l.replace(/</g,'&lt;') + '</div>';
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+fetchLogs();
+setInterval(() => { if(autoRefresh) fetchLogs(); }, 2000);
+</script></body></html>"""
+    return HTMLResponse(content=html)
+
+@app.get("/console/json")
+async def console_json():
+    return JSONResponse(content=log_handler.get_logs())
+
+# ===========================================================================
+# Model management endpoints
+# ===========================================================================
+@app.post("/setmodel")
+async def setmodel(req: SetModelTypeRequest):
+    return await set_model_type(req)
+
+@app.get("/getmodel")
+async def getmodel():
+    with _model_type_lock:
+        result = {"model_type": _current_model_type}
+        if _current_model_type == "local":
+            result["local"] = {
+                "repo_id": _current_qwen_repo_id,
+                "filename": _current_qwen_filename,
+                "path": str(_current_qwen_path) if _current_qwen_path else None,
+            }
+        else:
+            result["openrouter"] = {
+                "model": _openrouter_model,
+                "api_key_set": _openrouter_api_key is not None,
+            }
+        return result
+
 @app.post("/v1/changemodel")
-async def v1_change_model(req: ChangeModelRequest):
-    """Switch the active Qwen GGUF translation model."""
+async def change_model(repo_id: str = Form(...), filename: Optional[str] = Form(None)):
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, switch_qwen_model, req.repo_id, req.filename)
-        return {"status": "ok", "repo_id": req.repo_id, "filename": _current_qwen_filename}
+        switch_qwen_model(repo_id, filename)
+        return {"status": "ok", "repo_id": repo_id, "filename": filename}
     except Exception as e:
-        logging.error(f"Failed to switch model: {e}\n{traceback.format_exc()}")
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 @app.get("/v1/listmodels")
-async def v1_list_models():
-    """List all locally downloaded GGUF models available for translation."""
-    return {"models": list_local_gguf_models()}
+async def list_models():
+    models = list_local_gguf_models()
+    return {"models": models, "count": len(models)}
 
 # ===========================================================================
-# Colorize Global Toggle Endpoint
-# ===========================================================================
-@app.post("/v1/colorize")
-async def v1_toggle_colorize(enable: bool = Query(...)):
-    """Globally enable or disable the manga colorizer for all future translations."""
-    global _colorize_enabled
-    _colorize_enabled = enable
-    logging.info(f"Global colorization toggled to: {enable}")
-    return {"status": "ok", "colorize_enabled": _colorize_enabled}
-
-# ===========================================================================
-# AI Resolve / Prompt Endpoints
+# OCR resolve endpoint
 # ===========================================================================
 @app.post("/v1/ai/resolve")
-async def v1_ai_resolve(req: AIResolveRequest):
-    return {
-        "provider": req.provider or "qwen-gguf",
-        "model":    req.model or _current_qwen_repo_id,
-        "model_list": req.model_list or [_current_qwen_repo_id],
-        "resolved": True,
-    }
-
-@app.get("/v1/ai/prompt/default")
-async def v1_ai_prompt_default(lang: str = DEFAULT_LANG):
-    return {
-        "lang": lang,
-        "system": SYSTEM_PROMPT,
-        "user_template": "{text}",
-    }
+async def ai_resolve(image: UploadFile = File(...), lang: str = Form("ja")):
+    contents = await image.read()
+    pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+    if lang == "ko":
+        results = glm_ocr_korean(pil_img)
+    else:
+        results = hayai_ocr_with_yolo(pil_img)
+    return {"results": results, "count": len(results)}
 
 # ===========================================================================
-# Entry point
+# Default prompt endpoint
+# ===========================================================================
+@app.get("/v1/ai/prompt/default")
+async def get_default_prompt():
+    return {"prompt": SYSTEM_PROMPT}
+
+# ===========================================================================
+# Colorize endpoint
+# ===========================================================================
+@app.post("/v1/colorize")
+async def colorize_endpoint(image: UploadFile = File(...)):
+    try:
+        contents = await image.read()
+        pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+        result = colorize_pil(pil_img)
+        buf = io.BytesIO()
+        result.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+    except Exception as e:
+        raise HTTPException(500, f"Colorization failed: {e}")
+
+# ===========================================================================
+# Translation Job endpoints
+# ===========================================================================
+@app.post("/v1/translate")
+async def create_translate_job(
+    image: UploadFile = File(...),
+    target_lang: str = Form(DEFAULT_LANG),
+    ocr_lang: str = Form("ja"),
+    inpaint: bool = Form(True),
+):
+    """Create a new translation job.
+    
+    - inpaint: If true, erase original text via inpainting before overlaying translations.
+               If false, overlay translations directly on top of the original text.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    contents = await image.read()
+    pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+
+    async with _job_lock:
+        _jobs[job_id] = {
+            "id": job_id,
+            "status": "pending",
+            "image": pil_img,
+            "target_lang": target_lang,
+            "ocr_lang": ocr_lang,
+            "inpaint": inpaint,
+            "result": None,
+            "error": None,
+            "created": time.time(),
+        }
+
+    asyncio.create_task(_process_job(job_id))
+    return {"job_id": job_id, "status": "pending", "inpaint": inpaint}
+
+async def _process_job(job_id: str):
+    """Background task: OCR -> Translate (Batch for OpenRouter, Sequential for Local)."""
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "processing"
+
+    try:
+        pil_img = job["image"]
+        target_lang = job["target_lang"]
+        ocr_lang = job["ocr_lang"]
+
+        # Step 1: OCR
+        if ocr_lang == "ko":
+            ocr_results = glm_ocr_korean(pil_img)
+        else:
+            ocr_results = hayai_ocr_with_yolo(pil_img)
+
+        if not ocr_results:
+            async with _job_lock:
+                job["status"] = "completed"
+                job["result"] = {"boxes": [], "translations": []}
+            return
+
+        texts_to_translate = [item["text"] for item in ocr_results]
+        translations = []
+
+        with _model_type_lock:
+            model_type = _current_model_type
+
+        # Step 2: Translate
+        if model_type == "openrouter":
+            # --- BATCH STRATEGY FOR OPENROUTER ---
+            logging.info(f"[Job {job_id}] Using OpenRouter BATCH strategy for {len(texts_to_translate)} boxes.")
+            batch_results = await openrouter_translate_batch(texts_to_translate, target_lang)
+            
+            # Check if batch completely failed or missed items, fallback to sequential for missing ones
+            needs_sequential_fallback = not any(batch_results)
+            
+            if needs_sequential_fallback:
+                logging.warning(f"[Job {job_id}] Batch failed entirely, falling back to sequential requests.")
+                for idx, text in enumerate(texts_to_translate):
+                    if not text.strip():
+                        translations.append({"text": text, "translation": "", "bbox": ocr_results[idx]["bbox"]})
+                        continue
+                    translated = await openrouter_translate(text, target_lang)
+                    await asyncio.sleep(1.0)
+                    translations.append({
+                        "text": text,
+                        "translation": translated,
+                        "bbox": ocr_results[idx]["bbox"],
+                    })
+            else:
+                # Batch succeeded (even if partially), fill in translations
+                for idx, text in enumerate(texts_to_translate):
+                    translated = batch_results[idx]
+                    
+                    # If a specific line failed to parse in the batch, retry it individually
+                    if not translated and text.strip():
+                        logging.warning(f"[Job {job_id}] Box {idx+1} missed in batch, retrying individually...")
+                        translated = await openrouter_translate(text, target_lang)
+                        await asyncio.sleep(1.0)
+                        
+                    translations.append({
+                        "text": text,
+                        "translation": translated,
+                        "bbox": ocr_results[idx]["bbox"],
+                    })
+        else:
+            # --- SEQUENTIAL STRATEGY FOR LOCAL GGUF ---
+            logging.info(f"[Job {job_id}] Using Local SEQUENTIAL strategy for {len(texts_to_translate)} boxes.")
+            loop = asyncio.get_event_loop()
+            for idx, text in enumerate(texts_to_translate):
+                if not text.strip():
+                    translations.append({"text": text, "translation": "", "bbox": ocr_results[idx]["bbox"]})
+                    continue
+                
+                logging.info(f"[Job {job_id}] Translating box {idx + 1}/{len(ocr_results)}: '{text[:40]}'")
+                translated = await loop.run_in_executor(_llm_executor, qwen_translate, text, target_lang)
+                
+                translations.append({
+                    "text": text,
+                    "translation": translated,
+                    "bbox": ocr_results[idx]["bbox"],
+                })
+
+        async with _job_lock:
+            job["status"] = "completed"
+            job["result"] = {
+                "boxes": ocr_results,
+                "translations": translations,
+            }
+
+    except Exception as e:
+        logging.error(f"[Job {job_id}] Failed: {e}\n{traceback.format_exc()}")
+        async with _job_lock:
+            job["status"] = "failed"
+            job["error"] = str(e)
+
+@app.get("/v1/translate/{job_id}")
+async def get_translate_job(job_id: str):
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        result = {
+            "id": job["id"],
+            "status": job["status"],
+            "target_lang": job["target_lang"],
+            "ocr_lang": job["ocr_lang"],
+            "inpaint": job.get("inpaint", True),
+        }
+        if job["status"] == "completed":
+            result["result"] = job["result"]
+        elif job["status"] == "failed":
+            result["error"] = job["error"]
+        return result
+
+@app.post("/v1/translate/{job_id}/image")
+async def get_translated_image(job_id: str):
+    """Generate the final translated image.
+    
+    Pipeline:
+    1. Get OCR boxes + translations from completed job
+    2. Build inpaint mask from all text bounding boxes
+    3. Inpaint to erase original text (SimpleLama if available, else cv2.inpaint)
+    4. Detect text/bg colors from ORIGINAL image (before inpainting)
+    5. Overlay translated text with proper sizing and centering
+    """
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        if job["status"] != "completed":
+            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
+
+        pil_img = job["image"]
+        translations = job["result"].get("translations", [])
+        do_inpaint = job.get("inpaint", True)
+
+    if not translations:
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+
+    # Convert original image to cv2 for color detection and inpainting
+    img_bgr = pil_to_cv2(pil_img)
+    h, w = img_bgr.shape[:2]
+
+    # Collect all bounding boxes that have translations
+    boxes_to_inpaint = []
+    items_to_draw = []
+
+    for item in translations:
+        text = item.get("translation", "")
+        if not text or not text.strip():
+            continue
+        bbox = item.get("bbox")
+        if not bbox:
+            continue
+        x1, y1, x2, y2 = bbox
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w < 10 or box_h < 10:
+            continue
+
+        boxes_to_inpaint.append(bbox)
+        items_to_draw.append(item)
+
+    # --- Step 1: Inpainting (erase original text) ---
+    if do_inpaint and boxes_to_inpaint:
+        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions...")
+        mask = build_inpaint_mask(
+            img_bgr.shape,
+            boxes_to_inpaint,
+            padding=4,
+            dilate_kernel=5,
+        )
+
+        # Use lama if available, otherwise cv2 fallback
+        use_lama = SimpleLama is not None
+        img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
+        logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
+
+    # --- Step 2: Detect colors from ORIGINAL image (before inpainting) ---
+    # We use the original for color detection so we get accurate text/bg colors
+    orig_bgr = pil_to_cv2(pil_img)
+
+    # --- Step 3: Overlay translated text ---
+    out_pil = cv2_to_pil(img_bgr)
+    draw = ImageDraw.Draw(out_pil)
+
+    with _font_config_lock:
+        fp = str(_current_font_path)
+
+    for item in items_to_draw:
+        text = item["translation"]
+        bbox = item["bbox"]
+        x1, y1, x2, y2 = bbox
+        box_w = x2 - x1
+        box_h = y2 - y1
+
+        # Detect colors from the ORIGINAL image at this bbox location
+        text_color, bg_color = detect_text_and_bg_colors(orig_bgr, bbox)
+
+        # Fit text to box
+        font_size, lines, heights = fit_font_and_wrap(draw, text, box_w, box_h, font_path=fp)
+        font = get_font(fp, font_size)
+
+        # Calculate vertical centering
+        if heights:
+            total_text_h = sum(heights)
+        else:
+            total_text_h = font_size * len(lines)
+        start_y = y1 + (box_h - total_text_h) // 2
+
+        # Draw each line
+        current_y = start_y
+        for i, line in enumerate(lines):
+            if not line:
+                current_y += heights[i] if i < len(heights) else font_size
+                continue
+
+            line_w = draw.textlength(line, font=font)
+            line_x = x1 + (box_w - line_w) / 2
+
+            draw_text_with_config(
+                draw,
+                (line_x, current_y),
+                line,
+                font=font,
+                fill=text_color,
+                stroke_fill=bg_color,
+            )
+
+            current_y += heights[i] if i < len(heights) else font_size
+
+    # Return the final image
+    buf = io.BytesIO()
+    out_pil.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+# ===========================================================================
+# Main entry point
 # ===========================================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
