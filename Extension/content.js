@@ -2,6 +2,124 @@
   let isTranslating = false;
   let floatBtn, floatPopup;
 
+  // ========================================================================
+  // FONT PREVIEW HELPERS
+  // Fetches the server's actual active font (NotoCJK.ttc etc.) and renders
+  // live canvas swatches showing the halo/stroke effect used by the backend
+  // at each boldness level, instead of a plain text dropdown.
+  // ========================================================================
+  let _mtFontFace = null;
+  let _mtFontFaceServerUrl = null;
+
+  async function loadServerFontFace(serverUrl) {
+    if (_mtFontFace && _mtFontFaceServerUrl === serverUrl) return _mtFontFace;
+    const res = await fetch(`${serverUrl}/v1/font`);
+    if (!res.ok) throw new Error(`font fetch failed: HTTP ${res.status}`);
+    const buf = await res.arrayBuffer();
+    const face = new FontFace('MTPreviewFont', buf);
+    await face.load();
+    document.fonts.add(face);
+    _mtFontFace = face;
+    _mtFontFaceServerUrl = serverUrl;
+    return face;
+  }
+
+  function drawFontWeightSwatch(canvas, level, fontFamily) {
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    const dpr = window.devicePixelRatio || 1;
+
+    // Mimic a manga text-bubble backdrop so the stroke/halo is visible,
+    // same relationship as text_color (dark ink) vs stroke_fill (bg color).
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#8a8a8a';
+    ctx.fillRect(0, 0, w, h);
+
+    const fontSize = (16 + level * 2) * dpr;
+    ctx.font = `${fontSize}px "${fontFamily}"`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round';
+    const text = 'Aあ';
+    const cx = (w * dpr) / 2, cy = (h * dpr) / 2;
+
+    if (level > 0) {
+      ctx.lineWidth = level * 2.2 * dpr;
+      ctx.strokeStyle = '#ffffff';
+      ctx.strokeText(text, cx, cy);
+    }
+    ctx.fillStyle = '#111111';
+    ctx.fillText(text, cx, cy);
+  }
+
+  async function initFontWeightPicker() {
+    const container = document.getElementById('mtFontWeightPicker');
+    if (!container || container.dataset.built === '1') return;
+    container.dataset.built = '1';
+    container.innerHTML = '';
+
+    const { serverUrl, fontWeight } = await chrome.storage.local.get(['serverUrl', 'fontWeight']);
+    const selected = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
+    document.getElementById('mtFontWeightHidden').value = selected;
+
+    let fontFamily = 'sans-serif';
+    if (serverUrl) {
+      try {
+        const face = await loadServerFontFace(serverUrl);
+        fontFamily = face.family;
+      } catch (e) {
+        console.warn('[MangaTranslator] Could not load server font for preview, using fallback:', e);
+      }
+    }
+
+    const labels = ['Thin', 'Light', 'Regular', 'Bold', 'Heavy'];
+    for (let level = 0; level <= 4; level++) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex; flex-direction:column; align-items:center; cursor:pointer;';
+      wrap.title = `${level + 1} - ${labels[level]}`;
+
+      const dpr = window.devicePixelRatio || 1;
+      const canvas = document.createElement('canvas');
+      const cssW = 40, cssH = 32;
+      canvas.style.width = cssW + 'px';
+      canvas.style.height = cssH + 'px';
+      canvas.width = cssW * dpr;
+      canvas.height = cssH * dpr;
+      canvas.dataset.level = level;
+      canvas.style.cssText += `border-radius:4px; border:2px solid ${level === selected ? '#28a745' : '#444'}; display:block;`;
+      drawFontWeightSwatch(canvas, level, fontFamily);
+
+      const lbl = document.createElement('div');
+      lbl.innerText = level + 1;
+      lbl.style.cssText = 'font-size:10px; color:#aaa; margin-top:2px;';
+
+      wrap.appendChild(canvas);
+      wrap.appendChild(lbl);
+      wrap.onclick = () => {
+        document.getElementById('mtFontWeightHidden').value = level;
+        chrome.storage.local.set({ fontWeight: String(level) });
+        container.querySelectorAll('canvas').forEach(c => {
+          c.style.border = `2px solid ${parseInt(c.dataset.level, 10) === level ? '#28a745' : '#444'}`;
+        });
+      };
+      container.appendChild(wrap);
+    }
+  }
+
+  function refreshFontWeightSelection() {
+    chrome.storage.local.get(['fontWeight'], (data) => {
+      const selected = data.fontWeight !== undefined ? parseInt(data.fontWeight, 10) : 2;
+      const hidden = document.getElementById('mtFontWeightHidden');
+      if (hidden) hidden.value = selected;
+      const container = document.getElementById('mtFontWeightPicker');
+      if (container) {
+        container.querySelectorAll('canvas').forEach(c => {
+          c.style.border = `2px solid ${parseInt(c.dataset.level, 10) === selected ? '#28a745' : '#444'}`;
+        });
+      }
+    });
+  }
+
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "translateAllImages") {
@@ -73,17 +191,10 @@
 
       <div style="margin-bottom: 14px;">
         <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Font Boldness</div>
-        <select id="mtFontWeightSelect" style="
-          width: 100%; padding: 7px 8px; border-radius: 4px;
-          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
-          font-size: 13px; cursor: pointer;
-        ">
-          <option value="0">1 - Thin</option>
-          <option value="1">2 - Light</option>
-          <option value="2" selected>3 - Regular</option>
-          <option value="3">4 - Bold</option>
-          <option value="4">5 - Heavy</option>
-        </select>
+        <div id="mtFontWeightPicker" style="display:flex; gap:6px;">
+          <div style="font-size:11px; color:#888;">Loading preview…</div>
+        </div>
+        <input type="hidden" id="mtFontWeightHidden" value="2">
       </div>
 
       <div style="margin-bottom: 14px;">
@@ -130,9 +241,6 @@
       const sel = document.getElementById('mtTargetLangSelect');
       if (sel && data.targetLang) sel.value = data.targetLang;
 
-      const weightSel = document.getElementById('mtFontWeightSelect');
-      if (weightSel && data.fontWeight !== undefined) weightSel.value = data.fontWeight;
-
       const modelTypeSel = document.getElementById('mtModelTypeSelect');
       const openrouterRow = document.getElementById('mtOpenrouterRow');
       if (modelTypeSel) {
@@ -144,6 +252,8 @@
         if (orModelInput) orModelInput.value = data.openrouterModel;
       }
     });
+
+    initFontWeightPicker();
 
     // Toggle OpenRouter fields when model type changes
     document.getElementById('mtModelTypeSelect').onchange = (e) => {
@@ -187,7 +297,7 @@
     document.getElementById('mtStartBtn').onclick = async () => {
       const selectedModel     = document.querySelector('input[name="mtOcrModel"]:checked').value;
       const selectedLang      = document.getElementById('mtTargetLangSelect').value;
-      const selectedWeight    = document.getElementById('mtFontWeightSelect').value;
+      const selectedWeight    = document.getElementById('mtFontWeightHidden').value;
       const selectedModelType = document.getElementById('mtModelTypeSelect').value;
 
       // Persist choices so the extension popup stays in sync
@@ -243,9 +353,6 @@
         const sel = document.getElementById('mtTargetLangSelect');
         if (sel && data.targetLang) sel.value = data.targetLang;
 
-        const weightSel = document.getElementById('mtFontWeightSelect');
-        if (weightSel && data.fontWeight !== undefined) weightSel.value = data.fontWeight;
-
         const modelTypeSel = document.getElementById('mtModelTypeSelect');
         const openrouterRow = document.getElementById('mtOpenrouterRow');
         if (modelTypeSel) {
@@ -257,6 +364,7 @@
           if (orModelInput) orModelInput.value = data.openrouterModel;
         }
       });
+      refreshFontWeightSelection();
       floatPopup.style.display = 'block';
     }
   }

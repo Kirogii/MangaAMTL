@@ -21,6 +21,22 @@
     .subbox { padding: 8px; background: #2a2a3c; border-radius: 4px; border: 1px solid #444; margin-bottom: 15px; }
     .subbox input[type="text"] { margin: 6px 0; }
     .subbox button { margin-top: 4px; margin-bottom: 4px; }
+    .hint { font-size: 11px; color: #888; margin: -10px 0 12px 0; }
+    .font-scroll {
+      display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden;
+      white-space: nowrap; padding-bottom: 4px; margin: 8px 0 6px 0;
+      scrollbar-width: none; -ms-overflow-style: none;
+    }
+    .font-scroll::-webkit-scrollbar { display: none; }
+    .font-chip {
+      flex: 0 0 auto; padding: 7px 12px; background: #2a2a3c; color: #ccc;
+      border: 2px solid #555; border-radius: 16px; cursor: pointer;
+      font-size: 12px; white-space: nowrap;
+    }
+    .font-chip:hover { background: #34344a; }
+    .font-chip.active { border-color: #28a745; color: #fff; }
+    .font-loading { font-size: 11px; color: #888; padding: 4px 0; }
+    .font-loading.error { color: #ff4d4d; }
   </style>
 </head>
 <body>
@@ -48,14 +64,25 @@
     <label for="ocrKo">Korean (PaddleOCR)</label>
   </div>
 
-  <label for="fontWeight">Font Boldness:</label>
-  <select id="fontWeight">
-    <option value="0">1 - Thin</option>
-    <option value="1">2 - Light</option>
-    <option value="2">3 - Regular</option>
-    <option value="3">4 - Bold</option>
-    <option value="4">5 - Heavy</option>
+  <label>Font Family:</label>
+  <div id="fontFamilyScroll" class="font-scroll">
+    <div class="font-loading">Loading fonts…</div>
+  </div>
+  <div id="fontFamilyStatus" class="status" style="text-align:left; margin-top:0; margin-bottom:10px;"></div>
+
+  <label>Font Boldness:</label>
+  <div id="fontWeightPicker" style="display:flex; gap:8px; margin: 8px 0 15px 0;">
+    <div style="font-size:11px; color:#888;">Loading preview…</div>
+  </div>
+  <input type="hidden" id="fontWeightHidden" value="2">
+
+  <label for="inpaintMode">Inpainting Mode:</label>
+  <select id="inpaintMode">
+    <option value="low">Low (faster, default)</option>
+    <option value="high">High (better quality, bigger model)</option>
   </select>
+  <div class="hint">High mode auto-downloads a larger LaMa model on the server the first time it's used.</div>
+  <div id="inpaintModeStatus" class="status"></div>
 
   <label for="modelType">Translation Model:</label>
   <select id="modelType">

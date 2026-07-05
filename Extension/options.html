@@ -2,27 +2,51 @@
 <html>
 <head>
   <style>
-    body { width: 650px; padding: 20px; font-family: Arial, sans-serif; background: #f4f4f9; margin: 0 auto; }
-    h2, h3 { color: #333; }
-    .card { background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
-    label { font-weight: bold; color: #555; display: block; margin-bottom: 5px; }
-    input[type="text"], select { width: 100%; padding: 8px; margin-bottom: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; }
+    body { width: 650px; padding: 20px; font-family: Arial, sans-serif; background: #14141f; color: #e0e0e0; margin: 0 auto; }
+    h2, h3 { color: #ffffff; }
+    h2 { margin-bottom: 4px; }
+    .card { background: #1e1e2e; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.4); margin-bottom: 20px; border: 1px solid #333; }
+    label { font-weight: bold; color: #aaaaaa; display: block; margin-bottom: 5px; }
+    input[type="text"], select {
+      width: 100%; padding: 8px; margin-bottom: 10px; box-sizing: border-box;
+      border: 1px solid #444; border-radius: 4px; background: #2a2a3c; color: #e0e0e0;
+    }
+    input[type="text"]::placeholder { color: #777; }
     button { padding: 10px 15px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
     button:hover { background: #0052a3; }
     button.success { background: #28a745; }
     button.success:hover { background: #218838; }
-    button.secondary { background: #6c757d; }
+    button.secondary { background: #3a3f4b; border: 1px solid #555; color: #fff; }
+    button.secondary:hover { background: #4a4f5b; }
     .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
-    .status { margin-top: 10px; font-size: 14px; color: green; }
-    .error { color: red; }
+    .status { margin-top: 10px; font-size: 14px; color: #28a745; }
+    .error { color: #ff4d4d; }
+    .hint { font-size: 12px; color: #888; margin: -6px 0 12px 0; }
     table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-    th, td { padding: 8px; border: 1px solid #ddd; text-align: left; font-size: 14px; }
-    th { background: #f8f9fa; }
+    th, td { padding: 8px; border: 1px solid #383848; text-align: left; font-size: 14px; color: #ccc; }
+    th { background: #14141f; color: #fff; }
+    hr { margin: 20px 0; border: 0; border-top: 1px solid #333; }
+    .subbox { padding: 10px; background: #16161f; border-radius: 4px; border: 1px solid #333; }
+    .font-scroll {
+      display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden;
+      white-space: nowrap; padding-bottom: 4px; margin: 8px 0 6px 0;
+      scrollbar-width: none; -ms-overflow-style: none;
+    }
+    .font-scroll::-webkit-scrollbar { display: none; }
+    .font-chip {
+      flex: 0 0 auto; padding: 7px 12px; background: #2a2a3c; color: #ccc;
+      border: 2px solid #555; border-radius: 16px; cursor: pointer;
+      font-size: 12px; white-space: nowrap;
+    }
+    .font-chip:hover { background: #34344a; }
+    .font-chip.active { border-color: #28a745; color: #fff; }
+    .font-loading { font-size: 11px; color: #888; padding: 4px 0; }
+    .font-loading.error { color: #ff4d4d; }
   </style>
 </head>
 <body>
   <h2>Advanced Manga Translator Settings</h2>
-  
+
   <div class="card">
     <h3>API Server</h3>
     <label for="optServerUrl">FastAPI Server URL:</label>
@@ -32,15 +56,46 @@
   </div>
 
   <div class="card">
-    <h3>OCR Model (Japanese/Korean)</h3>
-    <div class="row">
-      <select id="ocrSelect">
-        <option value="ja">Japanese (Hayai+YOLO)</option>
-        <option value="ko">Korean (PaddleOCR)</option>
-      </select>
-      <button id="setOcrBtn">Switch OCR Model</button>
+    <h3>Translation Model</h3>
+    <select id="optModelType">
+      <option value="local">Local (GGUF)</option>
+      <option value="openrouter">OpenRouter</option>
+    </select>
+    <div id="optOpenrouterRow" class="subbox" style="display:none;">
+      <label for="optOpenrouterModel">OpenRouter Model:</label>
+      <input type="text" id="optOpenrouterModel" placeholder="e.g. openai/gpt-4o-mini">
+      <label for="optOpenrouterKey">OpenRouter API Key:</label>
+      <input type="text" id="optOpenrouterKey" placeholder="sk-or-...">
+      <button id="optSetModelBtn" class="secondary">Set Model</button>
+      <div id="optModelTypeStatus" class="status"></div>
     </div>
-    <div id="ocrStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <h3>Font Family</h3>
+    <div id="optFontFamilyScroll" class="font-scroll">
+      <div class="font-loading">Loading fonts…</div>
+    </div>
+    <div id="optFontFamilyStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <h3>Font Boldness</h3>
+    <div id="optFontWeightPicker" style="display:flex; gap:8px; margin-bottom: 6px;">
+      <div style="font-size:11px; color:#888;">Loading preview…</div>
+    </div>
+    <input type="hidden" id="optFontWeightHidden" value="2">
+    <div id="optFontStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <h3>Inpainting Mode</h3>
+    <select id="optInpaintMode">
+      <option value="low">Low (faster, default)</option>
+      <option value="high">High (better quality, bigger model)</option>
+    </select>
+    <div class="hint">High mode uses dreMaz/AnimeMangaInpainting's larger LaMa checkpoint. It downloads on the server the first time you switch to it.</div>
+    <div id="optInpaintStatus" class="status"></div>
   </div>
 
   <div class="card">
@@ -61,15 +116,15 @@
         <tr><td colspan="4" style="text-align:center;">Click "Refresh List" to load models...</td></tr>
       </tbody>
     </table>
-    
-    <hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;">
-    
+
+    <hr>
+
     <h3>Install Custom Model</h3>
     <label>Repo ID (e.g. hugging-quants/Llama-3.2-1B-Instruct-GGUF):</label>
     <input type="text" id="customRepo" placeholder="repo_id">
     <label>Filename (leave blank to auto-find):</label>
     <input type="text" id="customFile" placeholder="filename.gguf">
-    <button id="installModelBtn" class="success">Download & Switch</button>
+    <button id="installModelBtn" class="success">Download &amp; Switch</button>
     <div id="modelStatus" class="status"></div>
   </div>
 
