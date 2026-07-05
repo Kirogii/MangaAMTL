@@ -4,7 +4,8 @@
        /v1/translate /v1/translate/{id} /v1/translate/{id}/image
        /v1/changemodel /v1/listmodels /v1/colorize
        /v1/ai/resolve /v1/ai/prompt/default
-       /SetFont /GetFont /SetModelType /GetModelType /SetOpenRouterModel
+       /SetFont /GetFont /GetFonts /SetModelType /GetModelType /SetOpenRouterModel
+       /SetInpaintMode /GetInpaintMode
 - Logs: /console endpoint to view all backend logs and errors
 """
 
@@ -33,7 +34,7 @@ from pydantic import BaseModel, Field
 
 # --- FastAPI ---------------------------------------------------------------
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Request, Form
-from fastapi.responses import JSONResponse, Response, HTMLResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, Response, HTMLResponse, PlainTextResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- GPU / Device helpers --------------------------------------------------
@@ -160,6 +161,10 @@ INPAINT_FEATHER_PX = 3
 INPAINT_USE_MULTI_PASS = True
 INPAINT_COLOR_MATCH = True
 
+# --- Inpainting Model Config (Low/High) -----------------------------------
+LAMA_LARGE_URL = "https://huggingface.co/dreMaz/AnimeMangaInpainting/resolve/main/lama_large_512px.ckpt"
+LAMA_LARGE_PATH = MODEL_DIR / "lama_large_512px.ckpt"
+
 FONT_DIR = ROOT_DIR / "fonts"
 FONT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -229,7 +234,8 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-_simple_lama_model = None
+_simple_lama_model = None       # low mode (default SimpleLama / big-lama.pt)
+_simple_lama_high_model = None  # high mode (lama_large_512px.ckpt)
 _global_yolo       = None
 _global_qwen       = None
 _hayai_ocr_model   = None
@@ -260,6 +266,10 @@ _llm_lock = threading.Lock()
 _inpaint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inpaint")
 _inpaint_lock = threading.Lock()
 
+# --- Inpainting Mode Globals ---
+_inpaint_mode = "low"  # "low" or "high"
+_inpaint_mode_lock = threading.Lock()
+
 # --- Font Configuration Globals ---
 _current_font_path: pathlib.Path = FONT_PATH
 _current_stroke_width: int = 0
@@ -288,6 +298,20 @@ def ensure_yolo():
     if not YOLO_MODEL_PATH.exists():
         download_if_missing(YOLO_HF_RAW, YOLO_MODEL_PATH)
     return YOLO_MODEL_PATH
+
+def ensure_lama_large():
+    """Download lama_large_512px.ckpt if missing."""
+    if not LAMA_LARGE_PATH.exists() or LAMA_LARGE_PATH.stat().st_size < 10000:
+        logging.info(f"[Lama High] Downloading high-quality inpainting model...")
+        try:
+            from huggingface_hub import hf_hub_download
+            p = hf_hub_download(repo_id="dreMaz/AnimeMangaInpainting", filename="lama_large_512px.ckpt")
+            shutil.copy(str(p), str(LAMA_LARGE_PATH))
+            logging.info(f"[Lama High] Downloaded to {LAMA_LARGE_PATH}")
+        except ImportError:
+            download_if_missing(LAMA_LARGE_URL, LAMA_LARGE_PATH)
+            logging.info(f"[Lama High] Downloaded to {LAMA_LARGE_PATH}")
+    return LAMA_LARGE_PATH
 
 # ===========================================================================
 # Image utils
@@ -1099,13 +1123,65 @@ async def translate_with_current_backend_async(text: str, target_lang: str = "en
         return await loop.run_in_executor(_llm_executor, qwen_translate, text, target_lang)
 
 # ===========================================================================
-# Inpainting (SimpleLama + cv2 fallback)
+# Inpainting (SimpleLama + cv2 fallback) — with Low/High mode support
 # ===========================================================================
-def load_lama():
+
+def _load_lama_model_from_file(path: pathlib.Path, device: str):
+    """Load a LaMa model from a file. Tries TorchScript (JIT) first,
+    then falls back to state_dict loading via lama_cleaner if available.
+    """
+    # --- Attempt 1: TorchScript (JIT) ---
+    try:
+        model = torch.jit.load(str(path), map_location=device)
+        model.eval()
+        logging.info(f"[Lama] Loaded as TorchScript: {path}")
+        return model
+    except Exception as e:
+        logging.warning(f"[Lama] Not TorchScript ({e}), trying as state_dict checkpoint...")
+
+    # --- Attempt 2: state_dict via lama_cleaner ---
+    try:
+        try:
+            ckpt = torch.load(str(path), map_location='cpu', weights_only=False)
+        except TypeError:
+            # Older PyTorch without weights_only param
+            ckpt = torch.load(str(path), map_location='cpu')
+
+        if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+            state_dict = ckpt['state_dict']
+        else:
+            state_dict = ckpt
+
+        try:
+            from lama_cleaner.model.lama import LaMa
+            model = LaMa()
+            # Strip 'model.' prefix if present
+            cleaned = {}
+            for k, v in state_dict.items():
+                nk = k.replace('model.', '') if k.startswith('model.') else k
+                cleaned[nk] = v
+            model.load_state_dict(cleaned, strict=False)
+            model = model.to(device)
+            model.eval()
+            logging.info(f"[Lama] Loaded as state_dict via lama_cleaner: {path}")
+            return model
+        except ImportError:
+            raise RuntimeError(
+                f"{path} is a checkpoint (not JIT). "
+                "Install lama-cleaner to load it: pip install lama-cleaner"
+            )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Failed to load {path}: {e}")
+
+
+def load_lama_low():
+    """Load the default SimpleLama model (low quality, big-lama.pt packaged)."""
     global _simple_lama_model
     if _simple_lama_model is None and SimpleLama is not None:
         device = get_torch_device()
-        logging.info(f"[SimpleLama] Loading on device: {device}")
+        logging.info(f"[SimpleLama] Loading (low/default) on device: {device}")
         _simple_lama_model = SimpleLama()
         if device == "cuda":
             try:
@@ -1119,7 +1195,121 @@ def load_lama():
                 logging.warning(f"[SimpleLama] Failed moving to CUDA: {e}")
     return _simple_lama_model
 
-def _lama_inpaint_sync(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+
+class HighQualityLama:
+    """Custom wrapper for lama_large_512px.ckpt. 
+    Uses a patch-based inference approach to prevent blurring on large images."""
+    def __init__(self):
+        self.device = get_torch_device()
+        self.model = _load_lama_model_from_file(LAMA_LARGE_PATH, self.device)
+        self.model.eval()
+        try:
+            self.model.to(self.device)
+        except Exception:
+            pass
+
+    def __call__(self, pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
+        w, h = pil_img.size
+        img = np.array(pil_img.convert("RGB"))
+        mask = np.array(pil_mask.convert("L"))
+        
+        # Pad image to multiple of 8 to avoid LaMa dimension errors
+        pad_w = (8 - w % 8) % 8
+        pad_h = (8 - h % 8) % 8
+        if pad_h > 0 or pad_w > 0:
+            img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
+            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode='reflect')
+            
+        H, W = img.shape[:2]
+        
+        out_float = img.astype(np.float32)
+        weight = np.zeros((H, W), dtype=np.float32)
+        
+        patch_size = 512
+        stride = 256  # 50% overlap to prevent seam lines
+        
+        # Create a 2D Gaussian weight map for seamless blending
+        gauss = cv2.getGaussianKernel(patch_size, patch_size//4)
+        gauss_2d = (gauss @ gauss.T).astype(np.float32)
+        gauss_2d /= gauss_2d.max()
+        
+        # Generate patch coordinates
+        ys = list(range(0, max(1, H - patch_size + 1), stride))
+        if H > patch_size and (H - patch_size) % stride != 0:
+            ys.append(H - patch_size)
+        elif H <= patch_size:
+            ys = [0]
+            
+        xs = list(range(0, max(1, W - patch_size + 1), stride))
+        if W > patch_size and (W - patch_size) % stride != 0:
+            xs.append(W - patch_size)
+        elif W <= patch_size:
+            xs = [0]
+            
+        for y in ys:
+            for x in xs:
+                y1, y2 = y, y + patch_size
+                x1, x2 = x, x + patch_size
+                
+                # Extract patch and pad if at the edge
+                patch_img = img[y1:y2, x1:x2]
+                patch_mask = mask[y1:y2, x1:x2]
+                
+                ph, pw = patch_img.shape[:2]
+                if ph < patch_size or pw < patch_size:
+                    patch_img = np.pad(patch_img, ((0, patch_size - ph), (0, patch_size - pw), (0, 0)), mode='reflect')
+                    patch_mask = np.pad(patch_mask, ((0, patch_size - ph), (0, patch_size - pw)), mode='reflect')
+                
+                # Optimization: Skip patches that have no text to inpaint
+                if patch_mask.sum() == 0:
+                    continue
+                    
+                img_t = torch.from_numpy(patch_img).float().permute(2,0,1).unsqueeze(0).to(self.device) / 255.0
+                mask_t = torch.from_numpy(patch_mask).float().unsqueeze(0).unsqueeze(0).to(self.device) / 255.0
+                mask_t = (mask_t > 0.5).float()  # Strict binary mask
+                
+                with torch.no_grad():
+                    out_patch = self.model(img_t, mask_t).clamp(0, 1)
+                    
+                out_patch_np = (out_patch[0].permute(1,2,0).cpu().numpy() * 255).astype(np.float32)
+                
+                # Crop back to actual patch size before blending
+                out_patch_np = out_patch_np[:ph, :pw]
+                g = gauss_2d[:ph, :pw]
+                
+                # Blend the patch using the Gaussian weight map
+                out_float[y1:y2, x1:x2] = out_float[y1:y2, x1:x2] * (1 - g[:,:,None]) + out_patch_np * g[:,:,None]
+                weight[y1:y2, x1:x2] += g
+                
+        # Normalize by weight and restore original dimensions
+        weight[weight == 0] = 1
+        out_img = (out_float / weight[:,:,None]).clip(0, 255).astype(np.uint8)
+        out_img = out_img[:h, :w, :]
+        return Image.fromarray(out_img)
+
+
+def load_lama_high():
+    """Load the high-quality LaMa model (lama_large_512px.ckpt from dreMaz)."""
+    global _simple_lama_high_model
+    if _simple_lama_high_model is None:
+        ensure_lama_large()
+        logging.info(f"[Lama High] Loading {LAMA_LARGE_PATH} on device: {get_torch_device()}")
+        _simple_lama_high_model = HighQualityLama()
+        logging.info(f"[Lama High] Successfully loaded high-quality model.")
+    return _simple_lama_high_model
+
+
+def load_lama():
+    """Load the appropriate LaMa model based on the current inpaint mode."""
+    with _inpaint_mode_lock:
+        mode = _inpaint_mode
+
+    if mode == "high":
+        return load_lama_high()
+    return load_lama_low()
+
+
+def lama_inpaint(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Thread-safe SimpleLama inpainting."""
     with _inpaint_lock:
         sl = load_lama()
@@ -1130,7 +1320,7 @@ def _lama_inpaint_sync(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         out_pil  = sl(pil_img, pil_mask)
         return cv2.cvtColor(np.array(out_pil), cv2.COLOR_RGB2BGR)
 
-def _cv2_inpaint_sync(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def cv2_inpaint_fallback(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Thread-safe cv2 inpainting."""
     with _inpaint_lock:
         return cv2.inpaint(img_bgr, mask, INPAINT_RADIUS_CV2, cv2.INPAINT_TELEA)
@@ -1143,125 +1333,106 @@ async def inpaint_image_async(img_bgr: np.ndarray, mask: np.ndarray, use_lama: b
     if use_lama and SimpleLama is not None:
         try:
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(_inpaint_executor, _lama_inpaint_sync, img_bgr, mask)
-            logging.info("[Inpaint] SimpleLama inpainting complete.")
+            result = await loop.run_in_executor(_inpaint_executor, lama_inpaint, img_bgr, mask)
+            with _inpaint_mode_lock:
+                mode = _inpaint_mode
+            logging.info(f"[Inpaint] SimpleLama inpainting complete (mode={mode}).")
             return result
         except Exception as e:
             logging.warning(f"[Inpaint] SimpleLama failed ({e}), falling back to cv2.inpaint")
     
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(_inpaint_executor, _cv2_inpaint_sync, img_bgr, mask)
+    result = await loop.run_in_executor(_inpaint_executor, cv2_inpaint_fallback, img_bgr, mask)
     logging.info("[Inpaint] cv2.inpaint fallback complete.")
     return result
 
 def build_inpaint_mask(img_shape: Tuple[int, int, int],
                        bboxes: List[Tuple[int, int, int, int]],
-                       padding: int = 6,
-                       dilate_kernel: int = 7,
-                       feather_pixels: int = 3,
-                       adaptive_dilate: bool = True) -> np.ndarray:
-    """Build a high-quality binary mask from bounding boxes with padding, 
-    adaptive dilation, and feathered edges for smoother inpainting.
+                       padding: int = 2,
+                       dilate_kernel: int = 3) -> np.ndarray:
+    """Build a strict binary mask tailored tightly to the text bounding boxes.
     
-    Args:
-        img_shape: (H, W, C) of the image
-        bboxes: list of (x1, y1, x2, y2) tuples
-        padding: pixels to expand each box
-        dilate_kernel: kernel size for morphological dilation
-        feather_pixels: pixels to feather the mask edges (gradient)
-        adaptive_dilate: if True, scale dilation based on box size
-    
-    Returns:
-        uint8 mask, 255 = inpaint region, 0 = keep
+    Prevents the mask from expanding too far and erasing speech bubble borders.
     """
     h, w = img_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     
     for x1, y1, x2, y2 in bboxes:
-        box_w = x2 - x1
-        box_h = y2 - y1
-        box_size = max(box_w, box_h)
-        
-        # Adaptive padding based on text box size
-        adaptive_pad = padding + max(0, (box_size - 50) // 20)
-        
-        # Apply padding, clamped to image bounds
-        px1 = max(0, x1 - adaptive_pad)
-        py1 = max(0, y1 - adaptive_pad)
-        px2 = min(w, x2 + adaptive_pad)
-        py2 = min(h, y2 + adaptive_pad)
+        px1 = max(0, x1 - padding)
+        py1 = max(0, y1 - padding)
+        px2 = min(w, x2 + padding)
+        py2 = min(h, y2 + padding)
         mask[py1:py2, px1:px2] = 255
-    
-    # Multi-pass dilation with different kernels for better coverage
+        
     if dilate_kernel > 0:
-        # First pass: small kernel to catch edge details
-        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.dilate(mask, kernel_small, iterations=1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel, dilate_kernel))
+        mask = cv2.dilate(mask, kernel, iterations=1)
         
-        # Second pass: larger kernel for broader coverage
-        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel, dilate_kernel))
-        mask = cv2.dilate(mask, kernel_large, iterations=1)
-        
-        # Optional third pass for larger text areas
-        if adaptive_dilate:
-            kernel_xl = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel + 2, dilate_kernel + 2))
-            mask = cv2.dilate(mask, kernel_xl, iterations=1)
-    
-    # Feather edges using Gaussian blur for smoother transitions
-    if feather_pixels > 0:
-        # Convert to float for smooth gradient
-        mask_float = mask.astype(np.float32) / 255.0
-        # Apply Gaussian blur to create gradient at edges
-        blurred = cv2.GaussianBlur(mask_float, (feather_pixels * 2 + 1, feather_pixels * 2 + 1), 0)
-        # Threshold back to binary but with anti-aliased edges
-        mask = (blurred * 255).astype(np.uint8)
-        # Re-threshold to keep it mostly binary but with smoother edges
-        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-    
-    # Close small holes in the mask
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-    
     return mask
 
 # ===========================================================================
-# Text color detection
+# Text color detection (per box)
 # ===========================================================================
 def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
                               ) -> Tuple[Tuple[int,int,int], Tuple[int,int,int]]:
-    x1, y1, x2, y2 = bbox
-    region = img_bgr[max(0, y1):y2, max(0, x1):x2]
+    x1,y1,x2,y2 = bbox
+    region = img_bgr[max(0,y1):y2, max(0,x1):x2]
     if region.size == 0:
-        return (0, 0, 0), (255, 255, 255)
-    h_r, w_r = region.shape[:2]
-    if h_r > 80 or w_r > 80:
-        scale = 80.0 / max(h_r, w_r)
-        region = cv2.resize(region, (max(1, int(w_r * scale)), max(1, int(h_r * scale))),
-                            interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    bg_val = int(np.median(gray))
-    diff = np.abs(gray.astype(np.int16) - bg_val)
-    ink_mask = diff > 60
-    flat = region.reshape(-1, 3).astype(np.float32)
-    ink_flat = ink_mask.reshape(-1)
-    if ink_flat.sum() >= 4:
-        ink_bgr = flat[ink_flat].mean(axis=0)
-        bg_bgr  = flat[~ink_flat].mean(axis=0)
+        return (0,0,0), (255,255,255)
+
+    # Downsample for speed
+    if region.shape[0] > 120 or region.shape[1] > 120:
+        region = cv2.resize(region, (120, 120), interpolation=cv2.INTER_AREA)
+
+    pixels = region.reshape(-1, 3).astype(np.float32)
+    if len(pixels) < 8:
+        return (0,0,0), (255,255,255)
+
+    # --- Background = most common quantized color (mode, robust to thin text) ---
+    quant = (pixels / 32).astype(np.int32)
+    keys = quant[:,0] * 64 + quant[:,1] * 8 + quant[:,2]
+    uniq, counts = np.unique(keys, return_counts=True)
+    bg_key = int(uniq[int(np.argmax(counts))])
+    bg_bgr = np.array([bg_key // 64, (bg_key // 8) % 8, bg_key % 8], dtype=np.float32) * 32 + 16
+
+    # --- Text pixels = those far from background ---
+    dists = np.linalg.norm(pixels - bg_bgr, axis=1)
+    thresh = max(60.0, float(np.percentile(dists, 75)))
+    text_mask = dists > thresh
+
+    if int(text_mask.sum()) < 5:
+        # No clear text — pick ink by luminance contrast
+        bg_lum = float(bg_bgr.mean())
+        ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
     else:
-        bg_bgr = flat.mean(axis=0)
-        ink_bgr = np.array([0, 0, 0] if bg_val > 127 else [255, 255, 255], dtype=np.float32)
-    def snap(c):
+        text_pixels = pixels[text_mask]
+        text_dists = np.linalg.norm(text_pixels - bg_bgr, axis=1)
+        # Take the most extreme 30% — these are the true ink, not anti-aliasing
+        ext_t = float(np.percentile(text_dists, 70))
+        ext_mask = text_dists >= ext_t
+        if int(ext_mask.sum()) >= 3:
+            ink_bgr = np.median(text_pixels[ext_mask], axis=0)
+        else:
+            ink_bgr = np.median(text_pixels, axis=0)
+
+    # --- Snap near-pure colors to pure black/white ---
+    def snap(c: np.ndarray) -> np.ndarray:
         c = np.asarray(c, dtype=np.float32)
-        if np.all(c < 40):  return np.array([0, 0, 0], dtype=np.float32)
-        if np.all(c > 215): return np.array([255, 255, 255], dtype=np.float32)
+        if np.all(c < 40):  return np.array([0,0,0], dtype=np.float32)
+        if np.all(c > 215): return np.array([255,255,255], dtype=np.float32)
         return c
-    bg_bgr, ink_bgr = snap(bg_bgr), snap(ink_bgr)
-    bg_lum  = 0.299 * bg_bgr[2]  + 0.587 * bg_bgr[1]  + 0.114 * bg_bgr[0]
-    ink_lum = 0.299 * ink_bgr[2] + 0.587 * ink_bgr[1] + 0.114 * ink_bgr[0]
-    if abs(bg_lum - ink_lum) < 60:
-        ink_bgr = np.array([0, 0, 0] if bg_lum > 127 else [255, 255, 255], dtype=np.float32)
-    return (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0])), \
-           (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
+
+    ink_bgr = snap(ink_bgr)
+    bg_bgr  = snap(bg_bgr)
+
+    # --- Guarantee contrast between ink and outline ---
+    if float(np.linalg.norm(ink_bgr - bg_bgr)) < 80:
+        bg_lum = float(bg_bgr.mean())
+        ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
+
+    text_rgb    = (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0]))
+    outline_rgb = (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
+    return text_rgb, outline_rgb
 
 # ===========================================================================
 # Text wrapping & auto-fit
@@ -1467,19 +1638,39 @@ def draw_text_with_config(draw: ImageDraw.ImageDraw,
         draw.text(position, text, font=font, fill=fill, anchor=anchor)
 
 # ===========================================================================
-# SetFont Endpoint
+# Font Management Endpoints (Set, Get, GetFonts)
 # ===========================================================================
+def list_available_fonts() -> List[Dict[str, Any]]:
+    fonts = []
+    if FONT_DIR.exists():
+        for ext in ('*.ttf', '*.otf', '*.ttc'):
+            for f in sorted(FONT_DIR.glob(ext)):
+                try:
+                    size_kb = f.stat().st_size / 1024
+                except OSError:
+                    size_kb = 0
+                fonts.append({
+                    "name": f.stem,
+                    "filename": f.name,
+                    "path": str(f),
+                    "size_kb": round(size_kb, 1)
+                })
+    return fonts
+
 class SetFontRequest(BaseModel):
     font_path: Optional[str] = None
     font_url: Optional[str] = None
+    font_name: Optional[str] = None
     stroke_width: int = 0
 
 @app.post("/SetFont")
 async def set_font(req: SetFontRequest):
     global _current_font_path, _current_stroke_width
     with _font_config_lock:
-        if req.font_url and req.font_path:
-            raise HTTPException(400, "Provide either font_path or font_url, not both")
+        provided_params = sum(1 for p in [req.font_path, req.font_url, req.font_name] if p)
+        if provided_params > 1:
+            raise HTTPException(400, "Provide either font_path, font_url, or font_name, not multiple")
+        
         if req.font_url:
             filename = pathlib.Path(req.font_url).name
             if not filename.lower().endswith(('.ttf', '.otf', '.ttc')):
@@ -1502,6 +1693,30 @@ async def set_font(req: SetFontRequest):
             _current_font_path = p
             clear_font_cache()
             logging.info(f"[Font] Set to: {_current_font_path}")
+        elif req.font_name:
+            req_font_name = req.font_name.strip().lower()
+            available_fonts = list_available_fonts()
+            
+            matched_font = None
+            for f in available_fonts:
+                if f["filename"].lower() == req_font_name or f["name"].lower() == req_font_name:
+                    matched_font = f
+                    break
+            
+            if not matched_font:
+                # Try partial match on filename
+                for f in available_fonts:
+                    if f["filename"].lower().startswith(req_font_name):
+                        matched_font = f
+                        break
+
+            if not matched_font:
+                raise HTTPException(404, f"Font '{req.font_name}' not found in fonts folder. Available: {[f['name'] for f in available_fonts]}")
+            
+            _current_font_path = pathlib.Path(matched_font["path"])
+            clear_font_cache()
+            logging.info(f"[Font] Set to by name: {_current_font_path}")
+            
         _current_stroke_width = max(0, min(20, req.stroke_width))
         logging.info(f"[Font] Stroke width set to: {_current_stroke_width}")
     return {"status": "ok", "font_path": str(_current_font_path), "stroke_width": _current_stroke_width}
@@ -1510,6 +1725,78 @@ async def set_font(req: SetFontRequest):
 async def get_font_config():
     with _font_config_lock:
         return {"font_path": str(_current_font_path), "stroke_width": _current_stroke_width}
+
+@app.get("/GetFonts")
+async def get_fonts():
+    fonts = list_available_fonts()
+    return {"fonts": fonts, "count": len(fonts)}
+
+@app.get("/v1/font")
+async def get_font_file():
+    """Serve the currently active font file bytes so clients (e.g. the browser
+    extension) can render accurate font previews without needing the file
+    installed locally."""
+    with _font_config_lock:
+        path = pathlib.Path(_current_font_path)
+
+    if not path.exists():
+        raise HTTPException(404, "Font file not found on server")
+
+    suffix = path.suffix.lower()
+    media_type = {
+        ".ttf": "font/ttf",
+        ".otf": "font/otf",
+        ".ttc": "font/collection",
+    }.get(suffix, "application/octet-stream")
+
+    return FileResponse(str(path), media_type=media_type, filename=path.name)
+
+
+# ===========================================================================
+# SetInpaintMode Endpoint (Low/High inpainting model switching)
+# ===========================================================================
+class SetInpaintModeRequest(BaseModel):
+    mode: str  # "low" or "high"
+
+@app.post("/SetInpaintMode")
+async def set_inpaint_mode(req: SetInpaintModeRequest):
+    global _inpaint_mode
+    mode = req.mode.lower().strip()
+    if mode not in ("low", "high"):
+        raise HTTPException(400, "mode must be 'low' or 'high'")
+
+    if mode == "high":
+        # Auto-download the high-quality model if not present
+        try:
+            ensure_lama_large()
+        except Exception as e:
+            raise HTTPException(500, f"Failed to download high-quality inpainting model: {e}")
+
+    with _inpaint_mode_lock:
+        _inpaint_mode = mode
+
+    logging.info(f"[Inpaint] Mode set to: {mode}")
+
+    return {
+        "status": "ok",
+        "inpaint_mode": _inpaint_mode,
+        "high_model_path": str(LAMA_LARGE_PATH),
+        "high_model_downloaded": LAMA_LARGE_PATH.exists() if LAMA_LARGE_PATH.exists() else False,
+        "high_model_size_mb": round(LAMA_LARGE_PATH.stat().st_size / (1024 * 1024), 1) if LAMA_LARGE_PATH.exists() else 0,
+    }
+
+@app.get("/GetInpaintMode")
+async def get_inpaint_mode():
+    with _inpaint_mode_lock:
+        mode = _inpaint_mode
+    return {
+        "inpaint_mode": mode,
+        "high_model_path": str(LAMA_LARGE_PATH),
+        "high_model_downloaded": LAMA_LARGE_PATH.exists(),
+        "high_model_size_mb": round(LAMA_LARGE_PATH.stat().st_size / (1024 * 1024), 1) if LAMA_LARGE_PATH.exists() else 0,
+        "low_model": "big-lama.pt (SimpleLama default)",
+        "high_model": "lama_large_512px.ckpt (dreMaz/AnimeMangaInpainting)",
+    }
 
 # ===========================================================================
 # SetModelType Endpoint
@@ -1592,6 +1879,8 @@ async def version():
 
 @app.get("/meta")
 async def meta():
+    with _inpaint_mode_lock:
+        inpaint_mode = _inpaint_mode
     return {
         "version": BUILD_ID,
         "cuda": has_cuda(),
@@ -1603,6 +1892,9 @@ async def meta():
         "openrouter_model": _openrouter_model if _current_model_type == "openrouter" else None,
         "local_model": f"{_current_qwen_repo_id}/{_current_qwen_filename}" if _current_model_type == "local" else None,
         "inpaint_lama_available": SimpleLama is not None,
+        "inpaint_mode": inpaint_mode,
+        "inpaint_high_model_downloaded": LAMA_LARGE_PATH.exists(),
+        "inpaint_high_model_path": str(LAMA_LARGE_PATH),
     }
 
 @app.post("/warmup")
@@ -1623,8 +1915,14 @@ async def warmup():
         errors.append(f"Qwen: {e}")
     try:
         if SimpleLama is not None:
-            load_lama()
-            logging.info("[Warmup] SimpleLama loaded for inpainting.")
+            with _inpaint_mode_lock:
+                mode = _inpaint_mode
+            if mode == "high":
+                load_lama_high()
+                logging.info("[Warmup] SimpleLama (high) loaded for inpainting.")
+            else:
+                load_lama_low()
+                logging.info("[Warmup] SimpleLama (low) loaded for inpainting.")
         else:
             logging.info("[Warmup] SimpleLama not installed; cv2.inpaint will be used as fallback.")
     except Exception as e:
@@ -1962,11 +2260,12 @@ async def get_translated_image(job_id: str):
     # --- Step 1: Inpainting (erase original text) ---
     if do_inpaint and boxes_to_inpaint:
         logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions...")
+        # Use a very tight, safe mask to prevent erasing bubble borders
         mask = build_inpaint_mask(
             img_bgr.shape,
             boxes_to_inpaint,
-            padding=4,
-            dilate_kernel=5,
+            padding=2,
+            dilate_kernel=3,
         )
 
         # Use lama if available, otherwise cv2 fallback
