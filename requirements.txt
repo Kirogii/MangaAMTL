@@ -1,5 +1,6 @@
 llama-cpp-python
 
+aiohttp
 fastapi
 pydantic
 pillow
