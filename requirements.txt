@@ -1,5 +1,8 @@
 llama-cpp-python
 
+lama-cleaner
+rich
+betterproto
 aiohttp
 fastapi
 pydantic
