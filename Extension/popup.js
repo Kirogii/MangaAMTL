@@ -1,16 +1,7 @@
 // ============================================================================
 // FONT PREVIEW HELPERS
-// Fetches the server's actual active font and renders live canvas swatches
-// showing the halo/stroke effect used by the backend at each boldness level.
-//
-// Font bytes are cached per (serverUrl, filename) pair in memory so switching
-// back and forth between fonts you've already viewed this session doesn't
-// re-fetch them from the server. The backend only exposes the *currently
-// active* font's bytes via /v1/font, so a font's bytes only get cached the
-// first time it becomes active (either on load, or after you pick it in the
-// Font Family list).
 // ============================================================================
-const _mtFontByteCache = new Map(); // key: `${serverUrl}::${filename}` -> FontFace
+const _mtFontByteCache = new Map();
 
 function _mtFontFilenameFromPath(fontPath) {
   return (fontPath || '').split(/[\\/]/).pop();
@@ -119,8 +110,6 @@ async function initFontWeightPicker() {
 
 // ============================================================================
 // FONT FAMILY PICKER
-// Horizontally-scrolling, scrollbar-less chip list populated from /GetFonts.
-// Mouse wheel scrolls it sideways without needing to hold Shift.
 // ============================================================================
 function attachWheelHorizontalScroll(container) {
   if (container.dataset.wheelBound === '1') return;
@@ -201,7 +190,6 @@ async function selectFontFamily(serverUrl, filename, container) {
       c.classList.toggle('active', c.dataset.filename === filename);
     });
 
-    // Re-render the boldness swatches using the newly active font's real glyphs
     await initFontWeightPicker();
   } catch (e) {
     statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
@@ -209,9 +197,7 @@ async function selectFontFamily(serverUrl, filename, container) {
 }
 
 // ============================================================================
-// INPAINTING MODE HELPERS
-// Syncs the Low/High dropdown with the server's actual current mode and
-// pushes changes immediately when the user picks a different mode.
+// INPAINTING & OCR MODE HELPERS
 // ============================================================================
 async function syncInpaintModeFromServer(serverUrl) {
   const statusEl = document.getElementById('inpaintModeStatus');
@@ -259,17 +245,55 @@ async function pushInpaintMode(serverUrl, mode) {
   }
 }
 
+async function syncOcrModeFromServer(serverUrl) {
+  const statusEl = document.getElementById('ocrModeStatus');
+  if (!serverUrl) return;
+  try {
+    const res = await fetch(`${serverUrl}/GetOcrMode`);
+    const data = await res.json();
+    document.getElementById('ocrMode').value = data.ocr_mode || 'hayai';
+    chrome.storage.local.set({ ocrMode: data.ocr_mode || 'hayai' });
+    statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+  } catch (e) {
+    console.warn('[MangaTranslator] Could not fetch OCR mode from server:', e);
+  }
+}
+
+async function pushOcrMode(serverUrl, mode) {
+  const statusEl = document.getElementById('ocrModeStatus');
+  if (!serverUrl) {
+    statusEl.innerHTML = `<span style="color:#ff4d4d;">Set a Server URL first</span>`;
+    return;
+  }
+  statusEl.innerText = 'Switching...';
+  try {
+    const res = await fetch(`${serverUrl}/SetOcrMode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+      chrome.storage.local.set({ ocrMode: data.ocr_mode });
+    } else {
+      statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
+    }
+  } catch (e) {
+    statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
-  // Load all settings including fontWeight, modelType, and inpaintMode
   chrome.storage.local.get(
-    ['serverUrl', 'ocrModel', 'colorize', 'targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'inpaintMode'],
+    ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'inpaintMode', 'ocrMode'],
     (data) => {
       document.getElementById('serverUrl').value = data.serverUrl || 'http://localhost:7860';
-      const radio = document.querySelector(`input[name="ocrModel"][value="${data.ocrModel || 'ja'}"]`);
-      if (radio) radio.checked = true;
+      document.getElementById('ocrLang').value = data.ocrLang || 'ja';
       document.getElementById('colorize').checked = data.colorize !== false;
       document.getElementById('targetLang').value = data.targetLang || 'en';
       document.getElementById('inpaintMode').value = data.inpaintMode || 'low';
+      document.getElementById('ocrMode').value = data.ocrMode || 'hayai';
 
       const modelType = data.modelType || 'local';
       document.getElementById('modelType').value = modelType;
@@ -278,8 +302,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         document.getElementById('openrouterModel').value = data.openrouterModel;
       }
 
-      // Sync inpaint mode dropdown with the server's actual current state
       syncInpaintModeFromServer(data.serverUrl);
+      syncOcrModeFromServer(data.serverUrl);
     }
   );
 
@@ -295,23 +319,27 @@ document.getElementById('serverUrl').addEventListener('change', (e) => {
   initFontFamilyPicker(url);
   initFontWeightPicker();
   syncInpaintModeFromServer(url);
+  syncOcrModeFromServer(url);
 });
 
-// Toggle OpenRouter fields when model type changes
 document.getElementById('modelType').addEventListener('change', (e) => {
   const isOpenRouter = e.target.value === 'openrouter';
   document.getElementById('openrouterBox').style.display = isOpenRouter ? 'block' : 'none';
   chrome.storage.local.set({ modelType: e.target.value });
 });
 
-// Push inpainting mode to the server immediately when changed
 document.getElementById('inpaintMode').addEventListener('change', (e) => {
   const serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
   chrome.storage.local.set({ inpaintMode: e.target.value });
   pushInpaintMode(serverUrl, e.target.value);
 });
 
-// Set OpenRouter model / api key on the server
+document.getElementById('ocrMode').addEventListener('change', (e) => {
+  const serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+  chrome.storage.local.set({ ocrMode: e.target.value });
+  pushOcrMode(serverUrl, e.target.value);
+});
+
 document.getElementById('setModelBtn').addEventListener('click', async () => {
   const serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
   const model = document.getElementById('openrouterModel').value.trim();
@@ -351,7 +379,8 @@ document.getElementById('setModelBtn').addEventListener('click', async () => {
 
 document.getElementById('saveBtn').addEventListener('click', async () => {
   const url = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
-  const ocrModel = document.querySelector('input[name="ocrModel"]:checked').value;
+  const ocrMode = document.getElementById('ocrMode').value;
+  const ocrLang = document.getElementById('ocrLang').value;
   const colorize = document.getElementById('colorize').checked;
   const targetLang = document.getElementById('targetLang').value;
   const fontWeight = document.getElementById('fontWeightHidden').value;
@@ -360,7 +389,8 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
 
   chrome.storage.local.set({
     serverUrl: url,
-    ocrModel: ocrModel,
+    ocrMode: ocrMode,
+    ocrLang: ocrLang,
     colorize: colorize,
     targetLang: targetLang,
     fontWeight: fontWeight,
@@ -372,7 +402,6 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
     setTimeout(() => status.innerText = '', 2000);
   });
 
-  // Push font boldness to the server right away
   if (url) {
     try {
       await fetch(`${url}/SetFont`, {
@@ -384,10 +413,9 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
       console.warn('[MangaTranslator] Failed to push font weight to server:', e);
     }
 
-    // Keep inpainting mode in sync with the server too
     await pushInpaintMode(url, inpaintMode);
+    await pushOcrMode(url, ocrMode);
 
-    // If Local is selected, make sure the server switches back to local model
     if (modelType === 'local') {
       try {
         await fetch(`${url}/SetModelType`, {
@@ -403,11 +431,11 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
 });
 
 document.getElementById('translateBtn').addEventListener('click', () => {
-  chrome.storage.local.get(['ocrModel', 'targetLang'], (data) => {
+  chrome.storage.local.get(['ocrLang', 'targetLang'], (data) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       chrome.tabs.sendMessage(tabs[0].id, {
         action: "translateAllImages",
-        ocrModel: data.ocrModel || 'ja',
+        ocrLang: data.ocrLang || 'ja',
         targetLang: data.targetLang || 'en'
       });
       window.close();

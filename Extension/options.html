@@ -51,8 +51,19 @@
     <h3>API Server</h3>
     <label for="optServerUrl">FastAPI Server URL:</label>
     <input type="text" id="optServerUrl" placeholder="http://localhost:7860">
-    <button id="saveUrlBtn">Save URL</button>
-    <div id="urlStatus" class="status"></div>
+    <button id="mtSaveUrlBtn">Save URL</button>
+    <div id="mtUrlStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <h3>OCR Engine</h3>
+    <select id="optOcrMode">
+      <option value="hayai">Hayai (Local, Japanese)</option>
+      <option value="glm">GLM (Local, Korean)</option>
+      <option value="lens">Google Lens (Cloud, All)</option>
+    </select>
+    <div class="hint">Google Lens supports all languages and requires chrome-lens-py installed on the server.</div>
+    <div id="optOcrStatus" class="status"></div>
   </div>
 
   <div class="card">

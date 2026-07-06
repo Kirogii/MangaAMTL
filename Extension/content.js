@@ -4,9 +4,6 @@
 
   // ========================================================================
   // FONT PREVIEW HELPERS
-  // Fetches the server's actual active font (NotoCJK.ttc etc.) and renders
-  // live canvas swatches showing the halo/stroke effect used by the backend
-  // at each boldness level, instead of a plain text dropdown.
   // ========================================================================
   let _mtFontFace = null;
   let _mtFontFaceServerUrl = null;
@@ -29,8 +26,6 @@
     const w = canvas.width, h = canvas.height;
     const dpr = window.devicePixelRatio || 1;
 
-    // Mimic a manga text-bubble backdrop so the stroke/halo is visible,
-    // same relationship as text_color (dark ink) vs stroke_fill (bg color).
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = '#8a8a8a';
     ctx.fillRect(0, 0, w, h);
@@ -123,7 +118,7 @@
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "translateAllImages") {
-      startTranslationProcess(message.ocrModel, message.targetLang);
+      startTranslationProcess(message.ocrLang, message.targetLang);
     }
   });
 
@@ -164,12 +159,29 @@
       max-height: 85vh; overflow-y: auto;
     `;
     floatPopup.innerHTML = `
-      <div style="margin-bottom: 8px; font-weight: bold; color: #ffffff;">OCR Language</div>
-      <div style="margin-bottom: 14px; color: #ccc;">
-        <input type="radio" id="mtOcrJa" name="mtOcrModel" value="ja" checked>
-        <label for="mtOcrJa" style="font-size: 14px; cursor:pointer;">Japanese</label><br>
-        <input type="radio" id="mtOcrKo" name="mtOcrModel" value="ko" style="margin-top: 5px;">
-        <label for="mtOcrKo" style="font-size: 14px; cursor:pointer;">Korean</label>
+      <div style="margin-bottom: 14px;">
+        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">OCR Engine</div>
+        <select id="mtOcrModeSelect" style="
+          width: 100%; padding: 7px 8px; border-radius: 4px;
+          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
+          font-size: 13px; cursor: pointer; margin-bottom: 10px;
+        ">
+          <option value="hayai">Hayai (Local, Japanese)</option>
+          <option value="glm">GLM (Local, Korean)</option>
+          <option value="lens">Google Lens (Cloud, All)</option>
+        </select>
+        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">OCR Language</div>
+        <select id="mtOcrLangSelect" style="
+          width: 100%; padding: 7px 8px; border-radius: 4px;
+          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
+          font-size: 13px; cursor: pointer;
+        ">
+          <option value="ja">Japanese</option>
+          <option value="ko">Korean</option>
+          <option value="en">English</option>
+          <option value="zh">Chinese</option>
+          <option value="ru">Russian</option>
+        </select>
       </div>
 
       <div style="margin-bottom: 14px;">
@@ -237,7 +249,7 @@
     document.body.appendChild(floatPopup);
 
     // Restore saved settings into the dropdowns
-    chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel'], (data) => {
+    chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'ocrMode', 'ocrLang'], (data) => {
       const sel = document.getElementById('mtTargetLangSelect');
       if (sel && data.targetLang) sel.value = data.targetLang;
 
@@ -251,6 +263,10 @@
         const orModelInput = document.getElementById('mtOpenrouterModel');
         if (orModelInput) orModelInput.value = data.openrouterModel;
       }
+      const ocrModeSel = document.getElementById('mtOcrModeSelect');
+      if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
+      const ocrLangSel = document.getElementById('mtOcrLangSelect');
+      if (ocrLangSel) ocrLangSel.value = data.ocrLang || 'ja';
     });
 
     initFontWeightPicker();
@@ -293,9 +309,10 @@
       }
     };
 
-    // Translate All button — reads OCR model, target language, font weight, and model type
+    // Translate All button — reads OCR mode/lang, target language, font weight, and model type
     document.getElementById('mtStartBtn').onclick = async () => {
-      const selectedModel     = document.querySelector('input[name="mtOcrModel"]:checked').value;
+      const selectedOcrMode   = document.getElementById('mtOcrModeSelect').value;
+      const selectedOcrLang   = document.getElementById('mtOcrLangSelect').value;
       const selectedLang      = document.getElementById('mtTargetLangSelect').value;
       const selectedWeight    = document.getElementById('mtFontWeightHidden').value;
       const selectedModelType = document.getElementById('mtModelTypeSelect').value;
@@ -304,7 +321,9 @@
       chrome.storage.local.set({
         targetLang: selectedLang,
         fontWeight: selectedWeight,
-        modelType: selectedModelType
+        modelType: selectedModelType,
+        ocrMode: selectedOcrMode,
+        ocrLang: selectedOcrLang
       });
       floatPopup.style.display = 'none';
 
@@ -321,6 +340,17 @@
           console.warn('[MangaTranslator] Failed to push font weight to server:', e);
         }
 
+        // Push OCR Engine Mode to server
+        try {
+          await fetch(`${serverUrl}/SetOcrMode`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: selectedOcrMode })
+          });
+        } catch (e) {
+          console.warn('[MangaTranslator] Failed to push OCR mode to server:', e);
+        }
+
         // If Local is selected, ensure server is switched back to local model
         if (selectedModelType === 'local') {
           try {
@@ -335,7 +365,7 @@
         }
       }
 
-      startTranslationProcess(selectedModel, selectedLang);
+      startTranslationProcess(selectedOcrLang, selectedLang);
     };
 
     document.getElementById('mtSettingsBtn').onclick = () => {
@@ -349,7 +379,7 @@
       floatPopup.style.display = 'none';
     } else {
       // Re-sync dropdowns with storage every time popup opens
-      chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel'], (data) => {
+      chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'ocrMode', 'ocrLang'], (data) => {
         const sel = document.getElementById('mtTargetLangSelect');
         if (sel && data.targetLang) sel.value = data.targetLang;
 
@@ -363,6 +393,10 @@
           const orModelInput = document.getElementById('mtOpenrouterModel');
           if (orModelInput) orModelInput.value = data.openrouterModel;
         }
+        const ocrModeSel = document.getElementById('mtOcrModeSelect');
+        if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
+        const ocrLangSel = document.getElementById('mtOcrLangSelect');
+        if (ocrLangSel) ocrLangSel.value = data.ocrLang || 'ja';
       });
       refreshFontWeightSelection();
       floatPopup.style.display = 'block';
@@ -415,22 +449,6 @@
           Save URL
         </button>
         <div id="mtUrlStatus" style="margin-top: 10px; font-size: 14px; color: #28a745;"></div>
-      </div>
-
-      <div style="background: #2a2a3c; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333;">
-        <h3 style="margin-top: 0; color: #ffffff;">OCR Model (Japanese / Korean)</h3>
-        <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;">
-          <select id="mtOcrSelect"
-            style="padding: 8px; border: 1px solid #555; border-radius: 4px; background: #1e1e2e; color: #fff;">
-            <option value="ja">Japanese (Hayai+YOLO)</option>
-            <option value="ko">Korean (PaddleOCR)</option>
-          </select>
-          <button id="mtSetOcrBtn"
-            style="padding: 10px 15px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">
-            Switch OCR Model
-          </button>
-        </div>
-        <div id="mtOcrStatus" style="margin-top: 10px; font-size: 14px; color: #28a745;"></div>
       </div>
 
       <div style="background: #2a2a3c; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333;">
@@ -497,18 +515,6 @@
         status.innerText = 'URL Saved!';
         setTimeout(() => status.innerText = '', 2000);
       });
-    });
-
-    modal.querySelector('#mtSetOcrBtn').addEventListener('click', async () => {
-      const serverUrl = modal.querySelector('#mtOptServerUrl').value.trim().replace(/\/$/, '');
-      const model = modal.querySelector('#mtOcrSelect').value;
-      try {
-        const res  = await fetch(`${serverUrl}/setmodel?model=${model}`, { method: "POST" });
-        const data = await res.json();
-        modal.querySelector('#mtOcrStatus').innerText = `OCR model set to: ${data.current_model}`;
-      } catch (e) {
-        modal.querySelector('#mtOcrStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
-      }
     });
 
     modal.querySelector('#mtRefreshModelsBtn').addEventListener('click', async () => {
@@ -595,7 +601,7 @@
   // ========================================================================
   // MAIN TRANSLATION PROCESS
   // ========================================================================
-  async function startTranslationProcess(selectedOcrModel, selectedTargetLang) {
+  async function startTranslationProcess(selectedOcrLang, selectedTargetLang) {
     if (isTranslating) {
       console.warn("[MangaTranslator] Already translating, ignoring request.");
       return;
@@ -604,7 +610,7 @@
     floatPopup.style.display = 'none';
 
     // Load all settings from storage
-    const stored = await chrome.storage.local.get(['serverUrl', 'ocrModel', 'colorize', 'targetLang']);
+    const stored = await chrome.storage.local.get(['serverUrl', 'ocrLang', 'colorize', 'targetLang']);
 
     if (!stored.serverUrl) {
       alert("Please set your FastAPI Server URL in the extension popup or Advanced Settings!");
@@ -613,20 +619,11 @@
     }
 
     const serverUrl      = stored.serverUrl;
-    const targetOcr      = selectedOcrModel  || stored.ocrModel  || 'ja';
+    const targetOcr      = selectedOcrLang   || stored.ocrLang   || 'ja';
     const targetLanguage = selectedTargetLang || stored.targetLang || 'en';
-    const colorize       = stored.colorize !== false; // default true
+    const colorize       = stored.colorize !== false;
 
-    console.log(`[MangaTranslator] Starting — OCR: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize}, Server: ${serverUrl}`);
-
-    if (!['ja', 'ko'].includes(targetOcr)) {
-      alert(`Invalid OCR model: ${targetOcr}`);
-      isTranslating = false;
-      return;
-    }
-
-    // Note: OCR language is sent per-request as `ocr_lang` in the /v1/translate
-    // form submission, so no separate "switch OCR model" call is needed here.
+    console.log(`[MangaTranslator] Starting — OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize}, Server: ${serverUrl}`);
 
     let images = findAllTranslatableImages();
     if (images.length === 0) {
@@ -664,8 +661,7 @@
       updateOverlay(overlay, processedCount, images.length);
     }
 
-    const ocrLabel = targetOcr === 'ja' ? 'Japanese' : 'Korean';
-    overlay.innerText = `✅ Done! (OCR: ${ocrLabel}, Lang: ${targetLanguage}, Colorize: ${colorize ? 'On' : 'Off'})`;
+    overlay.innerText = `✅ Done! (OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize ? 'On' : 'Off'})`;
     setTimeout(() => overlay.remove(), 4000);
     isTranslating = false;
   }
@@ -798,7 +794,7 @@
   // ========================================================================
   // PROGRESS OVERLAY
   // ========================================================================
-  function createProgressOverlay(total, ocrModel, colorize, targetLang) {
+  function createProgressOverlay(total, ocrLang, colorize, targetLang) {
     const overlay = document.createElement('div');
     overlay.style.cssText = `
       position: fixed; top: 15px; right: 15px; z-index: 2147483647;
@@ -806,8 +802,7 @@
       border-radius: 8px; font-family: Arial, sans-serif; font-size: 14px;
       box-shadow: 0 4px 10px rgba(0,0,0,0.5); min-width: 260px; border: 1px solid #444;
     `;
-    const label = ocrModel === 'ko' ? 'Korean (PaddleOCR)' : 'Japanese (Hayai+YOLO)';
-    overlay.innerText = `Starting ${total} images… [OCR: ${label}, Lang: ${targetLang}, Color: ${colorize ? 'On' : 'Off'}]`;
+    overlay.innerText = `Starting ${total} images… [OCR Lang: ${ocrLang}, Lang: ${targetLang}, Color: ${colorize ? 'On' : 'Off'}]`;
     document.body.appendChild(overlay);
     return overlay;
   }

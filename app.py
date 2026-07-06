@@ -5,7 +5,7 @@
        /v1/changemodel /v1/listmodels /v1/colorize
        /v1/ai/resolve /v1/ai/prompt/default
        /SetFont /GetFont /GetFonts /SetModelType /GetModelType /SetOpenRouterModel
-       /SetInpaintMode /GetInpaintMode
+       /SetInpaintMode /GetInpaintMode /SetOcrMode /GetOcrMode
 - Logs: /console endpoint to view all backend logs and errors
 """
 
@@ -86,6 +86,11 @@ try:
     import onnxruntime as ort
 except Exception:
     ort = None
+
+try:
+    from chrome_lens_py import LensAPI
+except Exception:
+    LensAPI = None
 
 # --- Sanitization ----
 import re
@@ -269,6 +274,14 @@ _inpaint_lock = threading.Lock()
 # --- Inpainting Mode Globals ---
 _inpaint_mode = "low"  # "low" or "high"
 _inpaint_mode_lock = threading.Lock()
+
+# --- OCR Mode Globals ---
+_ocr_mode = "hayai"  # "hayai", "glm", or "lens"
+_ocr_mode_lock = threading.Lock()
+
+# --- Google Lens Globals ---
+_lens_api = None
+_lens_lock = threading.Lock()
 
 # --- Font Configuration Globals ---
 _current_font_path: pathlib.Path = FONT_PATH
@@ -776,6 +789,144 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         if text:
             out.append({"text": text, "bbox": bbox})
     return out
+
+# ===========================================================================
+# Google Lens OCR (chrome-lens-py)
+# ===========================================================================
+def get_lens_api():
+    global _lens_api
+    if LensAPI is None:
+        raise RuntimeError("chrome-lens-py not installed: pip install chrome-lens-py")
+    if _lens_api is None:
+        with _lens_lock:
+            if _lens_api is None:
+                _lens_api = LensAPI()
+                logging.info("[Google Lens] LensAPI initialized.")
+    return _lens_api
+
+def _geometry_to_bbox(geometry, img_w, img_h):
+    """Convert Google Lens geometry to pixel bbox. Handles both:
+    - dict with center_x/center_y/width/height (normalized 0-1)
+    - list of [x, y] normalized points (polygon)
+    """
+    if not geometry:
+        return None
+
+    # Case 1: dict-style center/size geometry (common for chrome-lens-py blocks/lines)
+    if isinstance(geometry, dict):
+        try:
+            cx = geometry.get("center_x")
+            cy = geometry.get("center_y")
+            bw = geometry.get("width")
+            bh = geometry.get("height")
+            if None in (cx, cy, bw, bh):
+                return None
+            x1 = max(0, int((cx - bw / 2) * img_w))
+            y1 = max(0, int((cy - bh / 2) * img_h))
+            x2 = min(img_w - 1, int((cx + bw / 2) * img_w))
+            y2 = min(img_h - 1, int((cy + bh / 2) * img_h))
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                return None
+            return (x1, y1, x2, y2)
+        except (TypeError, KeyError):
+            return None
+
+    # Case 2: list of [x, y] normalized polygon points
+    if isinstance(geometry, list) and len(geometry) >= 2:
+        try:
+            xs = [p[0] for p in geometry]
+            ys = [p[1] for p in geometry]
+            x1 = max(0, int(min(xs) * img_w))
+            y1 = max(0, int(min(ys) * img_h))
+            x2 = min(img_w - 1, int(max(xs) * img_w))
+            y2 = min(img_h - 1, int(max(ys) * img_h))
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                return None
+            return (x1, y1, x2, y2)
+        except (TypeError, IndexError, ValueError):
+            return None
+
+    return None
+
+async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Dict[str, Any]]:
+    """Run Google Lens OCR on the full image and return text blocks with bboxes."""
+    api = get_lens_api()
+    w, h = pil_img.size
+    logging.info(f"[Google Lens] Running OCR on {w}x{h} image (lang={ocr_lang})...")
+
+    # Map common OCR lang codes to BCP-47 for Google Lens
+    lens_lang_map = {
+        "ja": "ja",
+        "ko": "ko",
+        "en": "en",
+        "zh": "zh",
+        "ru": "ru",
+        "es": "es",
+        "id": "id",
+        "cz": "zh",
+    }
+    lens_lang = lens_lang_map.get(ocr_lang, ocr_lang)
+
+    try:
+        result = await api.process_image(
+            image_path=pil_img,
+            ocr_language=lens_lang,
+            output_format='blocks'
+        )
+    except Exception as e:
+        logging.error(f"[Google Lens] OCR failed: {e}")
+        return []
+
+    if not isinstance(result, dict):
+        return []
+
+    text_blocks = result.get("text_blocks", [])
+    logging.info(f"[Google Lens DEBUG] raw text_blocks: {text_blocks!r}")
+    out = []
+    for block in text_blocks:
+        if not isinstance(block, dict):
+            logging.warning(f"[Google Lens] Skipping non-dict block: {block!r}")
+            continue
+
+        text = (block.get("text") or "").strip()
+        if not text:
+            continue
+
+        geometry = block.get("geometry", [])
+        bbox = _geometry_to_bbox(geometry, w, h)
+        if bbox is None:
+            # Fallback: try lines' geometry to build a combined bbox
+            lines = block.get("lines", [])
+            all_points = []
+            for line in lines:
+                if not isinstance(line, dict):
+                    continue
+                line_geom = line.get("geometry", [])
+                if line_geom:
+                    all_points.extend(line_geom)
+            if all_points:
+                bbox = _geometry_to_bbox(all_points, w, h)
+        if bbox is None:
+            continue
+
+        out.append({"text": text, "bbox": bbox})
+
+    logging.info(f"[Google Lens] Found {len(out)} text blocks.")
+    return out
+
+async def get_ocr_results(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Dict[str, Any]]:
+    """Dispatch to the appropriate OCR backend based on current mode."""
+    with _ocr_mode_lock:
+        mode = _ocr_mode
+
+    if mode == "lens":
+        return await google_lens_ocr(pil_img, ocr_lang)
+    elif mode == "glm" or ocr_lang == "ko":
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_OCR_BOX_EXECUTOR, glm_ocr_korean, pil_img)
+    else:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_OCR_BOX_EXECUTOR, hayai_ocr_with_yolo, pil_img)
 
 # ===========================================================================
 # Qwen GGUF translator
@@ -1799,6 +1950,54 @@ async def get_inpaint_mode():
     }
 
 # ===========================================================================
+# SetOcrMode Endpoint (OCR backend switching: hayai / glm / lens)
+# ===========================================================================
+class SetOcrModeRequest(BaseModel):
+    mode: str  # "hayai", "glm", or "lens"
+
+@app.post("/SetOcrMode")
+async def set_ocr_mode(req: SetOcrModeRequest):
+    global _ocr_mode
+    mode = req.mode.lower().strip()
+    if mode not in ("hayai", "glm", "lens"):
+        raise HTTPException(400, "mode must be 'hayai', 'glm', or 'lens'")
+
+    if mode == "lens" and LensAPI is None:
+        raise HTTPException(500, "chrome-lens-py not installed. Run: pip install chrome-lens-py")
+
+    if mode == "lens":
+        try:
+            get_lens_api()
+        except Exception as e:
+            raise HTTPException(500, f"Failed to initialize Google Lens API: {e}")
+
+    with _ocr_mode_lock:
+        _ocr_mode = mode
+
+    logging.info(f"[OCR] Mode set to: {mode}")
+
+    return {
+        "status": "ok",
+        "ocr_mode": _ocr_mode,
+        "lens_available": LensAPI is not None,
+    }
+
+@app.get("/GetOcrMode")
+async def get_ocr_mode():
+    with _ocr_mode_lock:
+        mode = _ocr_mode
+    return {
+        "ocr_mode": mode,
+        "available_modes": ["hayai", "glm", "lens"],
+        "lens_available": LensAPI is not None,
+        "descriptions": {
+            "hayai": "Hayai OCR (Japanese, local model + YOLO)",
+            "glm": "GLM-OCR (Korean, transformers + YOLO)",
+            "lens": "Google Lens OCR (all languages, cloud API)",
+        }
+    }
+
+# ===========================================================================
 # SetModelType Endpoint
 # ===========================================================================
 class SetModelTypeRequest(BaseModel):
@@ -1881,11 +2080,15 @@ async def version():
 async def meta():
     with _inpaint_mode_lock:
         inpaint_mode = _inpaint_mode
+    with _ocr_mode_lock:
+        ocr_mode = _ocr_mode
     return {
         "version": BUILD_ID,
         "cuda": has_cuda(),
         "device": get_torch_device(),
+        "ocr_mode": ocr_mode,
         "ocr_model": _current_ocr_model,
+        "lens_available": LensAPI is not None,
         "font_path": str(_current_font_path),
         "stroke_width": _current_stroke_width,
         "model_type": _current_model_type,
@@ -1900,14 +2103,24 @@ async def meta():
 @app.post("/warmup")
 async def warmup():
     errors = []
+    with _ocr_mode_lock:
+        ocr_mode = _ocr_mode
+
     try:
         get_yolo()
     except Exception as e:
         errors.append(f"YOLO: {e}")
     try:
-        get_hayai_ocr()
+        if ocr_mode != "lens":
+            get_hayai_ocr()
     except Exception as e:
         errors.append(f"Hayai OCR: {e}")
+    try:
+        if ocr_mode == "lens":
+            get_lens_api()
+            logging.info("[Warmup] Google Lens API initialized.")
+    except Exception as e:
+        errors.append(f"Google Lens: {e}")
     try:
         if _current_model_type == "local":
             get_qwen()
@@ -2024,10 +2237,7 @@ async def list_models():
 async def ai_resolve(image: UploadFile = File(...), lang: str = Form("ja")):
     contents = await image.read()
     pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
-    if lang == "ko":
-        results = glm_ocr_korean(pil_img)
-    else:
-        results = hayai_ocr_with_yolo(pil_img)
+    results = await get_ocr_results(pil_img, lang)
     return {"results": results, "count": len(results)}
 
 # ===========================================================================
@@ -2100,11 +2310,8 @@ async def _process_job(job_id: str):
         target_lang = job["target_lang"]
         ocr_lang = job["ocr_lang"]
 
-        # Step 1: OCR
-        if ocr_lang == "ko":
-            ocr_results = glm_ocr_korean(pil_img)
-        else:
-            ocr_results = hayai_ocr_with_yolo(pil_img)
+        # Step 1: OCR (dispatches to hayai / glm / lens based on current mode)
+        ocr_results = await get_ocr_results(pil_img, ocr_lang)
 
         if not ocr_results:
             async with _job_lock:
@@ -2295,7 +2502,12 @@ async def get_translated_image(job_id: str):
         text_color, bg_color = detect_text_and_bg_colors(orig_bgr, bbox)
 
         # Fit text to box
-        font_size, lines, heights = fit_font_and_wrap(draw, text, box_w, box_h, font_path=fp)
+        dynamic_max_size = max(96, min(int(box_h * 0.95), int(box_w * 0.85), 300))
+        dynamic_min_size = max(8, min(int(box_h * 0.15), 16))
+        font_size, lines, heights = fit_font_and_wrap(
+            draw, text, box_w, box_h, font_path=fp,
+            max_size=dynamic_max_size, min_size=dynamic_min_size
+        )
         font = get_font(fp, font_size)
 
         # Calculate vertical centering

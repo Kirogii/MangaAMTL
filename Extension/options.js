@@ -1,12 +1,7 @@
 // ============================================================================
 // FONT PREVIEW HELPERS
-// Font bytes are cached per (serverUrl, filename) in memory so switching back
-// and forth between fonts already viewed this session skips the network
-// fetch. The backend only exposes the *currently active* font's bytes via
-// /v1/font, so a font only gets cached once it's actually been made active
-// (on load, or right after picking it in the Font Family list).
 // ============================================================================
-const _mtFontByteCache = new Map(); // key: `${serverUrl}::${filename}` -> FontFace
+const _mtFontByteCache = new Map();
 
 function _mtFontFilenameFromPath(fontPath) {
   return (fontPath || '').split(/[\\/]/).pop();
@@ -130,8 +125,6 @@ async function initFontWeightPicker(serverUrl) {
 
 // ============================================================================
 // FONT FAMILY PICKER
-// Horizontally-scrolling, scrollbar-less chip list populated from /GetFonts.
-// Mouse wheel scrolls it sideways without needing to hold Shift.
 // ============================================================================
 function attachWheelHorizontalScroll(container) {
   if (container.dataset.wheelBound === '1') return;
@@ -212,7 +205,6 @@ async function selectFontFamily(serverUrl, filename, container) {
       c.classList.toggle('active', c.dataset.filename === filename);
     });
 
-    // Re-render the boldness swatches using the newly active font's real glyphs
     await initFontWeightPicker(serverUrl);
   } catch (e) {
     statusEl.innerHTML = `<span class="error">Error: ${e}</span>`;
@@ -220,7 +212,7 @@ async function selectFontFamily(serverUrl, filename, container) {
 }
 
 // ============================================================================
-// TRANSLATION MODEL / OPENROUTER
+// OCR / INPAINTING / MODEL TYPE SYNC
 // ============================================================================
 async function syncModelTypeFromServer(serverUrl) {
   if (!serverUrl) return;
@@ -238,9 +230,6 @@ async function syncModelTypeFromServer(serverUrl) {
   }
 }
 
-// ============================================================================
-// INPAINTING MODE
-// ============================================================================
 async function syncInpaintModeFromServer(serverUrl) {
   const statusEl = document.getElementById('optInpaintStatus');
   if (!serverUrl) return;
@@ -284,6 +273,45 @@ async function pushInpaintMode(serverUrl, mode) {
   }
 }
 
+async function syncOcrModeFromServer(serverUrl) {
+  const statusEl = document.getElementById('optOcrStatus');
+  if (!serverUrl) return;
+  try {
+    const res = await fetch(`${serverUrl}/GetOcrMode`);
+    const data = await res.json();
+    document.getElementById('optOcrMode').value = data.ocr_mode || 'hayai';
+    chrome.storage.local.set({ ocrMode: data.ocr_mode || 'hayai' });
+    statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+  } catch (e) {
+    console.warn('[MangaTranslator] Could not fetch OCR mode from server:', e);
+  }
+}
+
+async function pushOcrMode(serverUrl, mode) {
+  const statusEl = document.getElementById('optOcrStatus');
+  if (!serverUrl) {
+    statusEl.innerHTML = `<span class="error">Set a Server URL first</span>`;
+    return;
+  }
+  statusEl.innerText = 'Switching...';
+  try {
+    const res = await fetch(`${serverUrl}/SetOcrMode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+      chrome.storage.local.set({ ocrMode: data.ocr_mode });
+    } else {
+      statusEl.innerHTML = `<span class="error">Error: ${data.detail}</span>`;
+    }
+  } catch (e) {
+    statusEl.innerHTML = `<span class="error">Error: ${e}</span>`;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   chrome.storage.local.get(['serverUrl'], (data) => {
     const url = data.serverUrl || 'http://localhost:7860';
@@ -292,13 +320,14 @@ document.addEventListener('DOMContentLoaded', () => {
     initFontWeightPicker(url);
     syncModelTypeFromServer(url);
     syncInpaintModeFromServer(url);
+    syncOcrModeFromServer(url);
   });
 });
 
-document.getElementById('saveUrlBtn').addEventListener('click', () => {
+document.getElementById('mtSaveUrlBtn').addEventListener('click', () => {
   const url = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
   chrome.storage.local.set({ serverUrl: url }, () => {
-    const status = document.getElementById('urlStatus');
+    const status = document.getElementById('mtUrlStatus');
     status.innerText = 'URL Saved!';
     setTimeout(() => status.innerText = '', 2000);
   });
@@ -306,6 +335,7 @@ document.getElementById('saveUrlBtn').addEventListener('click', () => {
   initFontWeightPicker(url);
   syncModelTypeFromServer(url);
   syncInpaintModeFromServer(url);
+  syncOcrModeFromServer(url);
 });
 
 document.getElementById('optModelType').addEventListener('change', (e) => {
@@ -313,7 +343,6 @@ document.getElementById('optModelType').addEventListener('change', (e) => {
   document.getElementById('optOpenrouterRow').style.display = isOpenRouter ? 'block' : 'none';
   chrome.storage.local.set({ modelType: e.target.value });
 
-  // Switching back to Local takes effect immediately (no extra fields needed)
   if (!isOpenRouter) {
     const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
     if (serverUrl) {
@@ -360,6 +389,11 @@ document.getElementById('optSetModelBtn').addEventListener('click', async () => 
 document.getElementById('optInpaintMode').addEventListener('change', (e) => {
   const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
   pushInpaintMode(serverUrl, e.target.value);
+});
+
+document.getElementById('optOcrMode').addEventListener('change', (e) => {
+  const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
+  pushOcrMode(serverUrl, e.target.value);
 });
 
 // ============================================================================
