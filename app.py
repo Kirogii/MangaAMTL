@@ -158,7 +158,7 @@ YOLO_HF_RAW = "https://huggingface.co/Kirogii/Yolo-Manga_Textbox-Region_Detect/r
 Qwen_REPO_ID = "Manojb/Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
 Qwen_MODEL_FILENAME = "Qwen_Qwen3.5-0.8B-Q4_K_M.gguf"
 
-INPAINT_RADIUS_CV2 = 7  # Increased from 5
+INPAINT_RADIUS_CV2 = 7
 INPAINT_TELEA_RADIUS = 10
 INPAINT_NS_RADIUS = 7
 INPAINT_DILATE_PASSES = 2
@@ -167,8 +167,8 @@ INPAINT_USE_MULTI_PASS = True
 INPAINT_COLOR_MATCH = True
 
 # --- Inpainting Model Config (Low/High) -----------------------------------
-LAMA_LARGE_URL = "https://huggingface.co/dreMaz/AnimeMangaInpainting/resolve/main/lama_large_512px.ckpt"
-LAMA_LARGE_PATH = MODEL_DIR / "lama_large_512px.ckpt"
+LAMA_LARGE_URL = "https://huggingface.co/df1412/anime-big-lama/resolve/main/anime-manga-big-lama.pt"
+LAMA_LARGE_PATH = MODEL_DIR / "anime-manga-big-lama.pt"
 
 FONT_DIR = ROOT_DIR / "fonts"
 FONT_DIR.mkdir(parents=True, exist_ok=True)
@@ -240,7 +240,7 @@ app.add_middleware(
 )
 
 _simple_lama_model = None       # low mode (default SimpleLama / big-lama.pt)
-_simple_lama_high_model = None  # high mode (lama_large_512px.ckpt)
+_simple_lama_high_model = None  # high mode (anime-manga-big-lama.pt)
 _global_yolo       = None
 _global_qwen       = None
 _hayai_ocr_model   = None
@@ -313,12 +313,12 @@ def ensure_yolo():
     return YOLO_MODEL_PATH
 
 def ensure_lama_large():
-    """Download lama_large_512px.ckpt if missing."""
+    """Download anime-manga-big-lama.pt if missing."""
     if not LAMA_LARGE_PATH.exists() or LAMA_LARGE_PATH.stat().st_size < 10000:
         logging.info(f"[Lama High] Downloading high-quality inpainting model...")
         try:
             from huggingface_hub import hf_hub_download
-            p = hf_hub_download(repo_id="dreMaz/AnimeMangaInpainting", filename="lama_large_512px.ckpt")
+            p = hf_hub_download(repo_id="df1412/anime-big-lama", filename="anime-manga-big-lama.pt")
             shutil.copy(str(p), str(LAMA_LARGE_PATH))
             logging.info(f"[Lama High] Downloaded to {LAMA_LARGE_PATH}")
         except ImportError:
@@ -670,7 +670,8 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     h, w = img_bgr.shape[:2]
     yolo = get_yolo()
     logging.info(f"[OCR] Running YOLO text detection on {w}x{h} image...")
-    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
+    use_half = has_cuda()
+    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device(), half=use_half)
     if not results:
         return []
     r = results[0]
@@ -686,8 +687,11 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
         if box_area > 0.8 * img_area or box_area < 100:
             continue
         boxes.append((x1, y1, x2, y2))
+        
+    logging.info(f"[Hayai OCR] Found {len(boxes)} valid text boxes. Running OCR sequentially...")
     if not boxes:
         return []
+        
     def _ocr_one(bbox):
         x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
@@ -696,7 +700,10 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
         except Exception as e:
             logging.error(f"Hayai OCR failed on {bbox}: {e}")
             return bbox, ""
-    for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
+            
+    # FIX: Removed _OCR_BOX_EXECUTOR.map to prevent thread pool deadlock
+    for bbox in boxes:
+        bbox, text = _ocr_one(bbox)
         out.append({"text": text, "bbox": bbox})
     return out
 
@@ -731,7 +738,8 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
     h, w = img_bgr.shape[:2]
     yolo = get_yolo()
     logging.info(f"[GLM OCR] Running YOLO text detection on {w}x{h} image...")
-    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
+    use_half = has_cuda()
+    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device(), half=use_half)
     if not results:
         return []
     r = results[0]
@@ -747,7 +755,8 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         boxes.append((x1, y1, x2, y2))
     if not boxes:
         return []
-    logging.info(f"[GLM OCR] Found {len(boxes)} valid text boxes. Running GLM OCR on each...")
+    logging.info(f"[GLM OCR] Found {len(boxes)} valid text boxes. Running GLM OCR sequentially...")
+    
     TARGET_MAX = 1024
     TARGET_MIN = 384
     def _ocr_one(bbox):
@@ -784,8 +793,11 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         except Exception as e:
             logging.error(f"GLM OCR failed on {bbox}: {e}")
             return bbox, ""
+            
     out = []
-    for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
+    # FIX: Removed _OCR_BOX_EXECUTOR.map to prevent thread pool deadlock
+    for bbox in boxes:
+        bbox, text = _ocr_one(bbox)
         if text:
             out.append({"text": text, "bbox": bbox})
     return out
@@ -805,14 +817,8 @@ def get_lens_api():
     return _lens_api
 
 def _geometry_to_bbox(geometry, img_w, img_h):
-    """Convert Google Lens geometry to pixel bbox. Handles both:
-    - dict with center_x/center_y/width/height (normalized 0-1)
-    - list of [x, y] normalized points (polygon)
-    """
     if not geometry:
         return None
-
-    # Case 1: dict-style center/size geometry (common for chrome-lens-py blocks/lines)
     if isinstance(geometry, dict):
         try:
             cx = geometry.get("center_x")
@@ -830,8 +836,6 @@ def _geometry_to_bbox(geometry, img_w, img_h):
             return (x1, y1, x2, y2)
         except (TypeError, KeyError):
             return None
-
-    # Case 2: list of [x, y] normalized polygon points
     if isinstance(geometry, list) and len(geometry) >= 2:
         try:
             xs = [p[0] for p in geometry]
@@ -845,57 +849,122 @@ def _geometry_to_bbox(geometry, img_w, img_h):
             return (x1, y1, x2, y2)
         except (TypeError, IndexError, ValueError):
             return None
-
     return None
 
+def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merges OCR blocks that are physically close to each other.
+    Expands bounding boxes horizontally by 50% of their width to catch side-by-side text.
+    Expands bounding boxes vertically by a smaller margin (20% of height) to prevent 
+    merging distinct speech bubbles stacked on top of each other.
+    """
+    if len(blocks) <= 1:
+        return blocks
+        
+    parent = list(range(len(blocks)))
+    
+    def find(i):
+        if parent[i] == i:
+            return i
+        parent[i] = find(parent[i])
+        return parent[i]
+        
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
+            
+    for i in range(len(blocks)):
+        x1_i, y1_i, x2_i, y2_i = blocks[i]["bbox"]
+        w_i = x2_i - x1_i
+        h_i = y2_i - y1_i
+        
+        # Expand horizontally by 50% of width
+        # Expand vertically by 20% of height (or at least 10px) - reduces vertical over-merging
+        v_pad_i = max(10, h_i * 0.2)
+        exp_x1_i = x1_i - w_i * 0.5
+        exp_y1_i = y1_i - v_pad_i
+        exp_x2_i = x2_i + w_i * 0.5
+        exp_y2_i = y2_i + v_pad_i
+        
+        for j in range(i + 1, len(blocks)):
+            x1_j, y1_j, x2_j, y2_j = blocks[j]["bbox"]
+            w_j = x2_j - x1_j
+            h_j = y2_j - y1_j
+            
+            v_pad_j = max(10, h_j * 0.2)
+            exp_x1_j = x1_j - w_j * 0.5
+            exp_y1_j = y1_j - v_pad_j
+            exp_x2_j = x2_j + w_j * 0.5
+            exp_y2_j = y2_j + v_pad_j
+            
+            # Check intersection of expanded boxes
+            ix1 = max(exp_x1_i, exp_x1_j)
+            iy1 = max(exp_y1_i, exp_y1_j)
+            ix2 = min(exp_x2_i, exp_x2_j)
+            iy2 = min(exp_y2_i, exp_y2_j)
+            
+            if ix1 < ix2 and iy1 < iy2:
+                union(i, j)
+                
+    # Group blocks by their root parent
+    groups = {}
+    for i in range(len(blocks)):
+        root = find(i)
+        if root not in groups:
+            groups[root] = []
+        groups[root].append(blocks[i])
+        
+    merged_blocks = []
+    for group in groups.values():
+        # Combined bounding box
+        x1 = min(b["bbox"][0] for b in group)
+        y1 = min(b["bbox"][1] for b in group)
+        x2 = max(b["bbox"][2] for b in group)
+        y2 = max(b["bbox"][3] for b in group)
+        
+        # Sort texts in manga reading order (right-to-left, top-to-bottom)
+        group.sort(key=lambda b: (b["bbox"][0] * -1, b["bbox"][1]))
+        texts = [b["text"] for b in group]
+        merged_text = " ".join(texts) # Join with space for LLM context
+        
+        merged_blocks.append({
+            "text": merged_text,
+            "bbox": (x1, y1, x2, y2)
+        })
+        
+    return merged_blocks
+
 async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Dict[str, Any]]:
-    """Run Google Lens OCR on the full image and return text blocks with bboxes."""
     api = get_lens_api()
     w, h = pil_img.size
     logging.info(f"[Google Lens] Running OCR on {w}x{h} image (lang={ocr_lang})...")
-
-    # Map common OCR lang codes to BCP-47 for Google Lens
     lens_lang_map = {
-        "ja": "ja",
-        "ko": "ko",
-        "en": "en",
-        "zh": "zh",
-        "ru": "ru",
-        "es": "es",
-        "id": "id",
-        "cz": "zh",
+        "ja": "ja", "ko": "ko", "en": "en", "zh": "zh",
+        "ru": "ru", "es": "es", "id": "id", "cz": "zh",
     }
     lens_lang = lens_lang_map.get(ocr_lang, ocr_lang)
-
     try:
         result = await api.process_image(
-            image_path=pil_img,
-            ocr_language=lens_lang,
-            output_format='blocks'
+            image_path=pil_img, ocr_language=lens_lang, output_format='blocks'
         )
     except Exception as e:
         logging.error(f"[Google Lens] OCR failed: {e}")
         return []
-
     if not isinstance(result, dict):
         return []
-
     text_blocks = result.get("text_blocks", [])
     logging.info(f"[Google Lens DEBUG] raw text_blocks: {text_blocks!r}")
     out = []
     for block in text_blocks:
         if not isinstance(block, dict):
-            logging.warning(f"[Google Lens] Skipping non-dict block: {block!r}")
             continue
-
         text = (block.get("text") or "").strip()
         if not text:
             continue
-
         geometry = block.get("geometry", [])
         bbox = _geometry_to_bbox(geometry, w, h)
         if bbox is None:
-            # Fallback: try lines' geometry to build a combined bbox
             lines = block.get("lines", [])
             all_points = []
             for line in lines:
@@ -908,17 +977,16 @@ async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Di
                 bbox = _geometry_to_bbox(all_points, w, h)
         if bbox is None:
             continue
-
         out.append({"text": text, "bbox": bbox})
-
-    logging.info(f"[Google Lens] Found {len(out)} text blocks.")
-    return out
+    
+    # Merge close blocks before returning
+    merged = _merge_close_blocks(out)
+    logging.info(f"[Google Lens] Found {len(out)} raw blocks -> merged to {len(merged)} blocks.")
+    return merged
 
 async def get_ocr_results(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Dict[str, Any]]:
-    """Dispatch to the appropriate OCR backend based on current mode."""
     with _ocr_mode_lock:
         mode = _ocr_mode
-
     if mode == "lens":
         return await google_lens_ocr(pil_img, ocr_lang)
     elif mode == "glm" or ocr_lang == "ko":
@@ -991,7 +1059,8 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
     if not text:
         return ""
     lang_name = LANG_MAP.get(target_lang, "English")
-    max_tok = max(16, min(96, len(text) + 16))
+    # FIX: Increased max_tokens to prevent cutoffs on small models that add fluff text
+    max_tok = max(64, min(256, len(text) + 32))
     logging.info(f"[LLM] Starting translation for: '{text[:40]}' -> {lang_name}")
     llm = get_qwen()
     msgs = [
@@ -1008,18 +1077,91 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
         for tok in ("<|im_start|>", "<|im_end|>", "</s>"):
             if tok in raw:
                 raw = raw.replace(tok, "")
+                
+        # FIX: Clean up common prefixes small models use despite instructions
+        for prefix in ("Translation:", "Translated:", "Output:", f"{lang_name}:", f"{lang_name} translation:"):
+            if raw.lower().startswith(prefix.lower()):
+                raw = raw[len(prefix):].strip()
+                
         logging.info(f"[LLM] Translated to: '{raw[:40]}'")
         return clean_text_for_font(raw)
     except Exception as e:
         logging.error(f"[LLM] Translation failed: {e}")
         return ""
 
+def qwen_translate_batch(texts: List[str], target_lang: str = "en") -> List[str]:
+    """Translate a list of texts in a SINGLE LLM call using a numbered list."""
+    indexed_texts = [(i, t.strip()) for i, t in enumerate(texts) if t.strip()]
+    if not indexed_texts:
+        return [""] * len(texts)
+
+    lang_name = LANG_MAP.get(target_lang, "English")
+    prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (_, text) in enumerate(indexed_texts)]
+    batch_text = "\n".join(prompt_lines)
+
+    # FIX: Simplified prompt to be more robust for 0.8B models
+    batch_system_prompt = (
+        f"Translate the following numbered texts into {lang_name}. "
+        "Output only the translations, keeping the exact same numbers. No extra text."
+    )
+
+    total_chars = sum(len(t) for _, t in indexed_texts)
+    # FIX: Increased token limit generously
+    max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 32)))
+
+    llm = get_qwen()
+    msgs = [
+        {"role": "system", "content": batch_system_prompt},
+        {"role": "user", "content": batch_text},
+    ]
+
+    try:
+        with _llm_lock:
+            out = llm.create_chat_completion(
+                messages=msgs, max_tokens=max_tok, temperature=0.2, top_p=0.9,
+                stop=["<|im_end|>", "</s>"],
+            )
+        raw = out["choices"][0]["message"]["content"].strip()
+
+        results = [""] * len(texts)
+        parsed_lines = [ln.strip() for ln in raw.split('\n') if ln.strip()]
+        
+        matched_any = False
+        # Try to match numbered lines (e.g., "1. Hello")
+        for line in parsed_lines:
+            match = re.match(r"^(\d+)[\.\)]\s*(.*)$", line)
+            if match:
+                num = int(match.group(1)) - 1
+                trans = match.group(2).strip()
+                if 0 <= num < len(indexed_texts):
+                    orig_idx = indexed_texts[num][0]
+                    results[orig_idx] = clean_text_for_font(trans)
+                    matched_any = True
+                    
+        # FIX: Fallback if model ignored numbers and just outputted translations line by line
+        if not matched_any and len(parsed_lines) == len(indexed_texts):
+            logging.warning("[LLM Batch] Model didn't use numbers, mapping line-by-line...")
+            for i, line in enumerate(parsed_lines):
+                orig_idx = indexed_texts[i][0]
+                results[orig_idx] = clean_text_for_font(line)
+            matched_any = True
+
+        # Final fallback for any missing items
+        for num, (orig_idx, text) in enumerate(indexed_texts):
+            if not results[orig_idx]:
+                logging.warning(f"[LLM Batch] Box {num+1} missed in batch, retrying individually...")
+                results[orig_idx] = qwen_translate(text, target_lang)
+
+        return results
+    except Exception as e:
+        logging.error(f"[LLM Batch] Translation failed: {e}")
+        return [""] * len(texts)
+
 # ===========================================================================
 # OpenRouter Translation
 # ===========================================================================
 
 async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", max_retries: int = 5) -> List[str]:
-    """Translate a list of texts in a SINGLE OpenRouter API call using a numbered list format."""
     import aiohttp
     import random
 
@@ -1031,24 +1173,22 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
         logging.error("[OpenRouter] API key not configured")
         return [""] * len(texts)
 
-    # Filter out empty texts but keep their original indices
     indexed_texts = [(i, t) for i, t in enumerate(texts) if t.strip()]
     if not indexed_texts:
         return [""] * len(texts)
 
     lang_name = LANG_MAP.get(target_lang, "English")
-    
-    # Scale max_tokens based on total input length to prevent truncation
     total_chars = sum(len(t) for _, t in indexed_texts)
     max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 20)))
 
-    # Build the numbered list prompt
-    prompt_lines = [f"{idx + 1}. {text}" for idx, (orig_i, text) in enumerate(indexed_texts)]
+    # Sanitize input: replace newlines with spaces so the LLM list doesn't break
+    prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (orig_i, text) in enumerate(indexed_texts)]
     batch_text = "\n".join(prompt_lines)
 
     batch_system_prompt = (
         f"You are a manga translation engine. Translate the user's numbered list of texts into {lang_name}. "
         "Output ONLY the translated list, one per line, keeping the exact same numbers. "
+        "Do not include the original text. "
         "No explanations, no notes, no quotes."
     )
 
@@ -1079,7 +1219,7 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
             await asyncio.sleep(wait_time)
 
         try:
-            timeout = aiohttp.ClientTimeout(total=120) # Longer timeout for batches
+            timeout = aiohttp.ClientTimeout(total=120)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -1113,20 +1253,17 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                         logging.warning(f"[OpenRouter Batch] Empty/None content on attempt {attempt}")
                         continue
 
-                    # Parse the numbered list back out
                     results = [""] * len(texts)
                     parsed_lines = raw.split('\n')
                     for line in parsed_lines:
                         match = re.match(r"^\s*(\d+)\.\s*(.*)$", line)
                         if match:
-                            num = int(match.group(1)) - 1 # Convert to 0-based index
+                            num = int(match.group(1)) - 1
                             trans = match.group(2).strip()
-                            # Map back to the original text index
                             if 0 <= num < len(indexed_texts):
                                 orig_idx = indexed_texts[num][0]
                                 results[orig_idx] = clean_text_for_font(trans)
 
-                    # Verify we got most of them
                     success_count = sum(1 for r in results if r)
                     logging.info(f"[OpenRouter Batch] Parsed {success_count}/{len(indexed_texts)} translations.")
                     
@@ -1144,10 +1281,9 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
             continue
 
     logging.error(f"[OpenRouter Batch] FAILED after {max_retries} retries. Falling back to sequential.")
-    return [""] * len(texts) # Signal to fallback to sequential
+    return [""] * len(texts)
 
 async def openrouter_translate(text: str, target_lang: str = "en", max_retries: int = 5) -> str:
-    """Translate text using OpenRouter API with retries and rate-limit handling."""
     import aiohttp
     import random
 
@@ -1186,7 +1322,6 @@ async def openrouter_translate(text: str, target_lang: str = "en", max_retries: 
     }
 
     for attempt in range(1, max_retries + 1):
-        # Exponential backoff: 2s, 4s, 8s, 16s, 32s
         if attempt > 1:
             wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
             logging.info(f"[OpenRouter] Retry {attempt}/{max_retries} after {wait_time:.1f}s wait...")
@@ -1200,7 +1335,6 @@ async def openrouter_translate(text: str, target_lang: str = "en", max_retries: 
                     headers=headers,
                     json=payload
                 ) as response:
-                    # Handle rate limiting (429) specially
                     if response.status == 429:
                         retry_after = response.headers.get("Retry-After")
                         if retry_after:
@@ -1218,7 +1352,6 @@ async def openrouter_translate(text: str, target_lang: str = "en", max_retries: 
 
                     data = await response.json()
 
-                    # Safely extract content
                     raw = None
                     try:
                         if (data
@@ -1277,56 +1410,6 @@ async def translate_with_current_backend_async(text: str, target_lang: str = "en
 # Inpainting (SimpleLama + cv2 fallback) — with Low/High mode support
 # ===========================================================================
 
-def _load_lama_model_from_file(path: pathlib.Path, device: str):
-    """Load a LaMa model from a file. Tries TorchScript (JIT) first,
-    then falls back to state_dict loading via lama_cleaner if available.
-    """
-    # --- Attempt 1: TorchScript (JIT) ---
-    try:
-        model = torch.jit.load(str(path), map_location=device)
-        model.eval()
-        logging.info(f"[Lama] Loaded as TorchScript: {path}")
-        return model
-    except Exception as e:
-        logging.warning(f"[Lama] Not TorchScript ({e}), trying as state_dict checkpoint...")
-
-    # --- Attempt 2: state_dict via lama_cleaner ---
-    try:
-        try:
-            ckpt = torch.load(str(path), map_location='cpu', weights_only=False)
-        except TypeError:
-            # Older PyTorch without weights_only param
-            ckpt = torch.load(str(path), map_location='cpu')
-
-        if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-            state_dict = ckpt['state_dict']
-        else:
-            state_dict = ckpt
-
-        try:
-            from lama_cleaner.model.lama import LaMa
-            model = LaMa()
-            # Strip 'model.' prefix if present
-            cleaned = {}
-            for k, v in state_dict.items():
-                nk = k.replace('model.', '') if k.startswith('model.') else k
-                cleaned[nk] = v
-            model.load_state_dict(cleaned, strict=False)
-            model = model.to(device)
-            model.eval()
-            logging.info(f"[Lama] Loaded as state_dict via lama_cleaner: {path}")
-            return model
-        except ImportError:
-            raise RuntimeError(
-                f"{path} is a checkpoint (not JIT). "
-                "Install lama-cleaner to load it: pip install lama-cleaner"
-            )
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Failed to load {path}: {e}")
-
-
 def load_lama_low():
     """Load the default SimpleLama model (low quality, big-lama.pt packaged)."""
     global _simple_lama_model
@@ -1348,103 +1431,228 @@ def load_lama_low():
 
 
 class HighQualityLama:
-    """Custom wrapper for lama_large_512px.ckpt. 
-    Uses a patch-based inference approach to prevent blurring on large images."""
+    """Custom wrapper for anime-manga-big-lama.pt.
+    Uses patch-based inference with:
+    - 50% overlap (stride=256) for seamless blending
+    - Single pass inference (with color correction)
+    - Proper Gaussian-weighted accumulation and normalization
+    - Feathered mask boundary for smooth transitions
+    - Post-processing color correction to match surroundings
+    - TF32 + cuDNN benchmark on CUDA for speed
+    - FP16 precision on CUDA for doubled throughput
+    - Batched patch inference for massive speedups
+    """
+
     def __init__(self):
         self.device = get_torch_device()
-        self.model = _load_lama_model_from_file(LAMA_LARGE_PATH, self.device)
+        # Use FP16 on CUDA for massive speedup, FP32 on CPU
+        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+
+        # Enable TF32 on CUDA for tensor-core acceleration
+        if self.device == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+
+        ensure_lama_large()
+        logging.info(f"[Lama High] Loading {LAMA_LARGE_PATH} on device: {self.device} (dtype={self.dtype})")
+        
+        # TorchScript load with CPU fallback
+        try:
+            self.model = torch.jit.load(str(LAMA_LARGE_PATH), map_location=self.device)
+        except Exception as e:
+            logging.warning(f"[Lama High] Failed to load on {self.device} ({e}), falling back to CPU.")
+            self.device = "cpu"
+            self.dtype = torch.float32
+            self.model = torch.jit.load(str(LAMA_LARGE_PATH), map_location="cpu")
+            
         self.model.eval()
         try:
             self.model.to(self.device)
         except Exception:
             pass
 
+        self.patch_size = 512
+        self.stride = 256  # 50% overlap is enough for seamless blending
+        self.batch_size = 4 if self.device == "cuda" else 1 # Batch patches on GPU
+
+        # Wider Gaussian (sigma = patch_size/3) for softer blending
+        gauss = cv2.getGaussianKernel(self.patch_size, self.patch_size // 3)
+        self.gauss_2d = (gauss @ gauss.T).astype(np.float32)
+        self.gauss_2d /= self.gauss_2d.max()
+
+    def _infer_patches_batch(self, batch_imgs: np.ndarray, batch_masks: np.ndarray) -> np.ndarray:
+        """Run the LaMa model on a batch of 512×512 patches. Returns float32 RGB array."""
+        img_t = (
+            torch.from_numpy(batch_imgs)
+            .float()
+            .permute(0, 3, 1, 2)
+            .to(self.device)
+            .to(self.dtype)
+            / 255.0
+        )
+        mask_t = (
+            torch.from_numpy(batch_masks)
+            .float()
+            .unsqueeze(1)
+            .to(self.device)
+            .to(self.dtype)
+            / 255.0
+        )
+        mask_t = (mask_t > 0.5).float()
+
+        with torch.no_grad():
+            out = self.model(img_t, mask_t).clamp(0, 1)
+
+        return (out.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.float32)
+
+    def _gen_coords(self, length: int) -> List[int]:
+        ps = self.patch_size
+        if length <= ps:
+            return [0]
+        coords = list(range(0, length - ps + 1, self.stride))
+        if coords[-1] != length - ps:
+            coords.append(length - ps)
+        return coords
+
+    def _run_pass(self, img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Single inpainting pass over the image. Returns the blended result."""
+        H, W = img.shape[:2]
+        ps = self.patch_size
+
+        inpainted_acc = np.zeros((H, W, 3), dtype=np.float32)
+        inpainted_weight = np.zeros((H, W), dtype=np.float32)
+
+        ys = self._gen_coords(H)
+        xs = self._gen_coords(W)
+
+        valid_patches = []
+        valid_coords = []
+
+        # Gather all valid patches first
+        for y in ys:
+            for x in xs:
+                y1, y2 = y, y + ps
+                x1, x2 = x, x + ps
+
+                patch_img = img[y1:y2, x1:x2]
+                patch_mask = mask[y1:y2, x1:x2]
+                ph, pw = patch_img.shape[:2]
+
+                # Pad to full patch size if at image edge
+                if ph < ps or pw < ps:
+                    patch_img = np.pad(
+                        patch_img,
+                        ((0, ps - ph), (0, ps - pw), (0, 0)),
+                        mode="reflect",
+                    )
+                    patch_mask = np.pad(
+                        patch_mask,
+                        ((0, ps - ph), (0, ps - pw)),
+                        mode="reflect",
+                    )
+
+                # Skip patches with nothing to inpaint
+                if patch_mask.sum() == 0:
+                    continue
+
+                valid_patches.append((patch_img, patch_mask))
+                valid_coords.append((y1, y2, x1, x2, ph, pw))
+
+        # Process patches in batches
+        for i in range(0, len(valid_patches), self.batch_size):
+            batch_imgs = np.stack([p[0] for p in valid_patches[i:i+self.batch_size]])
+            batch_masks = np.stack([p[1] for p in valid_patches[i:i+self.batch_size]])
+            
+            outs = self._infer_patches_batch(batch_imgs, batch_masks)
+            
+            for j, out_patch in enumerate(outs):
+                y1, y2, x1, x2, ph, pw = valid_coords[i+j]
+                out_patch = out_patch[:ph, :pw]
+                g = self.gauss_2d[:ph, :pw]
+
+                inpainted_acc[y1:y2, x1:x2] += out_patch * g[:, :, None]
+                inpainted_weight[y1:y2, x1:x2] += g
+
+        # Normalize accumulated inpainted results
+        inpainted_weight_safe = inpainted_weight.copy()
+        inpainted_weight_safe[inpainted_weight_safe == 0] = 1.0
+        inpainted_result = (inpainted_acc / inpainted_weight_safe[:, :, None]).clip(
+            0, 255
+        )
+
+        # Feather the mask for a smooth transition between original and inpainted
+        feathered = cv2.GaussianBlur(
+            (mask > 0).astype(np.float32), (7, 7), 2.0
+        )
+        feathered = np.maximum(feathered, (mask > 0).astype(np.float32))
+
+        final = (
+            inpainted_result * feathered[:, :, None]
+            + img.astype(np.float32) * (1.0 - feathered[:, :, None])
+        )
+        return final.clip(0, 255).astype(np.uint8)
+
+    def _color_correct(
+        self, inpainted: np.ndarray, mask: np.ndarray, original: np.ndarray
+    ) -> np.ndarray:
+        """Match inpainted region's per-channel mean/std to surrounding context."""
+        border = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=2)
+        border = (border > 0) & (mask == 0)
+
+        if border.sum() < 20 or mask.sum() == 0:
+            return inpainted
+
+        out = inpainted.astype(np.float32).copy()
+        mask_bool = mask > 0
+
+        for c in range(3):
+            ref_pixels = original[border, c].astype(np.float32)
+            if len(ref_pixels) < 10:
+                continue
+            ref_mean = ref_pixels.mean()
+            ref_std = max(ref_pixels.std(), 1.0)
+
+            inp_pixels = out[mask_bool, c]
+            if len(inp_pixels) < 10:
+                continue
+            inp_mean = inp_pixels.mean()
+            inp_std = max(inp_pixels.std(), 1.0)
+
+            corrected = (out[:, :, c] - inp_mean) / inp_std * ref_std + ref_mean
+            out[:, :, c] = np.where(mask_bool, corrected, out[:, :, c])
+
+        return out.clip(0, 255).astype(np.uint8)
+
     def __call__(self, pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
         w, h = pil_img.size
         img = np.array(pil_img.convert("RGB"))
         mask = np.array(pil_mask.convert("L"))
-        
-        # Pad image to multiple of 8 to avoid LaMa dimension errors
+
+        # Pad to multiple of 8 (LaMa dimension requirement)
         pad_w = (8 - w % 8) % 8
         pad_h = (8 - h % 8) % 8
         if pad_h > 0 or pad_w > 0:
-            img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
-            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode='reflect')
-            
-        H, W = img.shape[:2]
-        
-        out_float = img.astype(np.float32)
-        weight = np.zeros((H, W), dtype=np.float32)
-        
-        patch_size = 512
-        stride = 256  # 50% overlap to prevent seam lines
-        
-        # Create a 2D Gaussian weight map for seamless blending
-        gauss = cv2.getGaussianKernel(patch_size, patch_size//4)
-        gauss_2d = (gauss @ gauss.T).astype(np.float32)
-        gauss_2d /= gauss_2d.max()
-        
-        # Generate patch coordinates
-        ys = list(range(0, max(1, H - patch_size + 1), stride))
-        if H > patch_size and (H - patch_size) % stride != 0:
-            ys.append(H - patch_size)
-        elif H <= patch_size:
-            ys = [0]
-            
-        xs = list(range(0, max(1, W - patch_size + 1), stride))
-        if W > patch_size and (W - patch_size) % stride != 0:
-            xs.append(W - patch_size)
-        elif W <= patch_size:
-            xs = [0]
-            
-        for y in ys:
-            for x in xs:
-                y1, y2 = y, y + patch_size
-                x1, x2 = x, x + patch_size
-                
-                # Extract patch and pad if at the edge
-                patch_img = img[y1:y2, x1:x2]
-                patch_mask = mask[y1:y2, x1:x2]
-                
-                ph, pw = patch_img.shape[:2]
-                if ph < patch_size or pw < patch_size:
-                    patch_img = np.pad(patch_img, ((0, patch_size - ph), (0, patch_size - pw), (0, 0)), mode='reflect')
-                    patch_mask = np.pad(patch_mask, ((0, patch_size - ph), (0, patch_size - pw)), mode='reflect')
-                
-                # Optimization: Skip patches that have no text to inpaint
-                if patch_mask.sum() == 0:
-                    continue
-                    
-                img_t = torch.from_numpy(patch_img).float().permute(2,0,1).unsqueeze(0).to(self.device) / 255.0
-                mask_t = torch.from_numpy(patch_mask).float().unsqueeze(0).unsqueeze(0).to(self.device) / 255.0
-                mask_t = (mask_t > 0.5).float()  # Strict binary mask
-                
-                with torch.no_grad():
-                    out_patch = self.model(img_t, mask_t).clamp(0, 1)
-                    
-                out_patch_np = (out_patch[0].permute(1,2,0).cpu().numpy() * 255).astype(np.float32)
-                
-                # Crop back to actual patch size before blending
-                out_patch_np = out_patch_np[:ph, :pw]
-                g = gauss_2d[:ph, :pw]
-                
-                # Blend the patch using the Gaussian weight map
-                out_float[y1:y2, x1:x2] = out_float[y1:y2, x1:x2] * (1 - g[:,:,None]) + out_patch_np * g[:,:,None]
-                weight[y1:y2, x1:x2] += g
-                
-        # Normalize by weight and restore original dimensions
-        weight[weight == 0] = 1
-        out_img = (out_float / weight[:,:,None]).clip(0, 255).astype(np.uint8)
-        out_img = out_img[:h, :w, :]
-        return Image.fromarray(out_img)
+            img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="reflect")
 
+        # ── Pass 1: Initial inpainting ──
+        logging.info("[Lama High] Pass 1/1 — batched inpainting...")
+        result_1 = self._run_pass(img, mask)
+
+        # ── Color correction: match inpainted stats to surrounding original ──
+        logging.info("[Lama High] Color correction...")
+        corrected = self._color_correct(result_1, mask, img)
+
+        # Restore original dimensions
+        corrected = corrected[:h, :w, :]
+        return Image.fromarray(corrected)
 
 def load_lama_high():
-    """Load the high-quality LaMa model (lama_large_512px.ckpt from dreMaz)."""
+    """Load the high-quality LaMa model (anime-manga-big-lama.pt)."""
     global _simple_lama_high_model
     if _simple_lama_high_model is None:
-        ensure_lama_large()
-        logging.info(f"[Lama High] Loading {LAMA_LARGE_PATH} on device: {get_torch_device()}")
+        logging.info(f"[Lama High] Initializing high-quality model wrapper...")
         _simple_lama_high_model = HighQualityLama()
         logging.info(f"[Lama High] Successfully loaded high-quality model.")
     return _simple_lama_high_model
@@ -1477,21 +1685,21 @@ def cv2_inpaint_fallback(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return cv2.inpaint(img_bgr, mask, INPAINT_RADIUS_CV2, cv2.INPAINT_TELEA)
 
 async def inpaint_image_async(img_bgr: np.ndarray, mask: np.ndarray, use_lama: bool = True) -> np.ndarray:
-    """Run inpainting in a thread pool so it doesn't block the event loop.
-    
-    Tries SimpleLama first (if use_lama=True and available), falls back to cv2.inpaint.
-    """
-    if use_lama and SimpleLama is not None:
+    """Run inpainting in a thread pool so it doesn't block the event loop."""
+    with _inpaint_mode_lock:
+        mode = _inpaint_mode
+
+    should_use_lama = use_lama and (mode == "high" or SimpleLama is not None)
+
+    if should_use_lama:
         try:
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(_inpaint_executor, lama_inpaint, img_bgr, mask)
-            with _inpaint_mode_lock:
-                mode = _inpaint_mode
-            logging.info(f"[Inpaint] SimpleLama inpainting complete (mode={mode}).")
+            logging.info(f"[Inpaint] LaMa inpainting complete (mode={mode}).")
             return result
         except Exception as e:
-            logging.warning(f"[Inpaint] SimpleLama failed ({e}), falling back to cv2.inpaint")
-    
+            logging.warning(f"[Inpaint] LaMa failed ({e}), falling back to cv2.inpaint")
+
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(_inpaint_executor, cv2_inpaint_fallback, img_bgr, mask)
     logging.info("[Inpaint] cv2.inpaint fallback complete.")
@@ -1501,10 +1709,7 @@ def build_inpaint_mask(img_shape: Tuple[int, int, int],
                        bboxes: List[Tuple[int, int, int, int]],
                        padding: int = 2,
                        dilate_kernel: int = 3) -> np.ndarray:
-    """Build a strict binary mask tailored tightly to the text bounding boxes.
-    
-    Prevents the mask from expanding too far and erasing speech bubble borders.
-    """
+    """Build a strict binary mask tailored tightly to the text bounding boxes."""
     h, w = img_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     
@@ -1522,68 +1727,232 @@ def build_inpaint_mask(img_shape: Tuple[int, int, int],
     return mask
 
 # ===========================================================================
-# Text color detection (per box)
+# Text color detection (per box + global batch voting for consistency)
 # ===========================================================================
-def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int,int,int,int]
-                              ) -> Tuple[Tuple[int,int,int], Tuple[int,int,int]]:
-    x1,y1,x2,y2 = bbox
-    region = img_bgr[max(0,y1):y2, max(0,x1):x2]
+def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int, int, int, int]
+                              ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Detect text (ink) and background (outline) colors within a bbox.
+
+    Strategy:
+      1. Slightly expand the bbox to capture surrounding background pixels
+         for a more representative background sample.
+      2. Cluster pixels in LAB color space using k-means (k=3) to identify
+         dominant color groups (background, text, anti-aliasing/transition).
+      3. Background = the largest cluster.
+      4. Text = the cluster with the greatest perceptual distance from the
+         background that has at least 4% of the pixels.
+      5. Use per-cluster MEDIAN color (robust to outliers) instead of mean.
+      6. Only "snap" to pure black/white when colors are extremely close to
+         the extremes (<=20 or >=235), avoiding premature binarization that
+         causes inconsistent black/white flipping between similar regions.
+      7. If final text/bg contrast is still too low, force the text to the
+         opposite extreme of the background luminance — but only as a last
+         resort.
+
+    Returns (text_rgb, bg_rgb) as 0-255 RGB tuples.
+    """
+    x1, y1, x2, y2 = bbox
+    h, w = img_bgr.shape[:2]
+
+    # --- Expand bbox slightly to capture surrounding background context ---
+    pad_x = max(3, (x2 - x1) // 6)
+    pad_y = max(3, (y2 - y1) // 6)
+    ex_x1 = max(0, x1 - pad_x)
+    ex_y1 = max(0, y1 - pad_y)
+    ex_x2 = min(w, x2 + pad_x)
+    ex_y2 = min(h, y2 + pad_y)
+
+    region = img_bgr[ex_y1:ex_y2, ex_x1:ex_x2]
     if region.size == 0:
-        return (0,0,0), (255,255,255)
+        return (255, 255, 255), (0, 0, 0)
 
-    # Downsample for speed
-    if region.shape[0] > 120 or region.shape[1] > 120:
-        region = cv2.resize(region, (120, 120), interpolation=cv2.INTER_AREA)
+    rh, rw = region.shape[:2]
 
-    pixels = region.reshape(-1, 3).astype(np.float32)
-    if len(pixels) < 8:
-        return (0,0,0), (255,255,255)
+    # --- Resize for consistent processing speed ---
+    max_dim = 180
+    if rh > max_dim or rw > max_dim:
+        scale = max_dim / max(rh, rw)
+        new_w = max(8, int(rw * scale))
+        new_h = max(8, int(rh * scale))
+        region = cv2.resize(region, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # --- Background = most common quantized color (mode, robust to thin text) ---
-    quant = (pixels / 32).astype(np.int32)
-    keys = quant[:,0] * 64 + quant[:,1] * 8 + quant[:,2]
-    uniq, counts = np.unique(keys, return_counts=True)
-    bg_key = int(uniq[int(np.argmax(counts))])
-    bg_bgr = np.array([bg_key // 64, (bg_key // 8) % 8, bg_key % 8], dtype=np.float32) * 32 + 16
+    # --- Convert to LAB for perceptually uniform color distance ---
+    region_lab = cv2.cvtColor(region, cv2.COLOR_BGR2LAB)
+    pixels_lab = np.ascontiguousarray(region_lab.reshape(-1, 3).astype(np.float32))
+    pixels_bgr = region.reshape(-1, 3).astype(np.float32)
 
-    # --- Text pixels = those far from background ---
-    dists = np.linalg.norm(pixels - bg_bgr, axis=1)
-    thresh = max(60.0, float(np.percentile(dists, 75)))
-    text_mask = dists > thresh
+    n_pixels = int(pixels_bgr.shape[0])
+    if n_pixels < 8:
+        return (255, 255, 255), (0, 0, 0)
 
-    if int(text_mask.sum()) < 5:
-        # No clear text — pick ink by luminance contrast
-        bg_lum = float(bg_bgr.mean())
-        ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
+    # --- K-means clustering in LAB space (k=3: bg, text, transition) ---
+    K = 3
+    try:
+        _, labels, centers_lab = cv2.kmeans(
+            pixels_lab, K, None,
+            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0),
+            10, cv2.KMEANS_PP_CENTERS
+        )
+    except cv2.error:
+        # Degenerate region — fall back to simple luminance split
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        mean_lum = float(gray.mean())
+        if mean_lum > 127:
+            return (0, 0, 0), (255, 255, 255)
+        return (255, 255, 255), (0, 0, 0)
+
+    labels = labels.flatten()
+    counts = np.bincount(labels, minlength=K)
+    sorted_idx = np.argsort(-counts)
+
+    # --- Identify background: the largest cluster ---
+    bg_idx = int(sorted_idx[0])
+    bg_lab = centers_lab[bg_idx]
+    bg_mask = (labels == bg_idx)
+    bg_bgr = np.median(pixels_bgr[bg_mask], axis=0)
+
+    # --- Identify text: highest perceptual distance from bg, enough pixels ---
+    min_text_count = max(5, int(n_pixels * 0.04))
+    best_text_idx = None
+    best_text_dist = -1.0
+    for i in range(K):
+        if i == bg_idx:
+            continue
+        if counts[i] < min_text_count:
+            continue
+        d = float(np.linalg.norm(centers_lab[i] - bg_lab))
+        if d > best_text_dist:
+            best_text_dist = d
+            best_text_idx = i
+
+    if best_text_idx is not None:
+        text_mask = (labels == best_text_idx)
+        text_bgr = np.median(pixels_bgr[text_mask], axis=0)
     else:
-        text_pixels = pixels[text_mask]
-        text_dists = np.linalg.norm(text_pixels - bg_bgr, axis=1)
-        # Take the most extreme 30% — these are the true ink, not anti-aliasing
-        ext_t = float(np.percentile(text_dists, 70))
-        ext_mask = text_dists >= ext_t
-        if int(ext_mask.sum()) >= 3:
-            ink_bgr = np.median(text_pixels[ext_mask], axis=0)
+        # --- Fallback: Otsu threshold on luminance ---
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Border sampling decides which side is background
+        if rh >= 2 and rw >= 2:
+            border = np.concatenate([
+                gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]
+            ])
         else:
-            ink_bgr = np.median(text_pixels, axis=0)
+            border = gray.flatten()
+        border_mean = float(border.mean()) if border.size else float(gray.mean())
+        if border_mean > 127:
+            text_sel = (otsu.flatten() == 0)   # light bg -> dark text
+        else:
+            text_sel = (otsu.flatten() != 0)   # dark bg  -> light text
+        if int(text_sel.sum()) > 0:
+            text_bgr = np.median(pixels_bgr[text_sel], axis=0)
+        else:
+            bg_lum = float(bg_bgr.mean())
+            text_bgr = (np.array([0, 0, 0], dtype=np.float32)
+                        if bg_lum > 127
+                        else np.array([255, 255, 255], dtype=np.float32))
 
-    # --- Snap near-pure colors to pure black/white ---
-    def snap(c: np.ndarray) -> np.ndarray:
+    # --- Gentle snap: ONLY when extremely close to extremes ---
+    def gentle_snap(c: np.ndarray) -> np.ndarray:
         c = np.asarray(c, dtype=np.float32)
-        if np.all(c < 40):  return np.array([0,0,0], dtype=np.float32)
-        if np.all(c > 215): return np.array([255,255,255], dtype=np.float32)
+        if np.all(c <= 20):
+            return np.array([0, 0, 0], dtype=np.float32)
+        if np.all(c >= 235):
+            return np.array([255, 255, 255], dtype=np.float32)
         return c
 
-    ink_bgr = snap(ink_bgr)
-    bg_bgr  = snap(bg_bgr)
+    text_bgr = gentle_snap(text_bgr)
+    bg_bgr = gentle_snap(bg_bgr)
 
-    # --- Guarantee contrast between ink and outline ---
-    if float(np.linalg.norm(ink_bgr - bg_bgr)) < 80:
+    # --- Final contrast enforcement (last resort) ---
+    contrast = float(np.linalg.norm(text_bgr - bg_bgr))
+    if contrast < 60:
         bg_lum = float(bg_bgr.mean())
-        ink_bgr = np.array([0,0,0], dtype=np.float32) if bg_lum > 127 else np.array([255,255,255], dtype=np.float32)
+        if bg_lum > 127:
+            text_bgr = np.array([0, 0, 0], dtype=np.float32)
+        else:
+            text_bgr = np.array([255, 255, 255], dtype=np.float32)
 
-    text_rgb    = (int(ink_bgr[2]), int(ink_bgr[1]), int(ink_bgr[0]))
-    outline_rgb = (int(bg_bgr[2]),  int(bg_bgr[1]),  int(bg_bgr[0]))
+    # BGR -> RGB
+    text_rgb = (int(text_bgr[2]), int(text_bgr[1]), int(text_bgr[0]))
+    outline_rgb = (int(bg_bgr[2]), int(bg_bgr[1]), int(bg_bgr[0]))
     return text_rgb, outline_rgb
+
+
+def detect_text_colors_batch(img_bgr: np.ndarray,
+                             bboxes: List[Tuple[int, int, int, int]]
+                             ) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
+    """Detect text/bg colors for a list of bboxes WITH global consistency.
+
+    Two passes:
+      1. Run detect_text_and_bg_colors on each box independently.
+      2. Tally light-text vs dark-text votes across all boxes. If there is a
+         strong majority (>= 2x the other), force the minority boxes to flip
+         to the majority polarity. This is what fixes "same region, half
+         white / half black text" — visually similar boxes now agree.
+
+    Returns a list of (text_rgb, bg_rgb) tuples aligned with `bboxes`.
+    """
+    if not bboxes:
+        return []
+
+    # --- Pass 1: independent detection ---
+    results: List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = []
+    for bbox in bboxes:
+        try:
+            results.append(detect_text_and_bg_colors(img_bgr, bbox))
+        except Exception as e:
+            logging.warning(f"[Color] detect_text_and_bg_colors failed for {bbox}: {e}")
+            results.append(((255, 255, 255), (0, 0, 0)))
+
+    # --- Pass 2: global polarity voting ---
+    light_votes = 0
+    dark_votes = 0
+    for text_rgb, bg_rgb in results:
+        text_lum = (text_rgb[0] + text_rgb[1] + text_rgb[2]) / 3.0
+        bg_lum = (bg_rgb[0] + bg_rgb[1] + bg_rgb[2]) / 3.0
+        if text_lum > bg_lum:
+            light_votes += 1
+        else:
+            dark_votes += 1
+
+    total_votes = light_votes + dark_votes
+    if total_votes == 0:
+        return results
+
+    # Require a 2:1 majority before forcing flips — protects mixed scenes
+    # (e.g. light text in a dark bubble AND dark text on a light sign).
+    force_light = light_votes >= 2 * dark_votes and light_votes >= 2
+    force_dark = dark_votes >= 2 * light_votes and dark_votes >= 2
+
+    if not force_light and not force_dark:
+        return results
+
+    logging.info(f"[Color] Global vote: light={light_votes} dark={dark_votes} "
+                 f"-> force_light={force_light} force_dark={force_dark}")
+
+    final_results = []
+    for (text_rgb, bg_rgb) in results:
+        if force_light:
+            text_lum = (text_rgb[0] + text_rgb[1] + text_rgb[2]) / 3.0
+            bg_lum = (bg_rgb[0] + bg_rgb[1] + bg_rgb[2]) / 3.0
+            if text_lum <= bg_lum:
+                # Flip to light text. Use the actual detected bg color as outline
+                # if it's dark enough; otherwise fall back to pure black outline.
+                outline = bg_rgb if bg_lum < 90 else (0, 0, 0)
+                final_results.append(((255, 255, 255), outline))
+            else:
+                final_results.append((text_rgb, bg_rgb))
+        else:  # force_dark
+            text_lum = (text_rgb[0] + text_rgb[1] + text_rgb[2]) / 3.0
+            bg_lum = (bg_rgb[0] + bg_rgb[1] + bg_rgb[2]) / 3.0
+            if text_lum >= bg_lum:
+                outline = bg_rgb if bg_lum > 165 else (255, 255, 255)
+                final_results.append(((0, 0, 0), outline))
+            else:
+                final_results.append((text_rgb, bg_rgb))
+
+    return final_results
 
 # ===========================================================================
 # Text wrapping & auto-fit
@@ -1855,7 +2224,6 @@ async def set_font(req: SetFontRequest):
                     break
             
             if not matched_font:
-                # Try partial match on filename
                 for f in available_fonts:
                     if f["filename"].lower().startswith(req_font_name):
                         matched_font = f
@@ -1917,7 +2285,6 @@ async def set_inpaint_mode(req: SetInpaintModeRequest):
         raise HTTPException(400, "mode must be 'low' or 'high'")
 
     if mode == "high":
-        # Auto-download the high-quality model if not present
         try:
             ensure_lama_large()
         except Exception as e:
@@ -1946,7 +2313,7 @@ async def get_inpaint_mode():
         "high_model_downloaded": LAMA_LARGE_PATH.exists(),
         "high_model_size_mb": round(LAMA_LARGE_PATH.stat().st_size / (1024 * 1024), 1) if LAMA_LARGE_PATH.exists() else 0,
         "low_model": "big-lama.pt (SimpleLama default)",
-        "high_model": "lama_large_512px.ckpt (dreMaz/AnimeMangaInpainting)",
+        "high_model": "anime-manga-big-lama.pt (df1412/anime-big-lama)",
     }
 
 # ===========================================================================
@@ -2132,10 +2499,10 @@ async def warmup():
                 mode = _inpaint_mode
             if mode == "high":
                 load_lama_high()
-                logging.info("[Warmup] SimpleLama (high) loaded for inpainting.")
+                logging.info("[Warmup] HighQualityLama loaded for inpainting.")
             else:
                 load_lama_low()
-                logging.info("[Warmup] SimpleLama (low) loaded for inpainting.")
+                logging.info("[Warmup] SimpleLama loaded for inpainting.")
         else:
             logging.info("[Warmup] SimpleLama not installed; cv2.inpaint will be used as fallback.")
     except Exception as e:
@@ -2297,20 +2664,23 @@ async def create_translate_job(
     asyncio.create_task(_process_job(job_id))
     return {"job_id": job_id, "status": "pending", "inpaint": inpaint}
 
+
 async def _process_job(job_id: str):
-    """Background task: OCR -> Translate (Batch for OpenRouter, Sequential for Local)."""
+    """Background task: OCR -> Translate (Batch for OpenRouter & Local)."""
     async with _job_lock:
         job = _jobs.get(job_id)
         if not job:
             return
         job["status"] = "processing"
+        # Capture the OCR mode that produced these boxes (lens boxes are tighter)
+        with _ocr_mode_lock:
+            job["ocr_mode"] = _ocr_mode
 
     try:
         pil_img = job["image"]
         target_lang = job["target_lang"]
         ocr_lang = job["ocr_lang"]
 
-        # Step 1: OCR (dispatches to hayai / glm / lens based on current mode)
         ocr_results = await get_ocr_results(pil_img, ocr_lang)
 
         if not ocr_results:
@@ -2325,15 +2695,12 @@ async def _process_job(job_id: str):
         with _model_type_lock:
             model_type = _current_model_type
 
-        # Step 2: Translate
         if model_type == "openrouter":
-            # --- BATCH STRATEGY FOR OPENROUTER ---
             logging.info(f"[Job {job_id}] Using OpenRouter BATCH strategy for {len(texts_to_translate)} boxes.")
             batch_results = await openrouter_translate_batch(texts_to_translate, target_lang)
-            
-            # Check if batch completely failed or missed items, fallback to sequential for missing ones
+
             needs_sequential_fallback = not any(batch_results)
-            
+
             if needs_sequential_fallback:
                 logging.warning(f"[Job {job_id}] Batch failed entirely, falling back to sequential requests.")
                 for idx, text in enumerate(texts_to_translate):
@@ -2348,36 +2715,28 @@ async def _process_job(job_id: str):
                         "bbox": ocr_results[idx]["bbox"],
                     })
             else:
-                # Batch succeeded (even if partially), fill in translations
                 for idx, text in enumerate(texts_to_translate):
                     translated = batch_results[idx]
-                    
-                    # If a specific line failed to parse in the batch, retry it individually
                     if not translated and text.strip():
                         logging.warning(f"[Job {job_id}] Box {idx+1} missed in batch, retrying individually...")
                         translated = await openrouter_translate(text, target_lang)
                         await asyncio.sleep(1.0)
-                        
+
                     translations.append({
                         "text": text,
                         "translation": translated,
                         "bbox": ocr_results[idx]["bbox"],
                     })
         else:
-            # --- SEQUENTIAL STRATEGY FOR LOCAL GGUF ---
-            logging.info(f"[Job {job_id}] Using Local SEQUENTIAL strategy for {len(texts_to_translate)} boxes.")
+            # --- BATCH STRATEGY FOR LOCAL GGUF ---
+            logging.info(f"[Job {job_id}] Using Local BATCH strategy for {len(texts_to_translate)} boxes.")
             loop = asyncio.get_event_loop()
+            batch_results = await loop.run_in_executor(_llm_executor, qwen_translate_batch, texts_to_translate, target_lang)
+
             for idx, text in enumerate(texts_to_translate):
-                if not text.strip():
-                    translations.append({"text": text, "translation": "", "bbox": ocr_results[idx]["bbox"]})
-                    continue
-                
-                logging.info(f"[Job {job_id}] Translating box {idx + 1}/{len(ocr_results)}: '{text[:40]}'")
-                translated = await loop.run_in_executor(_llm_executor, qwen_translate, text, target_lang)
-                
                 translations.append({
                     "text": text,
-                    "translation": translated,
+                    "translation": batch_results[idx] if batch_results[idx] else "",
                     "bbox": ocr_results[idx]["bbox"],
                 })
 
@@ -2415,15 +2774,7 @@ async def get_translate_job(job_id: str):
 
 @app.post("/v1/translate/{job_id}/image")
 async def get_translated_image(job_id: str):
-    """Generate the final translated image.
-    
-    Pipeline:
-    1. Get OCR boxes + translations from completed job
-    2. Build inpaint mask from all text bounding boxes
-    3. Inpaint to erase original text (SimpleLama if available, else cv2.inpaint)
-    4. Detect text/bg colors from ORIGINAL image (before inpainting)
-    5. Overlay translated text with proper sizing and centering
-    """
+    """Generate the final translated image."""
     async with _job_lock:
         job = _jobs.get(job_id)
         if not job:
@@ -2434,17 +2785,16 @@ async def get_translated_image(job_id: str):
         pil_img = job["image"]
         translations = job["result"].get("translations", [])
         do_inpaint = job.get("inpaint", True)
+        ocr_mode = job.get("ocr_mode", _ocr_mode)  # captured at OCR time
 
     if not translations:
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
         return Response(content=buf.getvalue(), media_type="image/png")
 
-    # Convert original image to cv2 for color detection and inpainting
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
 
-    # Collect all bounding boxes that have translations
     boxes_to_inpaint = []
     items_to_draw = []
 
@@ -2464,10 +2814,8 @@ async def get_translated_image(job_id: str):
         boxes_to_inpaint.append(bbox)
         items_to_draw.append(item)
 
-    # --- Step 1: Inpainting (erase original text) ---
     if do_inpaint and boxes_to_inpaint:
         logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions...")
-        # Use a very tight, safe mask to prevent erasing bubble borders
         mask = build_inpaint_mask(
             img_bgr.shape,
             boxes_to_inpaint,
@@ -2475,49 +2823,100 @@ async def get_translated_image(job_id: str):
             dilate_kernel=3,
         )
 
-        # Use lama if available, otherwise cv2 fallback
-        use_lama = SimpleLama is not None
+        with _inpaint_mode_lock:
+            inpaint_mode = _inpaint_mode
+        use_lama = inpaint_mode == "high" or SimpleLama is not None
         img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
         logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
 
-    # --- Step 2: Detect colors from ORIGINAL image (before inpainting) ---
-    # We use the original for color detection so we get accurate text/bg colors
     orig_bgr = pil_to_cv2(pil_img)
 
-    # --- Step 3: Overlay translated text ---
     out_pil = cv2_to_pil(img_bgr)
     draw = ImageDraw.Draw(out_pil)
 
     with _font_config_lock:
         fp = str(_current_font_path)
 
-    for item in items_to_draw:
+    # --- Detect colors for ALL boxes at once with global polarity voting ---
+    # This ensures visually similar regions (e.g. multiple boxes inside one
+    # speech bubble) get the same text color instead of flipping black/white.
+    all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
+    all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
+    color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
+
+    # ----- Lens-specific text sizing rules -----
+    # Lens bboxes are tight around text, so we let the rendered text
+    # slightly overflow by 1px on every side, and we force a readable
+    # minimum size for very small boxes (which would otherwise render
+    # as blurry tiny text).
+    LENS_OVERFLOW_PX          = 1   # text may exceed box by 1px each side
+    LENS_SMALL_BOX_THRESHOLD  = 24  # box dim below this => "really small"
+    LENS_SMALL_READABLE_SIZE  = 14  # forced readable font size for tiny boxes
+
+    is_lens = (ocr_mode == "lens")
+
+    for item_idx, item in enumerate(items_to_draw):
         text = item["translation"]
         bbox = item["bbox"]
         x1, y1, x2, y2 = bbox
         box_w = x2 - x1
         box_h = y2 - y1
 
-        # Detect colors from the ORIGINAL image at this bbox location
-        text_color, bg_color = detect_text_and_bg_colors(orig_bgr, bbox)
+        text_color, bg_color = color_by_idx[item_idx]
 
-        # Fit text to box
-        dynamic_max_size = max(96, min(int(box_h * 0.95), int(box_w * 0.85), 300))
-        dynamic_min_size = max(8, min(int(box_h * 0.15), 16))
-        font_size, lines, heights = fit_font_and_wrap(
-            draw, text, box_w, box_h, font_path=fp,
-            max_size=dynamic_max_size, min_size=dynamic_min_size
-        )
-        font = get_font(fp, font_size)
+        # -------- Pick font size + lines --------
+        if is_lens:
+            really_small = (box_w < LENS_SMALL_BOX_THRESHOLD or
+                            box_h < LENS_SMALL_BOX_THRESHOLD)
 
-        # Calculate vertical centering
+            if really_small:
+                # Force a small-but-readable size and let it overflow the box.
+                font_size = LENS_SMALL_READABLE_SIZE
+                font = get_font(fp, font_size)
+                # Allow wrapping if the text is long, but also allow overflow.
+                lines = wrap_text(draw, text, font,
+                                  max_width=max(box_w, font_size * 3),
+                                  allow_break=True, is_vertical=False)
+                if not lines:
+                    lines = [text]
+                heights, _, _ = _measure_block(draw, lines, font)
+            else:
+                # Normal Lens box: size text so it fills box + 1px overflow each side.
+                fit_w = box_w + LENS_OVERFLOW_PX * 2
+                fit_h = box_h + LENS_OVERFLOW_PX * 2
+                dynamic_max_size = max(96, min(int(fit_h * 0.98),
+                                               int(fit_w * 0.95), 320))
+                dynamic_min_size = max(10, min(int(box_h * 0.25), 18))
+                font_size, lines, heights = fit_font_and_wrap(
+                    draw, text, fit_w, fit_h, font_path=fp,
+                    max_size=dynamic_max_size, min_size=dynamic_min_size
+                )
+                font = get_font(fp, font_size)
+        else:
+            # ----- Non-Lens OCR: original behavior -----
+            dynamic_max_size = max(96, min(int(box_h * 0.95), int(box_w * 0.85), 300))
+            dynamic_min_size = max(8, min(int(box_h * 0.15), 16))
+            font_size, lines, heights = fit_font_and_wrap(
+                draw, text, box_w, box_h, font_path=fp,
+                max_size=dynamic_max_size, min_size=dynamic_min_size
+            )
+            font = get_font(fp, font_size)
+
+        # -------- Compute vertical placement --------
         if heights:
             total_text_h = sum(heights)
         else:
             total_text_h = font_size * len(lines)
-        start_y = y1 + (box_h - total_text_h) // 2
 
-        # Draw each line
+        if is_lens and not (box_w < LENS_SMALL_BOX_THRESHOLD or
+                            box_h < LENS_SMALL_BOX_THRESHOLD):
+            # Vertically center within (box + 1px overflow) region
+            outer_h = box_h + LENS_OVERFLOW_PX * 2
+            start_y = (y1 - LENS_OVERFLOW_PX) + (outer_h - total_text_h) // 2
+        else:
+            start_y = y1 + (box_h - total_text_h) // 2
+
+        # -------- Draw each line --------
         current_y = start_y
         for i, line in enumerate(lines):
             if not line:
@@ -2525,7 +2924,14 @@ async def get_translated_image(job_id: str):
                 continue
 
             line_w = draw.textlength(line, font=font)
-            line_x = x1 + (box_w - line_w) / 2
+
+            if is_lens and not (box_w < LENS_SMALL_BOX_THRESHOLD or
+                                box_h < LENS_SMALL_BOX_THRESHOLD):
+                # Horizontally center within (box + 1px overflow) region
+                outer_w = box_w + LENS_OVERFLOW_PX * 2
+                line_x = (x1 - LENS_OVERFLOW_PX) + (outer_w - line_w) / 2
+            else:
+                line_x = x1 + (box_w - line_w) / 2
 
             draw_text_with_config(
                 draw,
@@ -2538,10 +2944,10 @@ async def get_translated_image(job_id: str):
 
             current_y += heights[i] if i < len(heights) else font_size
 
-    # Return the final image
     buf = io.BytesIO()
     out_pil.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
+
 
 # ===========================================================================
 # Main entry point
