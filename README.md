@@ -23,7 +23,6 @@ ________________________________________________________________________________
 
 #  Localhost Setup
 ### Python 3.12 Is Needed for this
-### For V3+ You also need rust: https://rustup.rs
 - 1: Download C++ Buildtools: https://visualstudio.microsoft.com/visual-cpp-build-tools/<sub> Make sure to select c++ buildtools</sub>
 - 2: Download Latest Release: [Latest Version](https://github.com/Kirogii/MangaAMTL/releases/latest)
 - 3: Cd inside
