@@ -284,9 +284,12 @@ async function pushOcrMode(serverUrl, mode) {
   }
 }
 
+// ============================================================================
+// INIT — autoload all cached settings into dropdowns/fields
+// ============================================================================
 document.addEventListener('DOMContentLoaded', async () => {
   chrome.storage.local.get(
-    ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'inpaintMode', 'ocrMode'],
+    ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode'],
     (data) => {
       document.getElementById('serverUrl').value = data.serverUrl || 'http://localhost:7860';
       document.getElementById('ocrLang').value = data.ocrLang || 'ja';
@@ -300,6 +303,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.getElementById('openrouterBox').style.display = modelType === 'openrouter' ? 'block' : 'none';
       if (data.openrouterModel) {
         document.getElementById('openrouterModel').value = data.openrouterModel;
+      }
+      // ★ Load cached API key (displays as •••• because input is type="password")
+      if (data.openrouterApiKey) {
+        document.getElementById('openrouterKey').value = data.openrouterApiKey;
       }
 
       syncInpaintModeFromServer(data.serverUrl);
@@ -340,6 +347,9 @@ document.getElementById('ocrMode').addEventListener('change', (e) => {
   pushOcrMode(serverUrl, e.target.value);
 });
 
+// ============================================================================
+// SET MODEL — pushes to server AND caches the API key
+// ============================================================================
 document.getElementById('setModelBtn').addEventListener('click', async () => {
   const serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
   const model = document.getElementById('openrouterModel').value.trim();
@@ -367,7 +377,8 @@ document.getElementById('setModelBtn').addEventListener('click', async () => {
     });
     const data = await res.json();
     if (res.ok) {
-      chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model });
+      // ★ Cache model + API key so they persist across popup reopens
+      chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model, openrouterApiKey: apiKey });
       statusEl.innerText = `Active: ${data.openrouter_model}`;
     } else {
       statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
@@ -377,6 +388,9 @@ document.getElementById('setModelBtn').addEventListener('click', async () => {
   }
 });
 
+// ============================================================================
+// SAVE SETTINGS — caches EVERYTHING to chrome.storage.local
+// ============================================================================
 document.getElementById('saveBtn').addEventListener('click', async () => {
   const url = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
   const ocrMode = document.getElementById('ocrMode').value;
@@ -386,7 +400,10 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
   const fontWeight = document.getElementById('fontWeightHidden').value;
   const modelType = document.getElementById('modelType').value;
   const inpaintMode = document.getElementById('inpaintMode').value;
+  const openrouterModel = document.getElementById('openrouterModel').value.trim();
+  const openrouterApiKey = document.getElementById('openrouterKey').value.trim();
 
+  // ★ Cache all settings including the API key
   chrome.storage.local.set({
     serverUrl: url,
     ocrMode: ocrMode,
@@ -395,10 +412,12 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
     targetLang: targetLang,
     fontWeight: fontWeight,
     modelType: modelType,
-    inpaintMode: inpaintMode
+    inpaintMode: inpaintMode,
+    openrouterModel: openrouterModel,
+    openrouterApiKey: openrouterApiKey
   }, () => {
     const status = document.getElementById('status');
-    status.innerText = 'Settings saved!';
+    status.innerText = 'Settings saved & cached!';
     setTimeout(() => status.innerText = '', 2000);
   });
 

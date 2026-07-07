@@ -312,18 +312,44 @@ async function pushOcrMode(serverUrl, mode) {
   }
 }
 
+// ============================================================================
+// INIT — autoload ALL cached settings into dropdowns/fields on open
+// ============================================================================
 document.addEventListener('DOMContentLoaded', () => {
-  chrome.storage.local.get(['serverUrl'], (data) => {
-    const url = data.serverUrl || 'http://localhost:7860';
-    document.getElementById('optServerUrl').value = url;
-    initFontFamilyPicker(url);
-    initFontWeightPicker(url);
-    syncModelTypeFromServer(url);
-    syncInpaintModeFromServer(url);
-    syncOcrModeFromServer(url);
-  });
+  chrome.storage.local.get(
+    ['serverUrl', 'modelType', 'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'fontWeight'],
+    (data) => {
+      const url = data.serverUrl || 'http://localhost:7860';
+      document.getElementById('optServerUrl').value = url;
+
+      // ★ Autoload cached dropdown selections
+      if (data.ocrMode) document.getElementById('optOcrMode').value = data.ocrMode;
+      if (data.inpaintMode) document.getElementById('optInpaintMode').value = data.inpaintMode;
+
+      const cachedModelType = data.modelType || 'local';
+      document.getElementById('optModelType').value = cachedModelType;
+      document.getElementById('optOpenrouterRow').style.display = cachedModelType === 'openrouter' ? 'block' : 'none';
+      if (data.openrouterModel) {
+        document.getElementById('optOpenrouterModel').value = data.openrouterModel;
+      }
+      // ★ Load cached API key (displays as •••• because input is type="password")
+      if (data.openrouterApiKey) {
+        document.getElementById('optOpenrouterKey').value = data.openrouterApiKey;
+      }
+
+      initFontFamilyPicker(url);
+      initFontWeightPicker(url);
+      // Server syncs run after cache load — if server is online they keep things in sync
+      syncModelTypeFromServer(url);
+      syncInpaintModeFromServer(url);
+      syncOcrModeFromServer(url);
+    }
+  );
 });
 
+// ============================================================================
+// SAVE URL (individual button, still works)
+// ============================================================================
 document.getElementById('mtSaveUrlBtn').addEventListener('click', () => {
   const url = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
   chrome.storage.local.set({ serverUrl: url }, () => {
@@ -336,6 +362,34 @@ document.getElementById('mtSaveUrlBtn').addEventListener('click', () => {
   syncModelTypeFromServer(url);
   syncInpaintModeFromServer(url);
   syncOcrModeFromServer(url);
+});
+
+// ============================================================================
+// ★ SAVE ALL SETTINGS — caches everything to chrome.storage.local
+// ============================================================================
+document.getElementById('saveAllBtn').addEventListener('click', () => {
+  const url = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
+  const ocrMode = document.getElementById('optOcrMode').value;
+  const modelType = document.getElementById('optModelType').value;
+  const openrouterModel = document.getElementById('optOpenrouterModel').value.trim();
+  const openrouterApiKey = document.getElementById('optOpenrouterKey').value.trim();
+  const inpaintMode = document.getElementById('optInpaintMode').value;
+  const fontWeight = document.getElementById('optFontWeightHidden').value;
+
+  chrome.storage.local.set({
+    serverUrl: url,
+    ocrMode: ocrMode,
+    modelType: modelType,
+    openrouterModel: openrouterModel,
+    openrouterApiKey: openrouterApiKey,
+    inpaintMode: inpaintMode,
+    fontWeight: fontWeight
+  }, () => {
+    const btn = document.getElementById('saveAllBtn');
+    const originalText = btn.innerText;
+    btn.innerText = '✓ Settings Saved & Cached!';
+    setTimeout(() => { btn.innerText = originalText; }, 2000);
+  });
 });
 
 document.getElementById('optModelType').addEventListener('change', (e) => {
@@ -355,6 +409,9 @@ document.getElementById('optModelType').addEventListener('change', (e) => {
   }
 });
 
+// ============================================================================
+// SET MODEL — pushes to server AND caches API key
+// ============================================================================
 document.getElementById('optSetModelBtn').addEventListener('click', async () => {
   const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
   const model = document.getElementById('optOpenrouterModel').value.trim();
@@ -376,7 +433,8 @@ document.getElementById('optSetModelBtn').addEventListener('click', async () => 
     });
     const data = await res.json();
     if (res.ok) {
-      chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model });
+      // ★ Cache model + API key
+      chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model, openrouterApiKey: apiKey });
       statusEl.innerText = `Active: ${data.openrouter_model}`;
     } else {
       statusEl.innerHTML = `<span class="error">Error: ${data.detail}</span>`;
@@ -388,11 +446,13 @@ document.getElementById('optSetModelBtn').addEventListener('click', async () => 
 
 document.getElementById('optInpaintMode').addEventListener('change', (e) => {
   const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
+  chrome.storage.local.set({ inpaintMode: e.target.value });
   pushInpaintMode(serverUrl, e.target.value);
 });
 
 document.getElementById('optOcrMode').addEventListener('change', (e) => {
   const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
+  chrome.storage.local.set({ ocrMode: e.target.value });
   pushOcrMode(serverUrl, e.target.value);
 });
 

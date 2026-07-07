@@ -132,6 +132,39 @@
   `;
   document.head.appendChild(style);
 
+  // ========================================================================
+  // Helper: load all cached settings into the floating popup dropdowns
+  // ========================================================================
+  function loadCachedSettingsIntoPopup() {
+    chrome.storage.local.get(
+      ['targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'openrouterApiKey', 'ocrMode', 'ocrLang'],
+      (data) => {
+        const sel = document.getElementById('mtTargetLangSelect');
+        if (sel && data.targetLang) sel.value = data.targetLang;
+
+        const modelTypeSel = document.getElementById('mtModelTypeSelect');
+        const openrouterRow = document.getElementById('mtOpenrouterRow');
+        if (modelTypeSel) {
+          modelTypeSel.value = data.modelType || 'local';
+          openrouterRow.style.display = modelTypeSel.value === 'openrouter' ? 'block' : 'none';
+        }
+        if (data.openrouterModel) {
+          const orModelInput = document.getElementById('mtOpenrouterModel');
+          if (orModelInput) orModelInput.value = data.openrouterModel;
+        }
+        // Load cached API key (displays as •••• because input is type="password")
+        if (data.openrouterApiKey) {
+          const orKeyInput = document.getElementById('mtOpenrouterKey');
+          if (orKeyInput) orKeyInput.value = data.openrouterApiKey;
+        }
+        const ocrModeSel = document.getElementById('mtOcrModeSelect');
+        if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
+        const ocrLangSel = document.getElementById('mtOcrLangSelect');
+        if (ocrLangSel) ocrLangSel.value = data.ocrLang || 'ja';
+      }
+    );
+  }
+
   function injectUI() {
     // 1. Floating Button
     floatBtn = document.createElement('button');
@@ -223,7 +256,7 @@
           <input type="text" id="mtOpenrouterModel" placeholder="e.g. openai/gpt-4o-mini" style="
             width: 100%; padding: 7px 8px; margin-bottom: 6px; box-sizing: border-box;
             border: 1px solid #555; border-radius: 4px; background: #2a2a3c; color: #e0e0e0; font-size: 12px;">
-          <input type="text" id="mtOpenrouterKey" placeholder="OpenRouter API Key" style="
+          <input type="password" id="mtOpenrouterKey" placeholder="OpenRouter API Key" style="
             width: 100%; padding: 7px 8px; margin-bottom: 6px; box-sizing: border-box;
             border: 1px solid #555; border-radius: 4px; background: #2a2a3c; color: #e0e0e0; font-size: 12px;">
           <button id="mtSetModelBtn" style="
@@ -248,26 +281,8 @@
     `;
     document.body.appendChild(floatPopup);
 
-    // Restore saved settings into the dropdowns
-    chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'ocrMode', 'ocrLang'], (data) => {
-      const sel = document.getElementById('mtTargetLangSelect');
-      if (sel && data.targetLang) sel.value = data.targetLang;
-
-      const modelTypeSel = document.getElementById('mtModelTypeSelect');
-      const openrouterRow = document.getElementById('mtOpenrouterRow');
-      if (modelTypeSel) {
-        modelTypeSel.value = data.modelType || 'local';
-        openrouterRow.style.display = modelTypeSel.value === 'openrouter' ? 'block' : 'none';
-      }
-      if (data.openrouterModel) {
-        const orModelInput = document.getElementById('mtOpenrouterModel');
-        if (orModelInput) orModelInput.value = data.openrouterModel;
-      }
-      const ocrModeSel = document.getElementById('mtOcrModeSelect');
-      if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
-      const ocrLangSel = document.getElementById('mtOcrLangSelect');
-      if (ocrLangSel) ocrLangSel.value = data.ocrLang || 'ja';
-    });
+    // Restore saved settings into the dropdowns (autoload from cache)
+    loadCachedSettingsIntoPopup();
 
     initFontWeightPicker();
 
@@ -277,7 +292,7 @@
       chrome.storage.local.set({ modelType: e.target.value });
     };
 
-    // Set OpenRouter model on the server
+    // Set OpenRouter model on the server — also caches the API key
     document.getElementById('mtSetModelBtn').onclick = async () => {
       const statusEl = document.getElementById('mtModelStatus');
       const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
@@ -299,7 +314,8 @@
         });
         const data = await res.json();
         if (res.ok) {
-          chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model });
+          // Cache model + API key so they persist across popup reopens
+          chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model, openrouterApiKey: apiKey });
           statusEl.innerText = `Active: ${data.openrouter_model}`;
         } else {
           statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
@@ -378,26 +394,8 @@
     if (floatPopup.style.display === 'block') {
       floatPopup.style.display = 'none';
     } else {
-      // Re-sync dropdowns with storage every time popup opens
-      chrome.storage.local.get(['targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'ocrMode', 'ocrLang'], (data) => {
-        const sel = document.getElementById('mtTargetLangSelect');
-        if (sel && data.targetLang) sel.value = data.targetLang;
-
-        const modelTypeSel = document.getElementById('mtModelTypeSelect');
-        const openrouterRow = document.getElementById('mtOpenrouterRow');
-        if (modelTypeSel) {
-          modelTypeSel.value = data.modelType || 'local';
-          openrouterRow.style.display = modelTypeSel.value === 'openrouter' ? 'block' : 'none';
-        }
-        if (data.openrouterModel) {
-          const orModelInput = document.getElementById('mtOpenrouterModel');
-          if (orModelInput) orModelInput.value = data.openrouterModel;
-        }
-        const ocrModeSel = document.getElementById('mtOcrModeSelect');
-        if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
-        const ocrLangSel = document.getElementById('mtOcrLangSelect');
-        if (ocrLangSel) ocrLangSel.value = data.ocrLang || 'ja';
-      });
+      // Re-sync dropdowns + API key with cache every time popup opens
+      loadCachedSettingsIntoPopup();
       refreshFontWeightSelection();
       floatPopup.style.display = 'block';
     }
