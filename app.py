@@ -1001,14 +1001,51 @@ async def get_ocr_results(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Di
 # ===========================================================================
 LANG_MAP = {
     "en": "English", "ja": "Japanese", "ko": "Korean",
-    "id": "Indonesian", "ru": "Russian", "es": "Spanish", "cz": "Chinese"
+    "id": "Indonesian", "ru": "Russian", "es": "Spanish", 
+    "zh": "Chinese", "cz": "Chinese"  # cz often mistakenly used for Chinese, support both
 }
 
+SRC_LANG_MAP = {
+    "ja": "Japanese", "ko": "Korean", "en": "English", "zh": "Chinese",
+    "ru": "Russian", "es": "Spanish", "id": "Indonesian", "cz": "Chinese"
+}
+
+def _script_hint(lang_name: str) -> str:
+    """Provides explicit instructions for CJK languages to prevent romanization."""
+    if lang_name in ("Japanese", "Korean", "Chinese"):
+        return (f"Write the translation using the native {lang_name} writing system "
+                f"(e.g. kanji/kana for Japanese, hangul for Korean, hanzi for Chinese). "
+                f"Do NOT romanize. Do NOT transliterate.")
+    return ""
+
 SYSTEM_PROMPT = (
-    "You are a manga translation engine. "
-    "Translate the user's text into {lang}. "
-    "Output ONLY the {lang} translation, with no explanations, no notes, and no quotes."
+    "You are a professional manga translator. "
+    "Translate the user's text from its original language into {lang}. "
+    "Output ONLY the {lang} translation — no source text, no notes, no quotes. "
+    "{script_hint}"
 )
+
+def _looks_like_target(trans: str, target_lang: str) -> bool:
+    """Sanity check that the output matches the expected target language script."""
+    if not trans:
+        return False
+    # Normalize cz to zh
+    lang_code = "zh" if target_lang == "cz" else target_lang
+    
+    # Count CJK characters (Hiragana, Katakana, CJK Unified Ideographs, Hangul, Fullwidth)
+    cjk = sum(1 for c in trans if 0x3000 <= ord(c) <= 0x9FFF 
+              or 0xAC00 <= ord(c) <= 0xD7AF 
+              or 0xFF00 <= ord(c) <= 0xFFEF)
+    
+    # If target is Latin/Cyrillic script, and text is mostly CJK, it's likely a failed translation (echoing source)
+    if lang_code in ("en", "es", "id", "ru") and cjk > len(trans) * 0.3:
+        return False
+        
+    # If target is CJK, and there are NO CJK characters, it's likely romanized or failed
+    if lang_code in ("ja", "ko", "zh") and cjk == 0:
+        return False
+        
+    return True
 
 def get_qwen():
     global _global_qwen, _current_qwen_path
@@ -1054,18 +1091,56 @@ def switch_qwen_model(repo_id: str, filename: Optional[str] = None):
     logging.info(f"[Qwen] Switched to {repo_id}/{filename}, preloading...")
     get_qwen()
 
-def qwen_translate(text: str, target_lang: str = "en") -> str:
+
+def _retry_translate_single(text: str, lang_name: str, src_lang_name: str, llm) -> str:
+    """Retry translation with a much stronger prompt that explicitly forbids source language."""
+    retry_prompt = (
+        f"You MUST translate this text into {lang_name}. "
+        f"The source is {src_lang_name}. "
+        f"DO NOT output any {src_lang_name} text. "
+        f"Output ONLY {lang_name} text, nothing else. No explanations."
+    )
+    retry_user = f"[Source: {src_lang_name}] -> [Target: {lang_name}]\n{text}"
+    msgs = [
+        {"role": "system", "content": retry_prompt},
+        {"role": "user", "content": retry_user},
+    ]
+    try:
+        with _llm_lock:
+            out = llm.create_chat_completion(
+                messages=msgs,
+                max_tokens=max(64, min(256, len(text) + 32)),
+                temperature=0.1,
+                top_p=0.95,
+                stop=["<|im_end|>", "</s>"],
+            )
+        raw = out["choices"][0]["message"]["content"].strip()
+        for tok in ("<|im_start|>", "<|im_end|>", "</s>"):
+            raw = raw.replace(tok, "")
+        # Strip common prefixes
+        for prefix in ("Translation:", "Translated:", "Output:", f"{lang_name}:", f"{lang_name} translation:"):
+            if raw.lower().startswith(prefix.lower()):
+                raw = raw[len(prefix):].strip()
+        return raw
+    except Exception:
+        return text  # fallback: return original
+def qwen_translate(text: str, target_lang: str = "en", ocr_lang: str = "ja") -> str:
     text = text.strip()
     if not text:
         return ""
     lang_name = LANG_MAP.get(target_lang, "English")
-    # FIX: Increased max_tokens to prevent cutoffs on small models that add fluff text
+    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
+    
     max_tok = max(64, min(256, len(text) + 32))
     logging.info(f"[LLM] Starting translation for: '{text[:40]}' -> {lang_name}")
     llm = get_qwen()
+    
+    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name))
+    user_prompt = f"[Source language: {src_lang_name}]\n{text}"
+    
     msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(lang=lang_name)},
-        {"role": "user",   "content": text},
+        {"role": "system", "content": sys_prompt},
+        {"role": "user",   "content": user_prompt},
     ]
     try:
         with _llm_lock:
@@ -1078,35 +1153,43 @@ def qwen_translate(text: str, target_lang: str = "en") -> str:
             if tok in raw:
                 raw = raw.replace(tok, "")
                 
-        # FIX: Clean up common prefixes small models use despite instructions
+        # Clean up common prefixes small models use despite instructions
         for prefix in ("Translation:", "Translated:", "Output:", f"{lang_name}:", f"{lang_name} translation:"):
             if raw.lower().startswith(prefix.lower()):
                 raw = raw[len(prefix):].strip()
                 
+        # Validate translation looks like target language
+        if not _looks_like_target(raw, target_lang):
+            logging.warning(f"[LLM] Output appears to be wrong language ({target_lang}), retrying with stronger constraints...")
+            raw = _retry_translate_single(text, lang_name, src_lang_name, llm)
+            if not _looks_like_target(raw, target_lang):
+                logging.error(f"[LLM] Retry also failed for target={target_lang}, returning as-is")
         logging.info(f"[LLM] Translated to: '{raw[:40]}'")
         return clean_text_for_font(raw)
     except Exception as e:
         logging.error(f"[LLM] Translation failed: {e}")
         return ""
 
-def qwen_translate_batch(texts: List[str], target_lang: str = "en") -> List[str]:
+def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja") -> List[str]:
     """Translate a list of texts in a SINGLE LLM call using a numbered list."""
     indexed_texts = [(i, t.strip()) for i, t in enumerate(texts) if t.strip()]
     if not indexed_texts:
         return [""] * len(texts)
 
     lang_name = LANG_MAP.get(target_lang, "English")
-    prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (_, text) in enumerate(indexed_texts)]
-    batch_text = "\n".join(prompt_lines)
+    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
 
-    # FIX: Simplified prompt to be more robust for 0.8B models
+    prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (_, text) in enumerate(indexed_texts)]
+    batch_text = f"[Source language: {src_lang_name}]\n" + "\n".join(prompt_lines)
+
     batch_system_prompt = (
-        f"Translate the following numbered texts into {lang_name}. "
-        "Output only the translations, keeping the exact same numbers. No extra text."
-    )
+        f"You are a professional manga translator. "
+        f"Translate each numbered line from {src_lang_name} into {lang_name}. "
+        f"Output the same numbered list, containing ONLY the {lang_name} translations. "
+        f"Do not include the original text. No explanations. {_script_hint(lang_name)}"
+    ).strip()
 
     total_chars = sum(len(t) for _, t in indexed_texts)
-    # FIX: Increased token limit generously
     max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 32)))
 
     llm = get_qwen()
@@ -1135,22 +1218,32 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en") -> List[str]
                 trans = match.group(2).strip()
                 if 0 <= num < len(indexed_texts):
                     orig_idx = indexed_texts[num][0]
+                    # Validate this translation
+                    if not _looks_like_target(trans, target_lang):
+                        logging.warning(f"[LLM Batch] Box {num+1} appears to be wrong language, retrying individually...")
+                        trans = qwen_translate(text, target_lang, ocr_lang)
                     results[orig_idx] = clean_text_for_font(trans)
                     matched_any = True
                     
-        # FIX: Fallback if model ignored numbers and just outputted translations line by line
+        # Fallback if model ignored numbers and just outputted translations line by line
         if not matched_any and len(parsed_lines) == len(indexed_texts):
             logging.warning("[LLM Batch] Model didn't use numbers, mapping line-by-line...")
             for i, line in enumerate(parsed_lines):
                 orig_idx = indexed_texts[i][0]
-                results[orig_idx] = clean_text_for_font(line)
+                # Validate line-by-line fallback
+                if not _looks_like_target(line, target_lang):
+                    logging.warning(f"[LLM Batch Fallback] Line {i+1} appears to be wrong language, retrying individually...")
+                    single_result = qwen_translate(indexed_texts[i][1], target_lang, ocr_lang)
+                    results[orig_idx] = clean_text_for_font(single_result)
+                else:
+                    results[orig_idx] = clean_text_for_font(line)
             matched_any = True
 
-        # Final fallback for any missing items
+        # Final fallback for any missing items OR items that came back in the wrong script
         for num, (orig_idx, text) in enumerate(indexed_texts):
-            if not results[orig_idx]:
-                logging.warning(f"[LLM Batch] Box {num+1} missed in batch, retrying individually...")
-                results[orig_idx] = qwen_translate(text, target_lang)
+            if not results[orig_idx] or not _looks_like_target(results[orig_idx], target_lang):
+                logging.warning(f"[LLM Batch] Box {num+1} missed or wrong script, retrying individually...")
+                results[orig_idx] = qwen_translate(text, target_lang, ocr_lang)
 
         return results
     except Exception as e:
@@ -1161,7 +1254,7 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en") -> List[str]
 # OpenRouter Translation
 # ===========================================================================
 
-async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", max_retries: int = 5) -> List[str]:
+async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja", max_retries: int = 5) -> List[str]:
     import aiohttp
     import random
 
@@ -1178,19 +1271,18 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
         return [""] * len(texts)
 
     lang_name = LANG_MAP.get(target_lang, "English")
+    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
     total_chars = sum(len(t) for _, t in indexed_texts)
     max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 20)))
 
-    # Sanitize input: replace newlines with spaces so the LLM list doesn't break
     prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (orig_i, text) in enumerate(indexed_texts)]
-    batch_text = "\n".join(prompt_lines)
+    batch_text = f"[Source language: {src_lang_name}]\n" + "\n".join(prompt_lines)
 
     batch_system_prompt = (
-        f"You are a manga translation engine. Translate the user's numbered list of texts into {lang_name}. "
-        "Output ONLY the translated list, one per line, keeping the exact same numbers. "
-        "Do not include the original text. "
-        "No explanations, no notes, no quotes."
-    )
+        f"You are a professional manga translator. Translate each numbered line from {src_lang_name} into {lang_name}. "
+        f"Output ONLY the translated list, one per line, keeping the exact same numbers. "
+        f"Do not include the original text. No explanations, no notes, no quotes. {_script_hint(lang_name)}"
+    ).strip()
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1264,13 +1356,20 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                                 orig_idx = indexed_texts[num][0]
                                 results[orig_idx] = clean_text_for_font(trans)
 
-                    success_count = sum(1 for r in results if r)
-                    logging.info(f"[OpenRouter Batch] Parsed {success_count}/{len(indexed_texts)} translations.")
+                    # Validate script and clear failures so individual fallback catches them
+                    valid_count = 0
+                    for i, r in enumerate(results):
+                        if r and _looks_like_target(r, target_lang):
+                            valid_count += 1
+                        else:
+                            results[i] = "" 
+
+                    logging.info(f"[OpenRouter Batch] Parsed {valid_count}/{len(indexed_texts)} valid translations.")
                     
-                    if success_count > 0:
+                    if valid_count > 0:
                         return results
                     else:
-                        logging.warning(f"[OpenRouter Batch] Failed to parse any numbered lines from response.")
+                        logging.warning(f"[OpenRouter Batch] Failed to parse any valid numbered lines from response.")
                         continue
 
         except asyncio.TimeoutError:
@@ -1283,7 +1382,7 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
     logging.error(f"[OpenRouter Batch] FAILED after {max_retries} retries. Falling back to sequential.")
     return [""] * len(texts)
 
-async def openrouter_translate(text: str, target_lang: str = "en", max_retries: int = 5) -> str:
+async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str = "ja", max_retries: int = 5) -> str:
     import aiohttp
     import random
 
@@ -1299,9 +1398,13 @@ async def openrouter_translate(text: str, target_lang: str = "en", max_retries: 
         return ""
 
     lang_name = LANG_MAP.get(target_lang, "English")
+    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
     max_tok = max(16, min(96, len(text) + 16))
 
     logging.info(f"[OpenRouter] Translating '{text[:40]}' -> {lang_name} using {model}")
+
+    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name))
+    user_prompt = f"[Source language: {src_lang_name}]\n{text}"
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1313,8 +1416,8 @@ async def openrouter_translate(text: str, target_lang: str = "en", max_retries: 
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT.format(lang=lang_name)},
-            {"role": "user", "content": text},
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "max_tokens": max_tok,
         "temperature": 0.2,
@@ -1380,14 +1483,14 @@ async def openrouter_translate(text: str, target_lang: str = "en", max_retries: 
     logging.error(f"[OpenRouter] FAILED after {max_retries} retries for: '{text[:40]}'")
     return ""
 
-def translate_with_current_backend(text: str, target_lang: str = "en") -> str:
+def translate_with_current_backend(text: str, target_lang: str = "en", ocr_lang: str = "ja") -> str:
     with _model_type_lock:
         model_type = _current_model_type
     if model_type == "openrouter":
         try:
             loop = asyncio.new_event_loop()
             try:
-                result = loop.run_until_complete(openrouter_translate(text, target_lang))
+                result = loop.run_until_complete(openrouter_translate(text, target_lang, ocr_lang))
                 return result
             finally:
                 loop.close()
@@ -1395,16 +1498,16 @@ def translate_with_current_backend(text: str, target_lang: str = "en") -> str:
             logging.error(f"[OpenRouter] Failed to run async translation: {e}")
             return ""
     else:
-        return qwen_translate(text, target_lang)
+        return qwen_translate(text, target_lang, ocr_lang)
 
-async def translate_with_current_backend_async(text: str, target_lang: str = "en") -> str:
+async def translate_with_current_backend_async(text: str, target_lang: str = "en", ocr_lang: str = "ja") -> str:
     with _model_type_lock:
         model_type = _current_model_type
     if model_type == "openrouter":
-        return await openrouter_translate(text, target_lang)
+        return await openrouter_translate(text, target_lang, ocr_lang)
     else:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_llm_executor, qwen_translate, text, target_lang)
+        return await loop.run_in_executor(_llm_executor, qwen_translate, text, target_lang, ocr_lang)
 
 # ===========================================================================
 # Inpainting (SimpleLama + cv2 fallback) — with Low/High mode support
@@ -1731,26 +1834,7 @@ def build_inpaint_mask(img_shape: Tuple[int, int, int],
 # ===========================================================================
 def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int, int, int, int]
                               ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
-    """Detect text (ink) and background (outline) colors within a bbox.
-
-    Strategy:
-      1. Slightly expand the bbox to capture surrounding background pixels
-         for a more representative background sample.
-      2. Cluster pixels in LAB color space using k-means (k=3) to identify
-         dominant color groups (background, text, anti-aliasing/transition).
-      3. Background = the largest cluster.
-      4. Text = the cluster with the greatest perceptual distance from the
-         background that has at least 4% of the pixels.
-      5. Use per-cluster MEDIAN color (robust to outliers) instead of mean.
-      6. Only "snap" to pure black/white when colors are extremely close to
-         the extremes (<=20 or >=235), avoiding premature binarization that
-         causes inconsistent black/white flipping between similar regions.
-      7. If final text/bg contrast is still too low, force the text to the
-         opposite extreme of the background luminance — but only as a last
-         resort.
-
-    Returns (text_rgb, bg_rgb) as 0-255 RGB tuples.
-    """
+    """Detect text (ink) and background (outline) colors within a bbox."""
     x1, y1, x2, y2 = bbox
     h, w = img_bgr.shape[:2]
 
@@ -1832,7 +1916,6 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int, int, int, in
         # --- Fallback: Otsu threshold on luminance ---
         gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Border sampling decides which side is background
         if rh >= 2 and rw >= 2:
             border = np.concatenate([
                 gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]
@@ -1841,9 +1924,9 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int, int, int, in
             border = gray.flatten()
         border_mean = float(border.mean()) if border.size else float(gray.mean())
         if border_mean > 127:
-            text_sel = (otsu.flatten() == 0)   # light bg -> dark text
+            text_sel = (otsu.flatten() == 0)
         else:
-            text_sel = (otsu.flatten() != 0)   # dark bg  -> light text
+            text_sel = (otsu.flatten() != 0)
         if int(text_sel.sum()) > 0:
             text_bgr = np.median(pixels_bgr[text_sel], axis=0)
         else:
@@ -1882,17 +1965,7 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int, int, int, in
 def detect_text_colors_batch(img_bgr: np.ndarray,
                              bboxes: List[Tuple[int, int, int, int]]
                              ) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
-    """Detect text/bg colors for a list of bboxes WITH global consistency.
-
-    Two passes:
-      1. Run detect_text_and_bg_colors on each box independently.
-      2. Tally light-text vs dark-text votes across all boxes. If there is a
-         strong majority (>= 2x the other), force the minority boxes to flip
-         to the majority polarity. This is what fixes "same region, half
-         white / half black text" — visually similar boxes now agree.
-
-    Returns a list of (text_rgb, bg_rgb) tuples aligned with `bboxes`.
-    """
+    """Detect text/bg colors for a list of bboxes WITH global consistency."""
     if not bboxes:
         return []
 
@@ -1920,8 +1993,6 @@ def detect_text_colors_batch(img_bgr: np.ndarray,
     if total_votes == 0:
         return results
 
-    # Require a 2:1 majority before forcing flips — protects mixed scenes
-    # (e.g. light text in a dark bubble AND dark text on a light sign).
     force_light = light_votes >= 2 * dark_votes and light_votes >= 2
     force_dark = dark_votes >= 2 * light_votes and dark_votes >= 2
 
@@ -1937,8 +2008,6 @@ def detect_text_colors_batch(img_bgr: np.ndarray,
             text_lum = (text_rgb[0] + text_rgb[1] + text_rgb[2]) / 3.0
             bg_lum = (bg_rgb[0] + bg_rgb[1] + bg_rgb[2]) / 3.0
             if text_lum <= bg_lum:
-                # Flip to light text. Use the actual detected bg color as outline
-                # if it's dark enough; otherwise fall back to pure black outline.
                 outline = bg_rgb if bg_lum < 90 else (0, 0, 0)
                 final_results.append(((255, 255, 255), outline))
             else:
@@ -2697,7 +2766,7 @@ async def _process_job(job_id: str):
 
         if model_type == "openrouter":
             logging.info(f"[Job {job_id}] Using OpenRouter BATCH strategy for {len(texts_to_translate)} boxes.")
-            batch_results = await openrouter_translate_batch(texts_to_translate, target_lang)
+            batch_results = await openrouter_translate_batch(texts_to_translate, target_lang, ocr_lang)
 
             needs_sequential_fallback = not any(batch_results)
 
@@ -2707,7 +2776,7 @@ async def _process_job(job_id: str):
                     if not text.strip():
                         translations.append({"text": text, "translation": "", "bbox": ocr_results[idx]["bbox"]})
                         continue
-                    translated = await openrouter_translate(text, target_lang)
+                    translated = await openrouter_translate(text, target_lang, ocr_lang)
                     await asyncio.sleep(1.0)
                     translations.append({
                         "text": text,
@@ -2719,7 +2788,7 @@ async def _process_job(job_id: str):
                     translated = batch_results[idx]
                     if not translated and text.strip():
                         logging.warning(f"[Job {job_id}] Box {idx+1} missed in batch, retrying individually...")
-                        translated = await openrouter_translate(text, target_lang)
+                        translated = await openrouter_translate(text, target_lang, ocr_lang)
                         await asyncio.sleep(1.0)
 
                     translations.append({
@@ -2731,7 +2800,7 @@ async def _process_job(job_id: str):
             # --- BATCH STRATEGY FOR LOCAL GGUF ---
             logging.info(f"[Job {job_id}] Using Local BATCH strategy for {len(texts_to_translate)} boxes.")
             loop = asyncio.get_event_loop()
-            batch_results = await loop.run_in_executor(_llm_executor, qwen_translate_batch, texts_to_translate, target_lang)
+            batch_results = await loop.run_in_executor(_llm_executor, qwen_translate_batch, texts_to_translate, target_lang, ocr_lang)
 
             for idx, text in enumerate(texts_to_translate):
                 translations.append({
@@ -2838,17 +2907,11 @@ async def get_translated_image(job_id: str):
         fp = str(_current_font_path)
 
     # --- Detect colors for ALL boxes at once with global polarity voting ---
-    # This ensures visually similar regions (e.g. multiple boxes inside one
-    # speech bubble) get the same text color instead of flipping black/white.
     all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
     all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
     color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
 
     # ----- Lens-specific text sizing rules -----
-    # Lens bboxes are tight around text, so we let the rendered text
-    # slightly overflow by 1px on every side, and we force a readable
-    # minimum size for very small boxes (which would otherwise render
-    # as blurry tiny text).
     LENS_OVERFLOW_PX          = 1   # text may exceed box by 1px each side
     LENS_SMALL_BOX_THRESHOLD  = 24  # box dim below this => "really small"
     LENS_SMALL_READABLE_SIZE  = 14  # forced readable font size for tiny boxes
@@ -2870,10 +2933,8 @@ async def get_translated_image(job_id: str):
                             box_h < LENS_SMALL_BOX_THRESHOLD)
 
             if really_small:
-                # Force a small-but-readable size and let it overflow the box.
                 font_size = LENS_SMALL_READABLE_SIZE
                 font = get_font(fp, font_size)
-                # Allow wrapping if the text is long, but also allow overflow.
                 lines = wrap_text(draw, text, font,
                                   max_width=max(box_w, font_size * 3),
                                   allow_break=True, is_vertical=False)
@@ -2881,7 +2942,6 @@ async def get_translated_image(job_id: str):
                     lines = [text]
                 heights, _, _ = _measure_block(draw, lines, font)
             else:
-                # Normal Lens box: size text so it fills box + 1px overflow each side.
                 fit_w = box_w + LENS_OVERFLOW_PX * 2
                 fit_h = box_h + LENS_OVERFLOW_PX * 2
                 dynamic_max_size = max(96, min(int(fit_h * 0.98),
@@ -2893,7 +2953,6 @@ async def get_translated_image(job_id: str):
                 )
                 font = get_font(fp, font_size)
         else:
-            # ----- Non-Lens OCR: original behavior -----
             dynamic_max_size = max(96, min(int(box_h * 0.95), int(box_w * 0.85), 300))
             dynamic_min_size = max(8, min(int(box_h * 0.15), 16))
             font_size, lines, heights = fit_font_and_wrap(
@@ -2910,7 +2969,6 @@ async def get_translated_image(job_id: str):
 
         if is_lens and not (box_w < LENS_SMALL_BOX_THRESHOLD or
                             box_h < LENS_SMALL_BOX_THRESHOLD):
-            # Vertically center within (box + 1px overflow) region
             outer_h = box_h + LENS_OVERFLOW_PX * 2
             start_y = (y1 - LENS_OVERFLOW_PX) + (outer_h - total_text_h) // 2
         else:
@@ -2927,7 +2985,6 @@ async def get_translated_image(job_id: str):
 
             if is_lens and not (box_w < LENS_SMALL_BOX_THRESHOLD or
                                 box_h < LENS_SMALL_BOX_THRESHOLD):
-                # Horizontally center within (box + 1px overflow) region
                 outer_w = box_w + LENS_OVERFLOW_PX * 2
                 line_x = (x1 - LENS_OVERFLOW_PX) + (outer_w - line_w) / 2
             else:
