@@ -1,30 +1,39 @@
-#      **           MangaAMTL is an open-source manga translation tool mainly for japanese manga**
-Take note this is mostly a project for myself so if theres any bugs it will be fixed in the next version so im not fixing a bunch of problems (Although im testing the installation/Usage of the program fully so there shouldnt be too many problems for you
-### V3.1.0 Translation Showcase (Text size is the only issue in typesetting currently)
-<p align="center">
-  <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/English2.png?raw=true" alt="Preview1" width="45%" />
-  <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/Raw.png?raw=true" alt="Preview2" width="45%" />
-</p>
+<div align="center">
 
-> [!WARNING]  
+<img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/English2.png?raw=true" alt="Preview1" width="45%" />
+<img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/Raw.png?raw=true" alt="Preview2" width="45%" />
+
+<br>
+
+<b>V3.1.0 Translation Showcase</b>
+<i>(Text size is the only issue in typesetting currently)</i>
+# MangaAMTL
+### Note: On First launch this installs multiple gbs of models
+</div>
+
+> [!WARNING]
 > Do not run this for production unless you know what you are doing (If you do not know what that is do not portforward this for other people)
 
 > [!CAUTION]
 > This is in alpha testing bugs are to be expected
+
+<div align="center">
+
 # Tree Guide
 - [Installation+Setup (For Localhost)](#LocalhostSetup)
-- [Huggingface Setup](#HuggingfaceSetup)
 - [Credits](#Credits)
 - [Features](#Features)
 - [Problems+Solutions](#Problems)
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
+</div>
 
-#  Localhost Setup
-### Python 3.12 Is Needed for this
-- 1: Download C++ Buildtools: https://visualstudio.microsoft.com/visual-cpp-build-tools/<sub> Make sure to select c++ buildtools</sub>
-- 2: Download Latest Release: [Latest Version](https://github.com/Kirogii/MangaAMTL/releases/latest)
+<div align="center">
+
+# Localhost Setup
+Python 3.12 Is Needed for this
+</div>
+
+- Download C++ Buildtools: https://visualstudio.microsoft.com/visual-cpp-build-tools/ <sub>(Make sure to select c++ buildtools)</sub>
+- Download Latest Release: [Latest Version](https://github.com/Kirogii/MangaAMTL/releases/latest)
 - 3: Cd inside
 `cd MangaAMTL`
 - 4: Install dependencies
@@ -34,17 +43,13 @@ ________________________________________________________________________________
 
 ` The application will start on:
  http://localhost:7860`
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
+</div>
 
-# Huggingface Setup (Dead for now)
-- Clone the space https://huggingface.co/spaces/Kirogii/Manga_AMTL
+<div align="center">
 
+</div>
 
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
+<div align="center">
 
 
 # Credits
@@ -52,9 +57,9 @@ ________________________________________________________________________________
 - https://huggingface.co/sharky172/manga-light-colorizer/
 - https://huggingface.co/Kirogii/Yolo-Manga_Textbox-Region_Detect/
 - https://huggingface.co/zai-org/GLM-OCR
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
+</div>
+
+<div align="center">
 
 # Features
 - Multi language translation from source support (Chinese,Korean,Japanese,Russian,Indonesian,English)
@@ -62,9 +67,9 @@ ________________________________________________________________________________
 - Colorizing Support
 - If your looking for logs they are all inside http://localhost:7860/console
   
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
-_________________________________________________________________________________________________________________________________________________________
+</div>
+
+<div align="center">
 
 # Problems
 - Llama-Cpp-Python erroring (ON Cuda version): Install: https://developer.nvidia.com/cuda-downloads (Then rerun the install command from above)
