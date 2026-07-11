@@ -7,7 +7,7 @@ Take note this is mostly a project for myself so if theres any bugs it will be f
 </p>
 
 > [!WARNING]  
-> Do not run this for production unless you know what you are doing (If you do not know what that is do not portforward this)
+> Do not run this for production unless you know what you are doing (If you do not know what that is do not portforward this for other people)
 
 > [!CAUTION]
 > This is in alpha testing bugs are to be expected
