@@ -670,8 +670,7 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
     h, w = img_bgr.shape[:2]
     yolo = get_yolo()
     logging.info(f"[OCR] Running YOLO text detection on {w}x{h} image...")
-    use_half = has_cuda()
-    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device(), half=use_half)
+    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
     if not results:
         return []
     r = results[0]
@@ -687,11 +686,8 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
         if box_area > 0.8 * img_area or box_area < 100:
             continue
         boxes.append((x1, y1, x2, y2))
-        
-    logging.info(f"[Hayai OCR] Found {len(boxes)} valid text boxes. Running OCR sequentially...")
     if not boxes:
         return []
-        
     def _ocr_one(bbox):
         x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
@@ -700,10 +696,7 @@ def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
         except Exception as e:
             logging.error(f"Hayai OCR failed on {bbox}: {e}")
             return bbox, ""
-            
-    # FIX: Removed _OCR_BOX_EXECUTOR.map to prevent thread pool deadlock
-    for bbox in boxes:
-        bbox, text = _ocr_one(bbox)
+    for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
         out.append({"text": text, "bbox": bbox})
     return out
 
@@ -738,8 +731,7 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
     h, w = img_bgr.shape[:2]
     yolo = get_yolo()
     logging.info(f"[GLM OCR] Running YOLO text detection on {w}x{h} image...")
-    use_half = has_cuda()
-    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device(), half=use_half)
+    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
     if not results:
         return []
     r = results[0]
@@ -755,8 +747,7 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         boxes.append((x1, y1, x2, y2))
     if not boxes:
         return []
-    logging.info(f"[GLM OCR] Found {len(boxes)} valid text boxes. Running GLM OCR sequentially...")
-    
+    logging.info(f"[GLM OCR] Found {len(boxes)} valid text boxes. Running GLM OCR on each...")
     TARGET_MAX = 1024
     TARGET_MIN = 384
     def _ocr_one(bbox):
@@ -793,15 +784,12 @@ def glm_ocr_korean(pil_img: Image.Image) -> List[Dict[str, Any]]:
         except Exception as e:
             logging.error(f"GLM OCR failed on {bbox}: {e}")
             return bbox, ""
-            
     out = []
-    # FIX: Removed _OCR_BOX_EXECUTOR.map to prevent thread pool deadlock
-    for bbox in boxes:
-        bbox, text = _ocr_one(bbox)
+    for bbox, text in _OCR_BOX_EXECUTOR.map(_ocr_one, boxes):
         if text:
             out.append({"text": text, "bbox": bbox})
     return out
-
+    
 # ===========================================================================
 # Google Lens OCR (chrome-lens-py)
 # ===========================================================================
@@ -853,60 +841,68 @@ def _geometry_to_bbox(geometry, img_w, img_h):
 
 def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Merges OCR blocks that are physically close to each other.
-    Expands bounding boxes horizontally by 50% of their width to catch side-by-side text.
-    Expands bounding boxes vertically by a smaller margin (20% of height) to prevent 
-    merging distinct speech bubbles stacked on top of each other.
+
+    Text is combined into one string for translation, but ALL original bounding
+    boxes are preserved in a "bboxes" list so that inpainting and text rendering
+    maintain each box's original position/height instead of creating one large
+    merged region centered between the original boxes.
+
+    Expansion rules (unchanged from before):
+    - Horizontally: 50% of box width on each side (catches side-by-side text)
+    - Vertically: 20% of height or at least 10px (prevents over-merging
+      distinct speech bubbles stacked vertically)
     """
     if len(blocks) <= 1:
+        # Ensure every block has a "bboxes" list for downstream consistency
+        for b in blocks:
+            if "bboxes" not in b:
+                b["bboxes"] = [b["bbox"]]
         return blocks
-        
+
     parent = list(range(len(blocks)))
-    
+
     def find(i):
         if parent[i] == i:
             return i
         parent[i] = find(parent[i])
         return parent[i]
-        
+
     def union(i, j):
         root_i = find(i)
         root_j = find(j)
         if root_i != root_j:
             parent[root_i] = root_j
-            
+
     for i in range(len(blocks)):
         x1_i, y1_i, x2_i, y2_i = blocks[i]["bbox"]
         w_i = x2_i - x1_i
         h_i = y2_i - y1_i
-        
-        # Expand horizontally by 50% of width
-        # Expand vertically by 20% of height (or at least 10px) - reduces vertical over-merging
+
         v_pad_i = max(10, h_i * 0.2)
         exp_x1_i = x1_i - w_i * 0.5
         exp_y1_i = y1_i - v_pad_i
         exp_x2_i = x2_i + w_i * 0.5
         exp_y2_i = y2_i + v_pad_i
-        
+
         for j in range(i + 1, len(blocks)):
             x1_j, y1_j, x2_j, y2_j = blocks[j]["bbox"]
             w_j = x2_j - x1_j
             h_j = y2_j - y1_j
-            
+
             v_pad_j = max(10, h_j * 0.2)
             exp_x1_j = x1_j - w_j * 0.5
             exp_y1_j = y1_j - v_pad_j
             exp_x2_j = x2_j + w_j * 0.5
             exp_y2_j = y2_j + v_pad_j
-            
-            # Check intersection of expanded boxes
+
             ix1 = max(exp_x1_i, exp_x1_j)
             iy1 = max(exp_y1_i, exp_y1_j)
             ix2 = min(exp_x2_i, exp_x2_j)
             iy2 = min(exp_y2_i, exp_y2_j)
-            
+
             if ix1 < ix2 and iy1 < iy2:
                 union(i, j)
-                
+
     # Group blocks by their root parent
     groups = {}
     for i in range(len(blocks)):
@@ -914,25 +910,31 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if root not in groups:
             groups[root] = []
         groups[root].append(blocks[i])
-        
+
     merged_blocks = []
     for group in groups.values():
-        # Combined bounding box
+        # Union bounding box — kept for backward compatibility / color detection
         x1 = min(b["bbox"][0] for b in group)
         y1 = min(b["bbox"][1] for b in group)
         x2 = max(b["bbox"][2] for b in group)
         y2 = max(b["bbox"][3] for b in group)
-        
+
+        # ── KEY CHANGE: preserve ALL original bounding boxes ──
+        # Instead of collapsing into one merged box, keep every original
+        # box so inpainting and text rendering stay in-place.
+        original_bboxes = [b["bbox"] for b in group]
+
         # Sort texts in manga reading order (right-to-left, top-to-bottom)
         group.sort(key=lambda b: (b["bbox"][0] * -1, b["bbox"][1]))
         texts = [b["text"] for b in group]
-        merged_text = " ".join(texts) # Join with space for LLM context
-        
+        merged_text = " ".join(texts)
+
         merged_blocks.append({
             "text": merged_text,
-            "bbox": (x1, y1, x2, y2)
+            "bbox": (x1, y1, x2, y2),       # union (backward compat)
+            "bboxes": original_bboxes,       # NEW: all original positions
         })
-        
+
     return merged_blocks
 
 async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Dict[str, Any]]:
@@ -1221,7 +1223,8 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: st
                     # Validate this translation
                     if not _looks_like_target(trans, target_lang):
                         logging.warning(f"[LLM Batch] Box {num+1} appears to be wrong language, retrying individually...")
-                        trans = qwen_translate(text, target_lang, ocr_lang)
+                        # FIX: use indexed_texts[num][1] instead of undefined 'text'
+                        trans = qwen_translate(indexed_texts[num][1], target_lang, ocr_lang)
                     results[orig_idx] = clean_text_for_font(trans)
                     matched_any = True
                     
@@ -2735,13 +2738,17 @@ async def create_translate_job(
 
 
 async def _process_job(job_id: str):
-    """Background task: OCR -> Translate (Batch for OpenRouter & Local)."""
+    """Background task: OCR -> Translate (Batch for OpenRouter & Local).
+
+    Each translation entry now includes a "bboxes" list containing all original
+    bounding boxes for merged groups, so the image renderer can draw in-place
+    without repositioning to the center of a merged region.
+    """
     async with _job_lock:
         job = _jobs.get(job_id)
         if not job:
             return
         job["status"] = "processing"
-        # Capture the OCR mode that produced these boxes (lens boxes are tighter)
         with _ocr_mode_lock:
             job["ocr_mode"] = _ocr_mode
 
@@ -2773,18 +2780,26 @@ async def _process_job(job_id: str):
             if needs_sequential_fallback:
                 logging.warning(f"[Job {job_id}] Batch failed entirely, falling back to sequential requests.")
                 for idx, text in enumerate(texts_to_translate):
+                    ocr_bbox = ocr_results[idx]["bbox"]
+                    ocr_bboxes = ocr_results[idx].get("bboxes", [ocr_bbox])
                     if not text.strip():
-                        translations.append({"text": text, "translation": "", "bbox": ocr_results[idx]["bbox"]})
+                        translations.append({
+                            "text": text, "translation": "",
+                            "bbox": ocr_bbox, "bboxes": ocr_bboxes,
+                        })
                         continue
                     translated = await openrouter_translate(text, target_lang, ocr_lang)
                     await asyncio.sleep(1.0)
                     translations.append({
                         "text": text,
                         "translation": translated,
-                        "bbox": ocr_results[idx]["bbox"],
+                        "bbox": ocr_bbox,
+                        "bboxes": ocr_bboxes,
                     })
             else:
                 for idx, text in enumerate(texts_to_translate):
+                    ocr_bbox = ocr_results[idx]["bbox"]
+                    ocr_bboxes = ocr_results[idx].get("bboxes", [ocr_bbox])
                     translated = batch_results[idx]
                     if not translated and text.strip():
                         logging.warning(f"[Job {job_id}] Box {idx+1} missed in batch, retrying individually...")
@@ -2794,7 +2809,8 @@ async def _process_job(job_id: str):
                     translations.append({
                         "text": text,
                         "translation": translated,
-                        "bbox": ocr_results[idx]["bbox"],
+                        "bbox": ocr_bbox,
+                        "bboxes": ocr_bboxes,
                     })
         else:
             # --- BATCH STRATEGY FOR LOCAL GGUF ---
@@ -2803,10 +2819,13 @@ async def _process_job(job_id: str):
             batch_results = await loop.run_in_executor(_llm_executor, qwen_translate_batch, texts_to_translate, target_lang, ocr_lang)
 
             for idx, text in enumerate(texts_to_translate):
+                ocr_bbox = ocr_results[idx]["bbox"]
+                ocr_bboxes = ocr_results[idx].get("bboxes", [ocr_bbox])
                 translations.append({
                     "text": text,
                     "translation": batch_results[idx] if batch_results[idx] else "",
-                    "bbox": ocr_results[idx]["bbox"],
+                    "bbox": ocr_bbox,
+                    "bboxes": ocr_bboxes,
                 })
 
         async with _job_lock:
@@ -2843,7 +2862,13 @@ async def get_translate_job(job_id: str):
 
 @app.post("/v1/translate/{job_id}/image")
 async def get_translated_image(job_id: str):
-    """Generate the final translated image."""
+    """Generate the final translated image.
+
+    The inpainting mask uses ALL original bounding boxes ("bboxes") so it
+    erases text in place without covering the middle empty space.
+    The text rendering uses the union "bbox" so the combined translation
+    is drawn once cleanly without duplicating or squishing.
+    """
     async with _job_lock:
         job = _jobs.get(job_id)
         if not job:
@@ -2854,7 +2879,7 @@ async def get_translated_image(job_id: str):
         pil_img = job["image"]
         translations = job["result"].get("translations", [])
         do_inpaint = job.get("inpaint", True)
-        ocr_mode = job.get("ocr_mode", _ocr_mode)  # captured at OCR time
+        ocr_mode = job.get("ocr_mode", _ocr_mode)
 
     if not translations:
         buf = io.BytesIO()
@@ -2867,6 +2892,7 @@ async def get_translated_image(job_id: str):
     boxes_to_inpaint = []
     items_to_draw = []
 
+    # ── Expand regions for inpainting, but keep text as 1 union box ──
     for item in translations:
         text = item.get("translation", "")
         if not text or not text.strip():
@@ -2874,17 +2900,27 @@ async def get_translated_image(job_id: str):
         bbox = item.get("bbox")
         if not bbox:
             continue
-        x1, y1, x2, y2 = bbox
-        box_w = x2 - x1
-        box_h = y2 - y1
-        if box_w < 10 or box_h < 10:
-            continue
 
-        boxes_to_inpaint.append(bbox)
-        items_to_draw.append(item)
+        # 1. Add ALL original bboxes to the inpainting list (combine in place)
+        bboxes = item.get("bboxes", [bbox])
+        for bx in bboxes:
+            bx1, by1, bx2, by2 = bx
+            if (bx2 - bx1) < 10 or (by2 - by1) < 10:
+                continue
+            boxes_to_inpaint.append(bx)
+
+        # 2. Add the UNION bbox to the draw list (don't split text)
+        x1, y1, x2, y2 = bbox
+        if (x2 - x1) < 10 or (y2 - y1) < 10:
+            continue
+        items_to_draw.append({
+            "translation": text,
+            "bbox": bbox,  # The merged union box
+        })
 
     if do_inpaint and boxes_to_inpaint:
-        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions...")
+        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
+                     f"(expanded from {len(translations)} translation groups)...")
         mask = build_inpaint_mask(
             img_bgr.shape,
             boxes_to_inpaint,
@@ -2906,15 +2942,15 @@ async def get_translated_image(job_id: str):
     with _font_config_lock:
         fp = str(_current_font_path)
 
-    # --- Detect colors for ALL boxes at once with global polarity voting ---
+    # --- Detect colors for ALL union boxes at once with global polarity voting ---
     all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
     all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
     color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
 
     # ----- Lens-specific text sizing rules -----
-    LENS_OVERFLOW_PX          = 1   # text may exceed box by 1px each side
-    LENS_SMALL_BOX_THRESHOLD  = 24  # box dim below this => "really small"
-    LENS_SMALL_READABLE_SIZE  = 14  # forced readable font size for tiny boxes
+    LENS_OVERFLOW_PX          = 1
+    LENS_SMALL_BOX_THRESHOLD  = 24
+    LENS_SMALL_READABLE_SIZE  = 20
 
     is_lens = (ocr_mode == "lens")
 
@@ -3004,8 +3040,7 @@ async def get_translated_image(job_id: str):
     buf = io.BytesIO()
     out_pil.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
-
-
+    
 # ===========================================================================
 # Main entry point
 # ===========================================================================
