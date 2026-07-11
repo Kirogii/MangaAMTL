@@ -15,7 +15,7 @@
 > Do not run this for production unless you know what you are doing (If you do not know what that is do not portforward this for other people)
 
 > [!CAUTION]
-> This is in alpha testing bugs are to be expected
+> This is in alpha testing bugs are to be expected if you have a problem make a post including data from your console http://localhost:8000/console
 
 <div align="center">
 
@@ -65,7 +65,6 @@ Python 3.12 Is Needed for this
 - Multi language translation from source support (Chinese,Korean,Japanese,Russian,Indonesian,English)
 - Model selection (You can install/add new models without much effort GGUF ONLY)
 - Colorizing Support
-- If your looking for logs they are all inside http://localhost:7860/console
   
 </div>
 
