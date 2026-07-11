@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # =====================================================================
 #  Manga Translation API — Termux Installer & Launcher
-#  - Auto-downloads latest release from GitHub
+#  - Auto-downloads latest release from GitHub via wget
 #  - Checks for new versions on startup
 #  - 'update' command downloads new zip and refreshes deps
 # =====================================================================
@@ -16,12 +16,13 @@ ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[✗]${NC} $1"; }
 
-# --- Paths ---
+# --- Paths & Config ---
 WORK_DIR="$HOME/manga-api"
 VENV_DIR="$WORK_DIR/venv"
 INSTALL_FLAG="$WORK_DIR/.installed_v1"
 VERSION_FILE="$WORK_DIR/.version"
 REPO_API="https://api.github.com/repos/Kirogii/MangaAMTL/releases/latest"
+USER_AGENT="termux-manga-installer"
 
 # =====================================================================
 #  STEP 1 — System packages
@@ -41,7 +42,7 @@ pkg install -y \
     openblas openssl openssl-tool zlib \
     libjpeg-turbo libpng \
     freetype fontconfig \
-    protobuf git wget curl unzip \
+    protobuf git wget unzip \
     rust libffi ndk-sysroot libc++ \
     2>/dev/null || warn "Some system packages failed — continuing"
 
@@ -54,14 +55,14 @@ mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
 
 log "Fetching latest release info from GitHub..."
-curl -sL "$REPO_API" -o release.json
+wget -q -U "$USER_AGENT" "$REPO_API" -O release.json
 
 ASSET_URL=$(python -c "import json; r=json.load(open('release.json')); print(r['assets'][0]['browser_download_url'] if r.get('assets') else '')" 2>/dev/null)
 RELEASE_TAG=$(python -c "import json; r=json.load(open('release.json')); print(r.get('tag_name', 'unknown'))" 2>/dev/null)
 
 if [ -n "$ASSET_URL" ]; then
     log "Downloading release package $RELEASE_TAG..."
-    curl -sL "$ASSET_URL" -o manga_release.zip
+    wget -q -U "$USER_AGENT" "$ASSET_URL" -O manga_release.zip
     log "Extracting package..."
     unzip -o manga_release.zip -d "$WORK_DIR" >/dev/null 2>&1
     
@@ -81,7 +82,7 @@ if [ -n "$ASSET_URL" ]; then
     ok "Release package downloaded and extracted (Version: $RELEASE_TAG)."
 else
     warn "No release attachment found. Falling back to raw app.py from main branch..."
-    curl -sL "https://raw.githubusercontent.com/Kirogii/MangaAMTL/main/app.py" -o "$WORK_DIR/app.py"
+    wget -q -U "$USER_AGENT" "https://raw.githubusercontent.com/Kirogii/MangaAMTL/main/app.py" -O "$WORK_DIR/app.py"
     rm -f release.json
     echo "dev-raw" > "$VERSION_FILE"
 fi
@@ -190,6 +191,7 @@ WORK_DIR="$HOME/manga-api"
 VENV_DIR="$WORK_DIR/venv"
 VERSION_FILE="$WORK_DIR/.version"
 REPO_API="https://api.github.com/repos/Kirogii/MangaAMTL/releases/latest"
+USER_AGENT="termux-manga-installer"
 
 cd "$WORK_DIR"
 source "$VENV_DIR/bin/activate"
@@ -207,7 +209,7 @@ if [ -f "$VERSION_FILE" ]; then
     LOCAL_VERSION=$(cat "$VERSION_FILE")
 fi
 
-REMOTE_TAG=$(curl -sL --max-time 5 "$REPO_API" | python -c "import json,sys; print(json.load(sys.stdin).get('tag_name','unknown'))" 2>/dev/null)
+REMOTE_TAG=$(wget -q -T 5 -U "$USER_AGENT" -O - "$REPO_API" | python -c "import json,sys; print(json.load(sys.stdin).get('tag_name','unknown'))" 2>/dev/null)
 
 if [ "$REMOTE_TAG" != "unknown" ] && [ "$REMOTE_TAG" != "$LOCAL_VERSION" ]; then
     echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
@@ -264,10 +266,11 @@ CYAN='\033[0;36m'; NC='\033[0m'
 WORK_DIR="$HOME/manga-api"
 VENV_DIR="$WORK_DIR/venv"
 REPO_API="https://api.github.com/repos/Kirogii/MangaAMTL/releases/latest"
+USER_AGENT="termux-manga-installer"
 TEMP_DIR=$(mktemp -d)
 
 echo -e "${CYAN}[*]${NC} Checking for updates..."
-curl -sL "$REPO_API" -o "$TEMP_DIR/release.json"
+wget -q -U "$USER_AGENT" "$REPO_API" -O "$TEMP_DIR/release.json"
 
 ASSET_URL=$(python -c "import json; r=json.load(open('$TEMP_DIR/release.json')); print(r['assets'][0]['browser_download_url'] if r.get('assets') else '')" 2>/dev/null)
 NEW_TAG=$(python -c "import json; r=json.load(open('$TEMP_DIR/release.json')); print(r.get('tag_name', 'unknown'))" 2>/dev/null)
@@ -285,7 +288,7 @@ if [ -f "$WORK_DIR/.version" ] && [ "$(cat "$WORK_DIR/.version")" == "$NEW_TAG" 
 fi
 
 echo -e "${CYAN}[*]${NC} Downloading latest release $NEW_TAG..."
-curl -sL "$ASSET_URL" -o "$TEMP_DIR/manga_update.zip"
+wget -q -U "$USER_AGENT" "$ASSET_URL" -O "$TEMP_DIR/manga_update.zip"
 
 echo -e "${CYAN}[*]${NC} Extracting package..."
 unzip -o "$TEMP_DIR/manga_update.zip" -d "$WORK_DIR" >/dev/null 2>&1
