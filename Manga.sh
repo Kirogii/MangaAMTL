@@ -4,7 +4,7 @@
 #  Repo: https://github.com/Kirogii/MangaAMTL
 #
 #  This script:
-#    - Installs required Termux packages (python, git, curl, unzip)
+#    - Installs required Termux packages (python, git, wget, unzip)
 #    - Downloads the latest release of MangaAMTL from GitHub
 #    - Creates a Python venv and installs requirements.txt automatically
 #    - Installs a global "Manga" command that:
@@ -45,14 +45,14 @@ fi
 info "Updating Termux packages..."
 pkg update -y && pkg upgrade -y
 
-info "Installing dependencies (python git curl unzip)..."
-pkg install -y python git curl unzip
+info "Installing dependencies (python git wget unzip)..."
+pkg install -y python git wget unzip
 
 # ----------------------------------------------------------------------------
 # 2. Helper: get latest release tag from GitHub API
 # ----------------------------------------------------------------------------
 get_latest_tag() {
-    curl -s --max-time 10 "$API_URL" 2>/dev/null | \
+    wget -qO- --timeout=10 "$API_URL" 2>/dev/null | \
     python3 -c "
 import json,sys
 try:
@@ -74,7 +74,7 @@ download_and_install() {
     local zip_url="https://github.com/${REPO}/archive/refs/tags/${tag}.zip"
 
     info "Downloading MangaAMTL ${tag}..."
-    if ! curl -L --fail --max-time 120 -o "$zip_path" "$zip_url"; then
+    if ! wget -q --timeout=120 -O "$zip_path" "$zip_url"; then
         err "Download failed. Check your internet connection or try again later."
         rm -rf "$tmp_dir"
         return 1
@@ -137,7 +137,7 @@ else
 fi
 
 info "Upgrading pip..."
-$PIP install --upgrade pip
+ $PIP install --upgrade pip
 
 if [ -f "${INSTALL_DIR}/${REQ_MODE}" ]; then
     info "Installing requirements from ${REQ_MODE} (this can take a while)..."
@@ -176,7 +176,7 @@ warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 err()   { echo -e "${RED}[x]${NC} $1"; }
 
 get_latest_tag() {
-    curl -s --max-time 8 "$API_URL" 2>/dev/null | \
+    wget -qO- --timeout=8 "$API_URL" 2>/dev/null | \
     python3 -c "
 import json,sys
 try:
@@ -201,7 +201,7 @@ do_update() {
     req_mode="$( [ -f "$REQ_MODE_FILE" ] && cat "$REQ_MODE_FILE" || echo "requirements.txt" )"
 
     info "Downloading MangaAMTL ${tag}..."
-    if ! curl -L --fail --max-time 120 -o "$zip_path" "$zip_url"; then
+    if ! wget -q --timeout=120 -O "$zip_path" "$zip_url"; then
         err "Download failed. Update aborted."
         rm -rf "$tmp_dir"
         return 1
