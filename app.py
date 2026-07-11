@@ -840,20 +840,17 @@ def _geometry_to_bbox(geometry, img_w, img_h):
     return None
 
 def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merges OCR blocks that are physically close to each other.
+    """Merges OCR blocks that are side-by-side on the same line.
 
-    Text is combined into one string for translation, but ALL original bounding
-    boxes are preserved in a "bboxes" list so that inpainting and text rendering
-    maintain each box's original position/height instead of creating one large
-    merged region centered between the original boxes.
+    Only merges horizontally — never merges boxes that are stacked
+    vertically in different speech bubbles. This keeps the union bbox
+    short so text overlay doesn't stretch downward across bubbles.
 
-    Expansion rules (unchanged from before):
-    - Horizontally: 50% of box width on each side (catches side-by-side text)
-    - Vertically: 20% of height or at least 10px (prevents over-merging
-      distinct speech bubbles stacked vertically)
+    Horizontal merge: aggressive (50% width expansion on each side).
+    Vertical merge:   STRICT — actual boxes must overlap ≥30% of the
+                      smaller box's height (i.e. truly on the same line).
     """
     if len(blocks) <= 1:
-        # Ensure every block has a "bboxes" list for downstream consistency
         for b in blocks:
             if "bboxes" not in b:
                 b["bboxes"] = [b["bbox"]]
@@ -862,66 +859,64 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     parent = list(range(len(blocks)))
 
     def find(i):
-        if parent[i] == i:
-            return i
-        parent[i] = find(parent[i])
-        return parent[i]
+        root = i
+        while parent[root] != root:
+            parent[root] = parent[parent[root]]
+            root = parent[root]
+        return root
 
     def union(i, j):
-        root_i = find(i)
-        root_j = find(j)
-        if root_i != root_j:
-            parent[root_i] = root_j
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
 
     for i in range(len(blocks)):
         x1_i, y1_i, x2_i, y2_i = blocks[i]["bbox"]
-        w_i = x2_i - x1_i
-        h_i = y2_i - y1_i
+        w_i = max(1, x2_i - x1_i)
+        h_i = max(1, y2_i - y1_i)
 
-        v_pad_i = max(10, h_i * 0.2)
+        # Horizontal expansion only (for detecting side-by-side text)
         exp_x1_i = x1_i - w_i * 0.5
-        exp_y1_i = y1_i - v_pad_i
         exp_x2_i = x2_i + w_i * 0.5
-        exp_y2_i = y2_i + v_pad_i
 
         for j in range(i + 1, len(blocks)):
             x1_j, y1_j, x2_j, y2_j = blocks[j]["bbox"]
-            w_j = x2_j - x1_j
-            h_j = y2_j - y1_j
+            w_j = max(1, x2_j - x1_j)
+            h_j = max(1, y2_j - y1_j)
 
-            v_pad_j = max(10, h_j * 0.2)
             exp_x1_j = x1_j - w_j * 0.5
-            exp_y1_j = y1_j - v_pad_j
             exp_x2_j = x2_j + w_j * 0.5
-            exp_y2_j = y2_j + v_pad_j
 
-            ix1 = max(exp_x1_i, exp_x1_j)
-            iy1 = max(exp_y1_i, exp_y1_j)
-            ix2 = min(exp_x2_i, exp_x2_j)
-            iy2 = min(exp_y2_i, exp_y2_j)
+            # --- Must be horizontally close (expanded boxes overlap) ---
+            h_overlap = min(exp_x2_i, exp_x2_j) - max(exp_x1_i, exp_x1_j)
+            if h_overlap <= 0:
+                continue
 
-            if ix1 < ix2 and iy1 < iy2:
-                union(i, j)
+            # --- Must NOT be vertically separated ---
+            # Use ACTUAL (unexpanded) vertical overlap, not padded.
+            # Only merge if the real boxes overlap vertically by at least
+            # 30% of the smaller height — i.e. they're on the same text line.
+            v_overlap_actual = min(y2_i, y2_j) - max(y1_i, y1_j)
+            min_h = min(h_i, h_j)
+
+            if v_overlap_actual < 0.3 * min_h:
+                continue  # Different vertical levels — don't merge
+
+            union(i, j)
 
     # Group blocks by their root parent
     groups = {}
     for i in range(len(blocks)):
         root = find(i)
-        if root not in groups:
-            groups[root] = []
-        groups[root].append(blocks[i])
+        groups.setdefault(root, []).append(blocks[i])
 
     merged_blocks = []
     for group in groups.values():
-        # Union bounding box — kept for backward compatibility / color detection
         x1 = min(b["bbox"][0] for b in group)
         y1 = min(b["bbox"][1] for b in group)
         x2 = max(b["bbox"][2] for b in group)
         y2 = max(b["bbox"][3] for b in group)
 
-        # ── KEY CHANGE: preserve ALL original bounding boxes ──
-        # Instead of collapsing into one merged box, keep every original
-        # box so inpainting and text rendering stay in-place.
         original_bboxes = [b["bbox"] for b in group]
 
         # Sort texts in manga reading order (right-to-left, top-to-bottom)
@@ -931,8 +926,8 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         merged_blocks.append({
             "text": merged_text,
-            "bbox": (x1, y1, x2, y2),       # union (backward compat)
-            "bboxes": original_bboxes,       # NEW: all original positions
+            "bbox": (x1, y1, x2, y2),
+            "bboxes": original_bboxes,
         })
 
     return merged_blocks
@@ -1257,7 +1252,7 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: st
 # OpenRouter Translation
 # ===========================================================================
 
-async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja", max_retries: int = 5) -> List[str]:
+async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja", max_retries: int = 2) -> List[str]:
     import aiohttp
     import random
 
@@ -1281,8 +1276,11 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
     prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (orig_i, text) in enumerate(indexed_texts)]
     batch_text = f"[Source language: {src_lang_name}]\n" + "\n".join(prompt_lines)
 
-    batch_system_prompt = (
-        f"You are a professional manga translator. Translate each numbered line from {src_lang_name} into {lang_name}. "
+    # Initial system prompt
+    base_system_prompt = (
+        f"You are a professional manga translator. "
+        f"Translate each numbered line from {src_lang_name} into {lang_name}. "
+        f"CRITICAL: You must actually translate the text. Do NOT simply copy or repeat the original {src_lang_name} text. "
         f"Output ONLY the translated list, one per line, keeping the exact same numbers. "
         f"Do not include the original text. No explanations, no notes, no quotes. {_script_hint(lang_name)}"
     ).strip()
@@ -1297,7 +1295,7 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": batch_system_prompt},
+            {"role": "system", "content": base_system_prompt},
             {"role": "user", "content": batch_text},
         ],
         "max_tokens": max_tok,
@@ -1307,11 +1305,22 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
 
     logging.info(f"[OpenRouter Batch] Sending {len(indexed_texts)} texts in one request to {model}...")
 
+    QUOTE_CHARS = "\"'“”‘’"
+
     for attempt in range(1, max_retries + 1):
         if attempt > 1:
             wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
             logging.info(f"[OpenRouter Batch] Retry {attempt}/{max_retries} after {wait_time:.1f}s wait...")
             await asyncio.sleep(wait_time)
+            
+            # Escalate the prompt on retries to force the LLM to stop echoing
+            payload["messages"][0]["content"] = (
+                f"YOUR PREVIOUS RESPONSE WAS INVALID BECAUSE YOU ECHOED THE SOURCE TEXT. "
+                f"You MUST translate each numbered line from {src_lang_name} into {lang_name}. "
+                f"CRITICAL: Do NOT repeat the original {src_lang_name} text. You MUST output {lang_name} text only. "
+                f"Output ONLY the translated list, one per line, keeping the exact same numbers. "
+                f"No explanations, no notes, no quotes. {_script_hint(lang_name)}"
+            ).strip()
 
         try:
             timeout = aiohttp.ClientTimeout(total=120)
@@ -1348,18 +1357,49 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                         logging.warning(f"[OpenRouter Batch] Empty/None content on attempt {attempt}")
                         continue
 
+                    # Strip markdown code fences if present
+                    raw = raw.strip()
+                    if raw.startswith("```"):
+                        fence_lines = raw.split('\n')
+                        if fence_lines[0].startswith("```"):
+                            fence_lines = fence_lines[1:]
+                        if fence_lines and fence_lines[-1].startswith("```"):
+                            fence_lines = fence_lines[:-1]
+                        raw = '\n'.join(fence_lines).strip()
+
                     results = [""] * len(texts)
-                    parsed_lines = raw.split('\n')
+                    parsed_lines = [ln.strip() for ln in raw.split('\n') if ln.strip()]
+
+                    # Try numbered format: "1. text", "1) text", "1: text", "[1] text"
+                    matched_count = 0
                     for line in parsed_lines:
-                        match = re.match(r"^\s*(\d+)\.\s*(.*)$", line)
+                        match = re.match(
+                            r"^\s*[\[\(]?(\d+)[\]\)]?[\.\)\-:]\s*(.*)$", line
+                        )
                         if match:
                             num = int(match.group(1)) - 1
                             trans = match.group(2).strip()
+                            # Strip wrapping quotes (standard and smart)
+                            if len(trans) >= 2 and trans[0] in QUOTE_CHARS and trans[-1] in QUOTE_CHARS:
+                                trans = trans[1:-1].strip()
+                            
                             if 0 <= num < len(indexed_texts):
                                 orig_idx = indexed_texts[num][0]
                                 results[orig_idx] = clean_text_for_font(trans)
+                                matched_count += 1
 
-                    # Validate script and clear failures so individual fallback catches them
+                    # Fallback: line-by-line if no numbers but count matches
+                    if matched_count == 0 and len(parsed_lines) == len(indexed_texts):
+                        logging.warning("[OpenRouter Batch] No numbered lines found, trying line-by-line mapping...")
+                        for i, line in enumerate(parsed_lines):
+                            trans = line.strip()
+                            if len(trans) >= 2 and trans[0] in QUOTE_CHARS and trans[-1] in QUOTE_CHARS:
+                                trans = trans[1:-1].strip()
+                            orig_idx = indexed_texts[i][0]
+                            results[orig_idx] = clean_text_for_font(trans)
+                            matched_count += 1
+
+                    # Validate script and clear failures
                     valid_count = 0
                     for i, r in enumerate(results):
                         if r and _looks_like_target(r, target_lang):
@@ -1367,12 +1407,14 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                         else:
                             results[i] = "" 
 
-                    logging.info(f"[OpenRouter Batch] Parsed {valid_count}/{len(indexed_texts)} valid translations.")
+                    logging.info(f"[OpenRouter Batch] Parsed {valid_count}/{len(indexed_texts)} valid translations "
+                                 f"(matched {matched_count} lines).")
                     
                     if valid_count > 0:
                         return results
                     else:
-                        logging.warning(f"[OpenRouter Batch] Failed to parse any valid numbered lines from response.")
+                        logging.warning(f"[OpenRouter Batch] Failed to parse any valid translations. "
+                                        f"Raw response (first 500 chars): {raw[:500]!r}")
                         continue
 
         except asyncio.TimeoutError:
@@ -1384,6 +1426,7 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
 
     logging.error(f"[OpenRouter Batch] FAILED after {max_retries} retries. Falling back to sequential.")
     return [""] * len(texts)
+
 
 async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str = "ja", max_retries: int = 5) -> str:
     import aiohttp
@@ -2048,42 +2091,34 @@ def get_current_font(size: int) -> ImageFont.FreeTypeFont:
     return get_font(font_path, size)
 
 def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False):
+    """Wraps text by words only. NEVER breaks a word into characters.
+    If a single word is wider than max_width, it will be placed on its own
+    line and allowed to overflow horizontally.
+    """
     if is_vertical:
         return [text] if text else [""]
+        
     words = text.split()
     if not words:
         return [""]
+        
     lines = []
     cur = ""
+    
     for word in words:
-        word_width = draw.textlength(word, font=font)
-        if word_width > max_width:
-            if not allow_break:
-                return None
-            if cur:
-                lines.append(cur)
-                cur = ""
-            while word:
-                split_idx = len(word)
-                while split_idx > 1 and draw.textlength(word[:split_idx], font=font) > max_width:
-                    split_idx -= 1
-                if split_idx == 0:
-                    split_idx = 1
-                part = word[:split_idx]
-                if draw.textlength(part + "-", font=font) <= max_width and split_idx < len(word):
-                    part += "-"
-                lines.append(part)
-                word = word[split_idx:]
-            continue
         test = (cur + " " + word) if cur else word
         if draw.textlength(test, font=font) <= max_width:
             cur = test
         else:
             if cur:
                 lines.append(cur)
+            # If the single word itself is wider than max_width, 
+            # just put it on its own line. Do not break it.
             cur = word
+            
     if cur:
         lines.append(cur)
+        
     return lines
 
 def _measure_block(draw, lines, font):
@@ -2181,6 +2216,7 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
     best_size = None
     best_lines = None
     best_heights = None
+    
     while lo <= hi:
         mid = (lo + hi) // 2
         key = (font_path, mid)
@@ -2188,28 +2224,35 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             try: cache[key] = ImageFont.truetype(font_path, mid)
             except Exception: cache[key] = ImageFont.load_default()
         font = cache[key]
+        
         lines = wrap_text(draw, text, font, box_w - 4, allow_break=False, is_vertical=False)
-        if lines is None:
-            hi = mid - 1
-            continue
+        
+        # wrap_text now always returns a list of lines, never None
         heights, total_h, max_w = _measure_block(draw, lines, font)
+        
         if max_w <= box_w - 4 and total_h <= box_h - 4:
             best_size, best_lines, best_heights = mid, lines, heights
             lo = mid + 1
         else:
             hi = mid - 1
+            
     if best_lines is None:
         key = (font_path, min_size)
         if key not in cache:
             try: cache[key] = ImageFont.truetype(font_path, min_size)
             except Exception: cache[key] = ImageFont.load_default()
         font = cache[key]
+        
+        # Even in fallback, wrap_text will not break words. 
+        # If it's too wide, it just overflows on one line.
         fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True, is_vertical=False)
         best_lines = fallback_lines if fallback_lines else [text]
         heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
         best_heights = heights
+        
     return best_size, best_lines, best_heights
+
 
 # ===========================================================================
 # Text drawing with configurable stroke
