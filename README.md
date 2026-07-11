@@ -42,7 +42,7 @@ Python 3.12 Is Needed for this
 `python app.py`
 
 ` The application will start on:
- http://localhost:7860`
+ http://localhost:8000`
 </div>
 
 <div align="center">
