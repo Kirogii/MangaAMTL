@@ -15,7 +15,7 @@
 > Do not run this for production unless you know what you are doing (If you do not know what that is do not portforward this for other people)
 
 > [!CAUTION]
-> This is in alpha testing bugs are to be expected if you have a problem make a post including data from your console http://localhost:8000/console
+> This is in alpha testing bugs are to be expected if you have a problem make a [Report](https://github.com/Kirogii/MangaAMTL/issues) including data from your console http://localhost:8000/console
 
 <div align="center">
 
