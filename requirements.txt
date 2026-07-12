@@ -1,5 +1,6 @@
 llama-cpp-python
 
+chrome-lens-py
 rich
 betterproto
 aiohttp
