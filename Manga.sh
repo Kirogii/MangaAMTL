@@ -39,6 +39,16 @@ if [ "${1:-}" = "--cuda" ]; then
     REQ_MODE="cudarequirements.txt"
 fi
 
+# Packages needed to *compile* things like llama-cpp-python, onnxruntime,
+# tokenizers (rust), pillow/opencv (C/C++), sentencepiece, etc. on Termux.
+BUILD_PKGS="clang make cmake ninja pkg-config rust binutils patchelf libjpeg-turbo libpng freetype libopenblas"
+
+# Termux already ships prebuilt Python packages for some of the heavier
+# pip requirements. Installing these via pkg is *much* faster/more reliable
+# than letting pip try to compile them from source on-device.
+# Format: "pip_name:termux_pkg_name"
+TERMUX_ALTS="numpy:python-numpy pillow:python-pillow opencv-python:opencv-python cryptography:python-cryptography"
+
 # ----------------------------------------------------------------------------
 # 1. Install Termux packages
 # ----------------------------------------------------------------------------
@@ -47,6 +57,17 @@ pkg update -y && pkg upgrade -y
 
 info "Installing dependencies (python git wget unzip)..."
 pkg install -y python git wget unzip
+
+info "Installing build tools (${BUILD_PKGS})..."
+# shellcheck disable=SC2086
+pkg install -y $BUILD_PKGS
+
+info "Installing Termux-native alternatives for heavy pip packages..."
+for pair in $TERMUX_ALTS; do
+    tpkg="${pair#*:}"
+    info "  -> ${tpkg}"
+    pkg install -y "$tpkg" || warn "Could not install ${tpkg} via pkg, will fall back to pip for it."
+done
 
 # ----------------------------------------------------------------------------
 # 2. Helper: get latest release tag from GitHub API
@@ -105,6 +126,25 @@ download_and_install() {
 }
 
 # ----------------------------------------------------------------------------
+# 3b. Strip packages we already installed via pkg (TERMUX_ALTS) out of a
+#     requirements file, so pip doesn't try to rebuild them from source.
+#     Writes a filtered copy and echoes its path.
+# ----------------------------------------------------------------------------
+filter_requirements() {
+    local src_file="$1"
+    local out_file="${src_file}.filtered"
+    cp "$src_file" "$out_file"
+    for pair in $TERMUX_ALTS; do
+        pipname="${pair%%:*}"
+        # Only strip it if the pkg install actually succeeded.
+        if python3 -c "import ${pipname//-/_}" >/dev/null 2>&1; then
+            grep -viE "^${pipname}([<>=! ].*)?$" "$out_file" > "${out_file}.tmp" && mv "${out_file}.tmp" "$out_file"
+        fi
+    done
+    echo "$out_file"
+}
+
+# ----------------------------------------------------------------------------
 # 4. Fresh install
 # ----------------------------------------------------------------------------
 info "Checking latest MangaAMTL release..."
@@ -140,8 +180,9 @@ info "Upgrading pip..."
  $PIP install --upgrade pip
 
 if [ -f "${INSTALL_DIR}/${REQ_MODE}" ]; then
-    info "Installing requirements from ${REQ_MODE} (this can take a while)..."
-    $PIP install -r "${INSTALL_DIR}/${REQ_MODE}"
+    FILTERED_REQ="$(filter_requirements "${INSTALL_DIR}/${REQ_MODE}")"
+    info "Installing requirements from ${REQ_MODE} (this can take a while, some packages will be compiled locally)..."
+    $PIP install -r "$FILTERED_REQ"
 else
     warn "${REQ_MODE} not found in the downloaded release, skipping pip install."
 fi
@@ -169,11 +210,37 @@ VERSION_FILE="${INSTALL_DIR}/.manga_version"
 REQ_MODE_FILE="${INSTALL_DIR}/.manga_reqmode"
 VENV_DIR="${INSTALL_DIR}/.venv"
 
+BUILD_PKGS="clang make cmake ninja pkg-config rust binutils patchelf libjpeg-turbo libpng freetype libopenblas"
+TERMUX_ALTS="numpy:python-numpy pillow:python-pillow opencv-python:opencv-python cryptography:python-cryptography"
+
 RED="\033[1;31m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"; CYAN="\033[1;36m"; NC="\033[0m"
 info()  { echo -e "${CYAN}[*]${NC} $1"; }
 ok()    { echo -e "${GREEN}[+]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 err()   { echo -e "${RED}[x]${NC} $1"; }
+
+ensure_build_tools() {
+    info "Making sure build tools are present..."
+    # shellcheck disable=SC2086
+    pkg install -y $BUILD_PKGS >/dev/null 2>&1
+    for pair in $TERMUX_ALTS; do
+        tpkg="${pair#*:}"
+        pkg install -y "$tpkg" >/dev/null 2>&1
+    done
+}
+
+filter_requirements() {
+    local src_file="$1"
+    local out_file="${src_file}.filtered"
+    cp "$src_file" "$out_file"
+    for pair in $TERMUX_ALTS; do
+        pipname="${pair%%:*}"
+        if python3 -c "import ${pipname//-/_}" >/dev/null 2>&1; then
+            grep -viE "^${pipname}([<>=! ].*)?$" "$out_file" > "${out_file}.tmp" && mv "${out_file}.tmp" "$out_file"
+        fi
+    done
+    echo "$out_file"
+}
 
 get_latest_tag() {
     wget -qO- --timeout=8 "$API_URL" 2>/dev/null | \
@@ -232,9 +299,11 @@ do_update() {
     fi
 
     if [ -f "${INSTALL_DIR}/${req_mode}" ]; then
+        ensure_build_tools
+        FILTERED_REQ="$(filter_requirements "${INSTALL_DIR}/${req_mode}")"
         info "Reinstalling requirements (${req_mode})..."
         pip install --upgrade pip
-        pip install -r "${INSTALL_DIR}/${req_mode}"
+        pip install -r "$FILTERED_REQ"
     fi
 
     if [ -d "$VENV_DIR" ]; then
