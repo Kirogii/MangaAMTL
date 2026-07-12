@@ -69,6 +69,10 @@ fi
 # tokenizers (rust), pillow/opencv (C/C++), sentencepiece, etc.
 BUILD_PKGS="build-essential cmake ninja-build pkg-config rustc cargo binutils patchelf libjpeg-turbo8-dev libpng-dev libfreetype6-dev libopenblas-dev"
 
+# Runtime shared libs commonly needed by opencv-python / Pillow / Qt-ish
+# GUI stacks (libGL for cv2's imshow/highgui bits, libglib for gobject).
+RUNTIME_PKGS="libgl1 libglib2.0-0"
+
 # Ubuntu already ships prebuilt apt packages for some of the heavier pip
 # requirements. Installing these via apt is *much* faster/more reliable than
 # letting pip try to compile them from source on-device.
@@ -87,6 +91,10 @@ $SUDO apt-get install -y python3 python3-venv python3-dev python3-pip git wget u
 info "Installing build tools (${BUILD_PKGS})..."
 # shellcheck disable=SC2086
 $SUDO apt-get install -y $BUILD_PKGS
+
+info "Installing runtime libraries (${RUNTIME_PKGS})..."
+# shellcheck disable=SC2086
+$SUDO apt-get install -y $RUNTIME_PKGS
 
 # ----------------------------------------------------------------------------
 # 1b. MangaAMTL requires Python 3.12. Not every Ubuntu release used by
@@ -295,6 +303,7 @@ REQ_MODE_FILE="${INSTALL_DIR}/.manga_reqmode"
 VENV_DIR="${INSTALL_DIR}/.venv"
 
 BUILD_PKGS="build-essential cmake ninja-build pkg-config rustc cargo binutils patchelf libjpeg-turbo8-dev libpng-dev libfreetype6-dev libopenblas-dev"
+RUNTIME_PKGS="libgl1 libglib2.0-0"
 TERMUX_ALTS="numpy:python3-numpy:numpy pillow:python3-pil:PIL opencv-python:python3-opencv:cv2 cryptography:python3-cryptography:cryptography"
 
 if [ "$(id -u)" = "0" ]; then
@@ -348,6 +357,8 @@ ensure_build_tools() {
     info "Making sure build tools are present..."
     # shellcheck disable=SC2086
     $SUDO apt-get install -y $BUILD_PKGS >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    $SUDO apt-get install -y $RUNTIME_PKGS >/dev/null 2>&1
     if [ "$SYSTEM_PY_IS_312" = "1" ]; then
         for triple in $TERMUX_ALTS; do
             apkg="$(echo "$triple" | cut -d: -f2)"
