@@ -2903,6 +2903,7 @@ async def get_translate_job(job_id: str):
             result["error"] = job["error"]
         return result
 
+
 @app.post("/v1/translate/{job_id}/image")
 async def get_translated_image(job_id: str):
     """Generate the final translated image.
@@ -2990,10 +2991,12 @@ async def get_translated_image(job_id: str):
     all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
     color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
 
-    # ----- Lens-specific text sizing rules -----
+    # ---- FIXED SIZE RANGE: 15-30 px (hard cap, both Lens & non-Lens) ----
+    HARD_MAX_SIZE = 30
+    HARD_MIN_SIZE = 15
+
     LENS_OVERFLOW_PX          = 1
     LENS_SMALL_BOX_THRESHOLD  = 24
-    LENS_SMALL_READABLE_SIZE  = 20
 
     is_lens = (ocr_mode == "lens")
 
@@ -3006,13 +3009,14 @@ async def get_translated_image(job_id: str):
 
         text_color, bg_color = color_by_idx[item_idx]
 
-        # -------- Pick font size + lines --------
+        # -------- Pick font size + lines (always clamped to 15-30) --------
         if is_lens:
             really_small = (box_w < LENS_SMALL_BOX_THRESHOLD or
                             box_h < LENS_SMALL_BOX_THRESHOLD)
 
             if really_small:
-                font_size = LENS_SMALL_READABLE_SIZE
+                # Even for tiny boxes, never exceed 30 or go below 15
+                font_size = HARD_MIN_SIZE
                 font = get_font(fp, font_size)
                 lines = wrap_text(draw, text, font,
                                   max_width=max(box_w, font_size * 3),
@@ -3023,22 +3027,34 @@ async def get_translated_image(job_id: str):
             else:
                 fit_w = box_w + LENS_OVERFLOW_PX * 2
                 fit_h = box_h + LENS_OVERFLOW_PX * 2
-                dynamic_max_size = max(96, min(int(fit_h * 0.98),
-                                               int(fit_w * 0.95), 320))
-                dynamic_min_size = max(10, min(int(box_h * 0.25), 18))
                 font_size, lines, heights = fit_font_and_wrap(
                     draw, text, fit_w, fit_h, font_path=fp,
-                    max_size=dynamic_max_size, min_size=dynamic_min_size
+                    max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE
                 )
                 font = get_font(fp, font_size)
         else:
-            dynamic_max_size = max(96, min(int(box_h * 0.95), int(box_w * 0.85), 300))
-            dynamic_min_size = max(8, min(int(box_h * 0.15), 16))
             font_size, lines, heights = fit_font_and_wrap(
                 draw, text, box_w, box_h, font_path=fp,
-                max_size=dynamic_max_size, min_size=dynamic_min_size
+                max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE
             )
             font = get_font(fp, font_size)
+
+        # ---- FINAL HARD CLAMP: guarantee 15-30 ----
+        if font_size > HARD_MAX_SIZE:
+            font_size = HARD_MAX_SIZE
+            font = get_font(fp, font_size)
+            # re-measure lines with the clamped font
+            lines = wrap_text(draw, text, font,
+                              max_width=(box_w + (LENS_OVERFLOW_PX * 2 if is_lens else 0)) - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
+        elif font_size < HARD_MIN_SIZE:
+            font_size = HARD_MIN_SIZE
+            font = get_font(fp, font_size)
+            lines = wrap_text(draw, text, font,
+                              max_width=(box_w + (LENS_OVERFLOW_PX * 2 if is_lens else 0)) - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
 
         # -------- Compute vertical placement --------
         if heights:
@@ -3083,7 +3099,7 @@ async def get_translated_image(job_id: str):
     buf = io.BytesIO()
     out_pil.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
-    
+ 
 # ===========================================================================
 # Main entry point
 # ===========================================================================
