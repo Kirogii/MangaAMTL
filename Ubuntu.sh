@@ -17,8 +17,8 @@
 #         * otherwise just starts app.py
 #
 #  Usage:
-#    bash install_manga_ubuntu.sh            (normal / CPU requirements.txt)
-#    bash install_manga_ubuntu.sh --cuda     (installs cudarequirements.txt instead)
+#    bash Ubuntu.sh            (normal / CPU requirements.txt)
+#    bash Ubuntu.sh --cuda     (installs cudarequirements.txt instead)
 # ============================================================================
 
 set -u
