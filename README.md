@@ -18,14 +18,6 @@
 > This is in alpha testing bugs are to be expected if you have a problem make a [Report](https://github.com/Kirogii/MangaAMTL/issues) including data from your console http://localhost:8000/console
 
 <div align="center">
-
-# Tree Guide
-- [Installation+Setup (For Localhost)](#LocalhostSetup)
-- [Credits](#Credits)
-- [Features](#Features)
-- [Problems+Solutions](#Problems)
-- [Phone/Termux Setup](#PhoneSetup)
-- [Ubuntu Linux Setup](#LinuxSetup)
 </div>
 
 <div align="center">
