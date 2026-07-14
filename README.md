@@ -25,7 +25,7 @@
 - [Features](#Features)
 - [Problems+Solutions](#Problems)
 - [Phone/Termux Setup](#PhoneSetup)
-- [Ubuntu Linux Setup](#Linux/UbuntuSetup)
+- [Ubuntu Linux Setup](#LinuxSetup)
 </div>
 
 <div align="center">
@@ -71,7 +71,7 @@ Python 3.12 Is Needed for this
 - Run `chmod +x Manga.sh`
 - Run `./Manga.sh`
 
-# Linux/Ubuntu Setup
+# Linux Setup
 ### This uses wget not curl
 - Run `apt install wget`
 - Run `wget https://raw.githubusercontent.com/Kirogii/MangaAMTL/refs/heads/main/Manga.sh`
