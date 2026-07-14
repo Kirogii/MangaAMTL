@@ -115,8 +115,9 @@
     <select id="optInpaintMode">
       <option value="low">Low (faster, default)</option>
       <option value="high">High (better quality, bigger model)</option>
+      <option value="none">None (fill with bg color, no model)</option>
     </select>
-    <div class="hint">High mode uses dreMaz/AnimeMangaInpainting's larger LaMa checkpoint. It downloads on the server the first time you switch to it.</div>
+    <div class="hint">High mode uses a larger LaMa checkpoint. 'None' mode fills text regions with the detected background color and uses no inpainting model.</div>
     <div id="optInpaintStatus" class="status"></div>
   </div>
 

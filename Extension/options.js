@@ -238,9 +238,13 @@ async function syncInpaintModeFromServer(serverUrl) {
     const data = await res.json();
     document.getElementById('optInpaintMode').value = data.inpaint_mode || 'low';
     chrome.storage.local.set({ inpaintMode: data.inpaint_mode || 'low' });
-    statusEl.innerText = data.inpaint_mode === 'high'
-      ? (data.high_model_downloaded ? `High model ready (${data.high_model_size_mb} MB)` : 'High model will download on first use')
-      : '';
+    if (data.inpaint_mode === 'high') {
+      statusEl.innerText = data.high_model_downloaded ? `High model ready (${data.high_model_size_mb} MB)` : 'High model will download on first use';
+    } else if (data.inpaint_mode === 'none') {
+      statusEl.innerText = 'None mode active (no model loaded)';
+    } else {
+      statusEl.innerText = '';
+    }
   } catch (e) {
     console.warn('[MangaTranslator] Could not fetch inpaint mode from server:', e);
   }
@@ -261,10 +265,13 @@ async function pushInpaintMode(serverUrl, mode) {
     });
     const data = await res.json();
     if (res.ok) {
-      statusEl.innerText = data.inpaint_mode === 'high'
-        ? `High model ready (${data.high_model_size_mb} MB)`
-        : 'Low mode active';
-      chrome.storage.local.set({ inpaintMode: data.inpaint_mode });
+      if (data.inpaint_mode === 'high') {
+        statusEl.innerText = `High model ready (${data.high_model_size_mb} MB)`;
+      } else if (data.inpaint_mode === 'none') {
+        statusEl.innerText = 'None mode active (no model loaded)';
+      } else {
+        statusEl.innerText = 'Low mode active';
+      }
     } else {
       statusEl.innerHTML = `<span class="error">Error: ${data.detail}</span>`;
     }

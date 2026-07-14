@@ -211,6 +211,8 @@ async function syncInpaintModeFromServer(serverUrl) {
       statusEl.innerText = data.high_model_downloaded
         ? `High model ready (${data.high_model_size_mb} MB)`
         : 'High model will download on first use';
+    } else if (data.inpaint_mode === 'none') {
+      statusEl.innerText = 'None mode active (no model loaded)';
     } else {
       statusEl.innerText = '';
     }
@@ -234,9 +236,13 @@ async function pushInpaintMode(serverUrl, mode) {
     });
     const data = await res.json();
     if (res.ok) {
-      statusEl.innerText = data.inpaint_mode === 'high'
-        ? `High model ready (${data.high_model_size_mb} MB)`
-        : 'Low mode active';
+      if (data.inpaint_mode === 'high') {
+        statusEl.innerText = `High model ready (${data.high_model_size_mb} MB)`;
+      } else if (data.inpaint_mode === 'none') {
+        statusEl.innerText = 'None mode active (no model loaded)';
+      } else {
+        statusEl.innerText = 'Low mode active';
+      }
     } else {
       statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
     }

@@ -85,8 +85,9 @@
   <select id="inpaintMode">
     <option value="low">Low (faster, default)</option>
     <option value="high">High (better quality, bigger model)</option>
+    <option value="none">None (fill with bg color, no model)</option>
   </select>
-  <div class="hint">High mode auto-downloads a larger LaMa model on the server the first time it's used.</div>
+  <div class="hint">High mode auto-downloads a larger LaMa model. 'None' mode uses the detected background color to fill text regions instead of inpainting.</div>
   <div id="inpaintModeStatus" class="status"></div>
 
   <label for="modelType">Translation Model:</label>
