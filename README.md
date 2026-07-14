@@ -25,6 +25,7 @@
 - [Features](#Features)
 - [Problems+Solutions](#Problems)
 - [Phone/Termux Setup](#PhoneSetup)
+- [Ubuntu Linux Setup](#LinuxUbuntuSetup)
 </div>
 
 <div align="center">
@@ -60,11 +61,19 @@ Python 3.12 Is Needed for this
 - https://huggingface.co/zai-org/GLM-OCR
 
 # Phone Setup
+### (Barely works still contemplating whether to scrap this)
 - Install [Termux](https://f-droid.org/en/packages/com.termux/) 
 - Run inside termux `pkg install proot-distro`
 - Run after you install proot-distro `proot-distro install ubuntu`
 - To get into the ubuntu instance `proot-distro login ubuntu`
 - Run inside the ubuntu instance `apt install wget`
+- Run `wget https://raw.githubusercontent.com/Kirogii/MangaAMTL/refs/heads/main/Manga.sh`
+- Run `chmod +x Manga.sh`
+- Run `./Manga.sh`
+
+# Linux/Ubuntu Setup
+### This uses wget not curl
+- Run `apt install wget`
 - Run `wget https://raw.githubusercontent.com/Kirogii/MangaAMTL/refs/heads/main/Manga.sh`
 - Run `chmod +x Manga.sh`
 - Run `./Manga.sh`
