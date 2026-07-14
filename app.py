@@ -1813,10 +1813,14 @@ def load_lama_high():
 
 
 def load_lama():
-    """Load the appropriate LaMa model based on the current inpaint mode."""
+    """Load the appropriate LaMa model based on the current inpaint mode.
+    Returns None for 'none' mode — no model is loaded."""
     with _inpaint_mode_lock:
         mode = _inpaint_mode
 
+    if mode == "none":
+        logging.info("[Inpaint] Mode is 'none' — no LaMa model loaded.")
+        return None
     if mode == "high":
         return load_lama_high()
     return load_lama_low()
@@ -1839,9 +1843,14 @@ def cv2_inpaint_fallback(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return cv2.inpaint(img_bgr, mask, INPAINT_RADIUS_CV2, cv2.INPAINT_TELEA)
 
 async def inpaint_image_async(img_bgr: np.ndarray, mask: np.ndarray, use_lama: bool = True) -> np.ndarray:
-    """Run inpainting in a thread pool so it doesn't block the event loop."""
+    """Run inpainting in a thread pool so it doesn't block the event loop.
+    In 'none' mode, returns the original image unchanged."""
     with _inpaint_mode_lock:
         mode = _inpaint_mode
+
+    if mode == "none":
+        logging.info("[Inpaint] Mode is 'none' — skipping inpainting entirely.")
+        return img_bgr
 
     should_use_lama = use_lama and (mode == "high" or SimpleLama is not None)
 
@@ -2428,6 +2437,31 @@ class SetInpaintModeRequest(BaseModel):
 async def set_inpaint_mode(req: SetInpaintModeRequest):
     global _inpaint_mode
     mode = req.mode.lower().strip()
+    if mode not in ("low", "high", "none"):
+        raise HTTPException(400, "mode must be 'low', 'high', or 'none'")
+
+    if mode == "high":
+        try:
+            ensure_lama_large()
+        except Exception as e:
+            raise HTTPException(500, f"Failed to download high-quality inpainting model: {e}")
+
+    # If switching away from "none", clear cached lama models so they reload
+    # on next use. If switching TO "none", no model load happens at all.
+    with _inpaint_mode_lock:
+        _inpaint_mode = mode
+
+    logging.info(f"[Inpaint] Mode set to: {mode}")
+
+    return {
+        "status": "ok",
+        "inpaint_mode": _inpaint_mode,
+        "high_model_path": str(LAMA_LARGE_PATH),
+        "high_model_downloaded": LAMA_LARGE_PATH.exists() if LAMA_LARGE_PATH.exists() else False,
+        "high_model_size_mb": round(LAMA_LARGE_PATH.stat().st_size / (1024 * 1024), 1) if LAMA_LARGE_PATH.exists() else 0,
+    }
+
+    mode = req.mode.lower().strip()
     if mode not in ("low", "high"):
         raise HTTPException(400, "mode must be 'low' or 'high'")
 
@@ -2452,6 +2486,17 @@ async def set_inpaint_mode(req: SetInpaintModeRequest):
 
 @app.get("/GetInpaintMode")
 async def get_inpaint_mode():
+    with _inpaint_mode_lock:
+        mode = _inpaint_mode
+    return {
+        "inpaint_mode": mode,
+        "high_model_path": str(LAMA_LARGE_PATH),
+        "high_model_downloaded": LAMA_LARGE_PATH.exists(),
+        "high_model_size_mb": round(LAMA_LARGE_PATH.stat().st_size / (1024 * 1024), 1) if LAMA_LARGE_PATH.exists() else 0,
+        "low_model": "big-lama.pt (SimpleLama default)",
+        "high_model": "anime-manga-big-lama.pt (df1412/anime-big-lama)",
+        "none_model": "No inpainting — fills text regions with detected background color",
+    }
     with _inpaint_mode_lock:
         mode = _inpaint_mode
     return {
@@ -2613,9 +2658,71 @@ async def meta():
         "inpaint_high_model_downloaded": LAMA_LARGE_PATH.exists(),
         "inpaint_high_model_path": str(LAMA_LARGE_PATH),
     }
+    with _inpaint_mode_lock:
+        inpaint_mode = _inpaint_mode
+    with _ocr_mode_lock:
+        ocr_mode = _ocr_mode
+    return {
+        "version": BUILD_ID,
+        "cuda": has_cuda(),
+        "device": get_torch_device(),
+        "ocr_mode": ocr_mode,
+        "ocr_model": _current_ocr_model,
+        "lens_available": LensAPI is not None,
+        "font_path": str(_current_font_path),
+        "stroke_width": _current_stroke_width,
+        "model_type": _current_model_type,
+        "openrouter_model": _openrouter_model if _current_model_type == "openrouter" else None,
+        "local_model": f"{_current_qwen_repo_id}/{_current_qwen_filename}" if _current_model_type == "local" else None,
+        "inpaint_lama_available": SimpleLama is not None,
+        "inpaint_mode": inpaint_mode,
+        "inpaint_high_model_downloaded": LAMA_LARGE_PATH.exists(),
+        "inpaint_high_model_path": str(LAMA_LARGE_PATH),
+    }
 
 @app.post("/warmup")
 async def warmup():
+    errors = []
+    with _ocr_mode_lock:
+        ocr_mode = _ocr_mode
+    with _inpaint_mode_lock:
+        inpaint_mode = _inpaint_mode
+
+    try:
+        get_yolo()
+    except Exception as e:
+        errors.append(f"YOLO: {e}")
+    try:
+        if ocr_mode != "lens":
+            get_hayai_ocr()
+    except Exception as e:
+        errors.append(f"Hayai OCR: {e}")
+    try:
+        if ocr_mode == "lens":
+            get_lens_api()
+            logging.info("[Warmup] Google Lens API initialized.")
+    except Exception as e:
+        errors.append(f"Google Lens: {e}")
+    try:
+        if _current_model_type == "local":
+            get_qwen()
+    except Exception as e:
+        errors.append(f"Qwen: {e}")
+    try:
+        if inpaint_mode == "none":
+            logging.info("[Warmup] Inpaint mode is 'none' — skipping LaMa load entirely.")
+        elif SimpleLama is not None:
+            if inpaint_mode == "high":
+                load_lama_high()
+                logging.info("[Warmup] HighQualityLama loaded for inpainting.")
+            else:
+                load_lama_low()
+                logging.info("[Warmup] SimpleLama loaded for inpainting.")
+        else:
+            logging.info("[Warmup] SimpleLama not installed; cv2.inpaint will be used as fallback.")
+    except Exception as e:
+        errors.append(f"SimpleLama: {e}")
+    return {"status": "warmed" if not errors else "partial", "errors": errors}
     errors = []
     with _ocr_mode_lock:
         ocr_mode = _ocr_mode
@@ -2938,6 +3045,195 @@ async def get_translate_job(job_id: str):
 
 @app.post("/v1/translate/{job_id}/image")
 async def get_translated_image(job_id: str):
+    """Generate the final translated image.
+
+    Inpaint mode behaviour:
+      - 'low'/'high': Standard LaMa inpainting erases original text.
+      - 'none':       No inpainting model is loaded. Text regions are
+                      filled with the background color detected by the
+                      text-color algorithm, then translations are drawn
+                      on top.
+    """
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        if job["status"] != "completed":
+            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
+
+        pil_img = job["image"]
+        translations = job["result"].get("translations", [])
+        do_inpaint = job.get("inpaint", True)
+        ocr_mode = job.get("ocr_mode", _ocr_mode)
+
+    if not translations:
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+
+    img_bgr = pil_to_cv2(pil_img)
+    h, w = img_bgr.shape[:2]
+
+    boxes_to_inpaint = []
+    items_to_draw = []
+
+    # ── Collect inpaint boxes (all original sub-boxes) and draw items (union bbox) ──
+    for item in translations:
+        text = item.get("translation", "")
+        if not text or not text.strip():
+            continue
+        bbox = item.get("bbox")
+        if not bbox:
+            continue
+
+        bboxes = item.get("bboxes", [bbox])
+        for bx in bboxes:
+            bx1, by1, bx2, by2 = bx
+            if (bx2 - bx1) < 10 or (by2 - by1) < 10:
+                continue
+            boxes_to_inpaint.append(bx)
+
+        x1, y1, x2, y2 = bbox
+        if (x2 - x1) < 10 or (y2 - y1) < 10:
+            continue
+        items_to_draw.append({
+            "translation": text,
+            "bbox": bbox,
+        })
+
+    # ── Detect text/background colors FIRST (from original image) ──
+    # This must happen before any inpainting/filling so the colors are
+    # read from the original text. In 'none' mode we need the bg_color
+    # to fill regions.
+    orig_bgr = pil_to_cv2(pil_img)
+    all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
+    all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
+    color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
+
+    # ── Get inpaint mode ──
+    with _inpaint_mode_lock:
+        inpaint_mode = _inpaint_mode
+
+    # ── Erase original text ──
+    if do_inpaint and boxes_to_inpaint:
+        if inpaint_mode == "none":
+            # ── None mode: fill text regions with detected background color ──
+            # No inpainting model is used. Each item's union bbox is filled
+            # with the background color detected by the text-color algorithm.
+            logging.info(f"[Inpaint] Mode='none' — filling {len(items_to_draw)} text regions "
+                         f"with detected background color (no inpainting model loaded).")
+            out_pil_temp = cv2_to_pil(img_bgr)
+            draw_fill = ImageDraw.Draw(out_pil_temp)
+            for item_idx, item in enumerate(items_to_draw):
+                _, bg_color = color_by_idx[item_idx]
+                bx1, by1, bx2, by2 = item["bbox"]
+                # Fill the union bbox with the detected background color
+                draw_fill.rectangle([bx1, by1, bx2, by2], fill=bg_color)
+            img_bgr = pil_to_cv2(out_pil_temp)
+            logging.info(f"[Inpaint] None-mode background fill complete for {len(items_to_draw)} regions.")
+        else:
+            # ── Low/High mode: standard inpainting ──
+            logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
+                         f"(from {len(translations)} translation groups)...")
+            mask = build_inpaint_mask(
+                img_bgr.shape,
+                boxes_to_inpaint,
+                padding=2,
+                dilate_kernel=3,
+            )
+            use_lama = inpaint_mode == "high" or SimpleLama is not None
+            img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
+            logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
+
+    out_pil = cv2_to_pil(img_bgr)
+    draw = ImageDraw.Draw(out_pil)
+
+    with _font_config_lock:
+        fp = str(_current_font_path)
+
+    # ── Font size limits ──
+    HARD_MAX_SIZE = 30
+    HARD_MIN_SIZE = 15
+
+    is_lens = (ocr_mode == "lens")
+
+    for item_idx, item in enumerate(items_to_draw):
+        text = item["translation"]
+        bbox = item["bbox"]
+        x1, y1, x2, y2 = bbox
+        box_w = x2 - x1
+        box_h = y2 - y1
+
+        text_color, bg_color = color_by_idx[item_idx]
+
+        # ── Inner box padding ratio ──
+        # 0.10 (10% per side) for standard OCR to keep text away from edges.
+        # 0.0 (no padding) for Google Lens so text fills the ENTIRE region.
+        if is_lens:
+            INNER_PADDING_RATIO = 0.0
+        else:
+            INNER_PADDING_RATIO = 0.10
+
+        # ── Fit text to INNER box (or full box for Lens) ──
+        font_size, lines, heights, inner_w, inner_h = fit_font_and_wrap(
+            draw, text, box_w, box_h, font_path=fp,
+            max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE,
+            inner_padding_ratio=INNER_PADDING_RATIO,
+        )
+        font = get_font(fp, font_size)
+
+        # ── Hard clamp to [15, 30] and re-measure if needed ──
+        if font_size > HARD_MAX_SIZE:
+            font_size = HARD_MAX_SIZE
+            font = get_font(fp, font_size)
+            lines = wrap_text(draw, text, font,
+                              max_width=inner_w - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
+        elif font_size < HARD_MIN_SIZE:
+            font_size = HARD_MIN_SIZE
+            font = get_font(fp, font_size)
+            lines = wrap_text(draw, text, font,
+                              max_width=inner_w - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
+
+        # ── Compute inner box position (centered within outer bbox) ──
+        inner_x = x1 + (box_w - inner_w) // 2
+        inner_y = y1 + (box_h - inner_h) // 2
+
+        # ── Compute vertical placement (center text block within inner box) ──
+        if heights:
+            total_text_h = sum(heights)
+        else:
+            total_text_h = font_size * len(lines)
+
+        start_y = inner_y + (inner_h - total_text_h) // 2
+
+        # ── Draw each line centered horizontally within inner box ──
+        current_y = start_y
+        for i, line in enumerate(lines):
+            if not line:
+                current_y += heights[i] if i < len(heights) else font_size
+                continue
+
+            line_w = draw.textlength(line, font=font)
+            line_x = inner_x + (inner_w - line_w) / 2
+
+            draw_text_with_config(
+                draw,
+                (line_x, current_y),
+                line,
+                font=font,
+                fill=text_color,
+                stroke_fill=bg_color,
+            )
+
+            current_y += heights[i] if i < len(heights) else font_size
+
+    buf = io.BytesIO()
+    out_pil.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
     """Generate the final translated image.
 
     Text is rendered within an INNER box that is smaller than the inpainting
