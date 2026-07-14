@@ -25,7 +25,7 @@
 - [Features](#Features)
 - [Problems+Solutions](#Problems)
 - [Phone/Termux Setup](#PhoneSetup)
-- [Ubuntu Linux Setup](#LinuxUbuntuSetup)
+- [Ubuntu Linux Setup](#Linux/UbuntuSetup)
 </div>
 
 <div align="center">
