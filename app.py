@@ -1581,23 +1581,18 @@ def load_lama_low():
 
 class HighQualityLama:
     """Custom wrapper for anime-manga-big-lama.pt.
-    Uses patch-based inference with:
-    - 50% overlap (stride=256) for seamless blending
-    - Single pass inference (with color correction)
-    - Proper Gaussian-weighted accumulation and normalization
-    - Feathered mask boundary for smooth transitions
-    - Post-processing color correction to match surroundings
-    - TF32 + cuDNN benchmark on CUDA for speed
-    - FP16 precision on CUDA for doubled throughput
-    - Batched patch inference for massive speedups
+    
+    Optimized for speed and color accuracy:
+    - Processes connected components (text clusters) individually instead of the whole image.
+    - Runs single-pass inference for crops smaller than 512x512.
+    - Uses LAB color space for precise color correction to prevent washed-out results.
+    - Uses targeted feathered blending to avoid light halos.
     """
 
     def __init__(self):
         self.device = get_torch_device()
-        # Use FP16 on CUDA for massive speedup, FP32 on CPU
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-        # Enable TF32 on CUDA for tensor-core acceleration
         if self.device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -1606,7 +1601,6 @@ class HighQualityLama:
         ensure_lama_large()
         logging.info(f"[Lama High] Loading {LAMA_LARGE_PATH} on device: {self.device} (dtype={self.dtype})")
         
-        # TorchScript load with CPU fallback
         try:
             self.model = torch.jit.load(str(LAMA_LARGE_PATH), map_location=self.device)
         except Exception as e:
@@ -1622,31 +1616,18 @@ class HighQualityLama:
             pass
 
         self.patch_size = 512
-        self.stride = 256  # 50% overlap is enough for seamless blending
-        self.batch_size = 4 if self.device == "cuda" else 1 # Batch patches on GPU
+        self.stride = 384  # 25% overlap is plenty for seamless blending
+        self.batch_size = 4 if self.device == "cuda" else 1
 
-        # Wider Gaussian (sigma = patch_size/3) for softer blending
-        gauss = cv2.getGaussianKernel(self.patch_size, self.patch_size // 3)
-        self.gauss_2d = (gauss @ gauss.T).astype(np.float32)
-        self.gauss_2d /= self.gauss_2d.max()
-
-    def _infer_patches_batch(self, batch_imgs: np.ndarray, batch_masks: np.ndarray) -> np.ndarray:
-        """Run the LaMa model on a batch of 512×512 patches. Returns float32 RGB array."""
+    def _infer_batch(self, batch_imgs: np.ndarray, batch_masks: np.ndarray) -> np.ndarray:
+        """Run the LaMa model on a batch of patches."""
         img_t = (
-            torch.from_numpy(batch_imgs)
-            .float()
-            .permute(0, 3, 1, 2)
-            .to(self.device)
-            .to(self.dtype)
-            / 255.0
+            torch.from_numpy(batch_imgs).float().permute(0, 3, 1, 2)
+            .to(self.device).to(self.dtype) / 255.0
         )
         mask_t = (
-            torch.from_numpy(batch_masks)
-            .float()
-            .unsqueeze(1)
-            .to(self.device)
-            .to(self.dtype)
-            / 255.0
+            torch.from_numpy(batch_masks).float().unsqueeze(1)
+            .to(self.device).to(self.dtype) / 255.0
         )
         mask_t = (mask_t > 0.5).float()
 
@@ -1655,147 +1636,171 @@ class HighQualityLama:
 
         return (out.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.float32)
 
-    def _gen_coords(self, length: int) -> List[int]:
+    def _infer_crop(self, crop_img: np.ndarray, crop_mask: np.ndarray) -> np.ndarray:
+        """Run LaMa on a single crop. Pads to 512x512 if small enough, otherwise patches."""
+        H, W = crop_img.shape[:2]
         ps = self.patch_size
-        if length <= ps:
-            return [0]
-        coords = list(range(0, length - ps + 1, self.stride))
-        if coords[-1] != length - ps:
-            coords.append(length - ps)
-        return coords
+        
+        # Fast path: crop fits inside a single patch
+        if H <= ps and W <= ps:
+            pad_h = ps - H
+            pad_w = ps - W
+            padded_img = np.pad(crop_img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+            padded_mask = np.pad(crop_mask, ((0, pad_h), (0, pad_w)), mode="reflect")
+            
+            out = self._infer_batch(
+                np.expand_dims(padded_img, 0),
+                np.expand_dims(padded_mask, 0)
+            )[0]
+            return out[:H, :W].clip(0, 255).astype(np.uint8)
 
-    def _run_pass(self, img: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Single inpainting pass over the image. Returns the blended result."""
-        H, W = img.shape[:2]
-        ps = self.patch_size
+        # Slow path: crop requires patching
+        gauss = cv2.getGaussianKernel(ps, ps // 3)
+        gauss_2d = (gauss @ gauss.T).astype(np.float32)
+        gauss_2d /= gauss_2d.max()
 
         inpainted_acc = np.zeros((H, W, 3), dtype=np.float32)
         inpainted_weight = np.zeros((H, W), dtype=np.float32)
 
-        ys = self._gen_coords(H)
-        xs = self._gen_coords(W)
+        if H <= ps:
+            ys = [0]
+        else:
+            ys = list(range(0, H - ps + 1, self.stride))
+            if ys[-1] != H - ps: ys.append(H - ps)
+            
+        if W <= ps:
+            xs = [0]
+        else:
+            xs = list(range(0, W - ps + 1, self.stride))
+            if xs[-1] != W - ps: xs.append(W - ps)
 
-        valid_patches = []
-        valid_coords = []
-
-        # Gather all valid patches first
+        patches = []
+        coords = []
         for y in ys:
             for x in xs:
                 y1, y2 = y, y + ps
                 x1, x2 = x, x + ps
-
-                patch_img = img[y1:y2, x1:x2]
-                patch_mask = mask[y1:y2, x1:x2]
-                ph, pw = patch_img.shape[:2]
-
-                # Pad to full patch size if at image edge
-                if ph < ps or pw < ps:
-                    patch_img = np.pad(
-                        patch_img,
-                        ((0, ps - ph), (0, ps - pw), (0, 0)),
-                        mode="reflect",
-                    )
-                    patch_mask = np.pad(
-                        patch_mask,
-                        ((0, ps - ph), (0, ps - pw)),
-                        mode="reflect",
-                    )
-
-                # Skip patches with nothing to inpaint
-                if patch_mask.sum() == 0:
+                p_img = crop_img[y1:y2, x1:x2]
+                p_mask = crop_mask[y1:y2, x1:x2]
+                
+                if p_mask.sum() == 0:
                     continue
+                    
+                patches.append((p_img, p_mask))
+                coords.append((y1, y2, x1, x2))
 
-                valid_patches.append((patch_img, patch_mask))
-                valid_coords.append((y1, y2, x1, x2, ph, pw))
-
-        # Process patches in batches
-        for i in range(0, len(valid_patches), self.batch_size):
-            batch_imgs = np.stack([p[0] for p in valid_patches[i:i+self.batch_size]])
-            batch_masks = np.stack([p[1] for p in valid_patches[i:i+self.batch_size]])
+        for i in range(0, len(patches), self.batch_size):
+            batch_imgs = np.stack([p[0] for p in patches[i:i+self.batch_size]])
+            batch_masks = np.stack([p[1] for p in patches[i:i+self.batch_size]])
             
-            outs = self._infer_patches_batch(batch_imgs, batch_masks)
+            outs = self._infer_batch(batch_imgs, batch_masks)
             
             for j, out_patch in enumerate(outs):
-                y1, y2, x1, x2, ph, pw = valid_coords[i+j]
+                y1, y2, x1, x2 = coords[i+j]
+                ph, pw = y2 - y1, x2 - x1
                 out_patch = out_patch[:ph, :pw]
-                g = self.gauss_2d[:ph, :pw]
+                g = gauss_2d[:ph, :pw]
 
                 inpainted_acc[y1:y2, x1:x2] += out_patch * g[:, :, None]
                 inpainted_weight[y1:y2, x1:x2] += g
 
-        # Normalize accumulated inpainted results
         inpainted_weight_safe = inpainted_weight.copy()
         inpainted_weight_safe[inpainted_weight_safe == 0] = 1.0
-        inpainted_result = (inpainted_acc / inpainted_weight_safe[:, :, None]).clip(
-            0, 255
-        )
+        result = (inpainted_acc / inpainted_weight_safe[:, :, None]).clip(0, 255).astype(np.uint8)
+        return result
 
-        # Feather the mask for a smooth transition between original and inpainted
-        feathered = cv2.GaussianBlur(
-            (mask > 0).astype(np.float32), (7, 7), 2.0
-        )
-        feathered = np.maximum(feathered, (mask > 0).astype(np.float32))
-
-        final = (
-            inpainted_result * feathered[:, :, None]
-            + img.astype(np.float32) * (1.0 - feathered[:, :, None])
-        )
-        return final.clip(0, 255).astype(np.uint8)
-
-    def _color_correct(
-        self, inpainted: np.ndarray, mask: np.ndarray, original: np.ndarray
-    ) -> np.ndarray:
-        """Match inpainted region's per-channel mean/std to surrounding context."""
+    def _color_correct(self, inpainted: np.ndarray, mask: np.ndarray, original: np.ndarray) -> np.ndarray:
+        """Match inpainted region's LAB mean/std to surrounding context."""
+        # Convert to LAB for perceptually uniform color matching
+        inp_lab = cv2.cvtColor(inpainted, cv2.COLOR_RGB2LAB)
+        orig_lab = cv2.cvtColor(original, cv2.COLOR_RGB2LAB)
+        
         border = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=2)
         border = (border > 0) & (mask == 0)
-
+        
         if border.sum() < 20 or mask.sum() == 0:
             return inpainted
-
-        out = inpainted.astype(np.float32).copy()
+            
+        out = inp_lab.astype(np.float32)
         mask_bool = mask > 0
-
+        
         for c in range(3):
-            ref_pixels = original[border, c].astype(np.float32)
-            if len(ref_pixels) < 10:
-                continue
-            ref_mean = ref_pixels.mean()
-            ref_std = max(ref_pixels.std(), 1.0)
-
-            inp_pixels = out[mask_bool, c]
-            if len(inp_pixels) < 10:
-                continue
-            inp_mean = inp_pixels.mean()
-            inp_std = max(inp_pixels.std(), 1.0)
-
-            corrected = (out[:, :, c] - inp_mean) / inp_std * ref_std + ref_mean
-            out[:, :, c] = np.where(mask_bool, corrected, out[:, :, c])
-
-        return out.clip(0, 255).astype(np.uint8)
+            ref = orig_lab[border, c].astype(np.float32)
+            if len(ref) < 10: continue
+            ref_mean = ref.mean()
+            ref_std = max(ref.std(), 1.0)
+            
+            inp = out[mask_bool, c]
+            if len(inp) < 10: continue
+            inp_mean = inp.mean()
+            inp_std = max(inp.std(), 1.0)
+            
+            # Shift and scale the inpainted pixels to match the border
+            out[:, :, c] = np.where(
+                mask_bool, 
+                (out[:, :, c] - inp_mean) / inp_std * ref_std + ref_mean, 
+                out[:, :, c]
+            )
+            
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(out, cv2.COLOR_LAB2RGB)
 
     def __call__(self, pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
         w, h = pil_img.size
         img = np.array(pil_img.convert("RGB"))
         mask = np.array(pil_mask.convert("L"))
+        
+        # Ensure mask is strictly 0 or 255
+        mask = (mask > 127).astype(np.uint8) * 255
 
-        # Pad to multiple of 8 (LaMa dimension requirement)
-        pad_w = (8 - w % 8) % 8
-        pad_h = (8 - h % 8) % 8
-        if pad_h > 0 or pad_w > 0:
-            img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
-            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="reflect")
+        if mask.sum() == 0:
+            return pil_img
 
-        # ── Pass 1: Initial inpainting ──
-        logging.info("[Lama High] Pass 1/1 — batched inpainting...")
-        result_1 = self._run_pass(img, mask)
+        # 1. Merge close text regions to group adjacent boxes into single crops
+        # This prevents hard seams between boxes that are close together
+        merge_kernel = np.ones((51, 51), np.uint8)
+        merged_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, merge_kernel)
+        
+        # 2. Find connected components (clusters of text)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(merged_mask, connectivity=8)
+        
+        out_img = img.copy()
 
-        # ── Color correction: match inpainted stats to surrounding original ──
-        logging.info("[Lama High] Color correction...")
-        corrected = self._color_correct(result_1, mask, img)
+        for i in range(1, num_labels):
+            x, y, cw, ch, area = stats[i]
+            if cw < 2 or ch < 2:
+                continue
+                
+            # Add generous padding to the crop for background context
+            pad = 64
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(w, x + cw + pad)
+            y2 = min(h, y + ch + pad)
+            
+            crop_img = img[y1:y2, x1:x2].copy()
+            crop_mask = mask[y1:y2, x1:x2].copy()
+            
+            # 3. Inpaint the crop
+            inpainted_crop = self._infer_crop(crop_img, crop_mask)
+            
+            # 4. Color correct the crop in LAB space
+            corrected_crop = self._color_correct(inpainted_crop, crop_mask, crop_img)
+            
+            # 5. Blend the crop back into the original image
+            # Feather the mask edges slightly for a seamless transition
+            blend_mask = cv2.GaussianBlur(crop_mask, (7, 7), 2.0)
+            blend_mask = np.maximum(blend_mask, crop_mask.astype(np.float32))
+            blend_mask = (blend_mask / 255.0).clip(0, 1)
+            
+            # Alpha blend only the masked region
+            out_img[y1:y2, x1:x2] = (
+                corrected_crop.astype(np.float32) * blend_mask[:, :, None] +
+                out_img[y1:y2, x1:x2].astype(np.float32) * (1.0 - blend_mask[:, :, None])
+            ).clip(0, 255).astype(np.uint8)
 
-        # Restore original dimensions
-        corrected = corrected[:h, :w, :]
-        return Image.fromarray(corrected)
+        return Image.fromarray(out_img)
+
 
 def load_lama_high():
     """Load the high-quality LaMa model (anime-manga-big-lama.pt)."""
@@ -2138,12 +2143,34 @@ def _measure_block(draw, lines, font):
 
 def fit_font_and_wrap(draw, text, box_w, box_h,
                       font_path=None,
-                      max_size=96, min_size=8, is_vertical=False):
+                      max_size=96, min_size=8, is_vertical=False,
+                      inner_padding_ratio=0.10):
+    """Fit text to be as large as possible within an INNER box that is smaller
+    than the inpainting region.
+
+    The inner box is created by shrinking box_w/box_h by inner_padding_ratio
+    on each side (default 10% per side → 80% usable area). This ensures text
+    stays within the inpainted area with a visual margin while maximizing
+    the font size.
+
+    Returns:
+        (font_size, lines, heights, inner_w, inner_h)
+        inner_w, inner_h = dimensions of the inner box used for fitting,
+        so the caller can position text correctly within the outer bbox.
+    """
     if font_path is None:
         with _font_config_lock:
             font_path = str(_current_font_path)
+
+    # ── Create inner box (smaller than the inpainting region) ──
+    pad_x = max(2, int(box_w * inner_padding_ratio))
+    pad_y = max(2, int(box_h * inner_padding_ratio))
+    inner_w = max(8, box_w - 2 * pad_x)
+    inner_h = max(8, box_h - 2 * pad_y)
+
     if not text.strip():
-        return min_size, [""], [0]
+        return min_size, [""], [0], inner_w, inner_h
+
     if not hasattr(fit_font_and_wrap, '_cache'):
         fit_font_and_wrap._cache = {}
     cache = fit_font_and_wrap._cache
@@ -2162,23 +2189,26 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             cols = []
             cur_col = ""
             cur_h = 0
-            bb = draw.textbbox((0,0), "字", font=font)
+            bb = draw.textbbox((0, 0), "字", font=font)
             char_h = (bb[3] - bb[1]) * 1.2
-            if char_h == 0: char_h = mid
+            if char_h == 0:
+                char_h = mid
             for ch in clean_v_text:
-                if cur_h + char_h > box_h and cur_col:
+                if cur_h + char_h > inner_h and cur_col:
                     cols.append(cur_col)
                     cur_col = ch
                     cur_h = char_h
                 else:
                     cur_col += ch
                     cur_h += char_h
-            if cur_col: cols.append(cur_col)
-            if not cols: cols = [clean_v_text]
+            if cur_col:
+                cols.append(cur_col)
+            if not cols:
+                cols = [clean_v_text]
             max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else mid
             col_w = max(max_char_w, mid * 0.8)
             total_w = len(cols) * col_w
-            if total_w <= box_w - 4:
+            if total_w <= inner_w - 4:
                 best_size = mid
                 best_cols = cols
                 best_col_widths = [col_w] * len(cols)
@@ -2191,68 +2221,70 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 try: cache[key] = ImageFont.truetype(font_path, min_size)
                 except Exception: cache[key] = ImageFont.load_default()
             font = cache[key]
-            bb = draw.textbbox((0,0), "字", font=font)
+            bb = draw.textbbox((0, 0), "字", font=font)
             char_h = (bb[3] - bb[1]) * 1.2
-            if char_h == 0: char_h = min_size
+            if char_h == 0:
+                char_h = min_size
             cols = []
             cur_col = ""
             cur_h = 0
             for ch in clean_v_text:
-                if cur_h + char_h > box_h and cur_col:
+                if cur_h + char_h > inner_h and cur_col:
                     cols.append(cur_col)
                     cur_col = ch
                     cur_h = char_h
                 else:
                     cur_col += ch
                     cur_h += char_h
-            if cur_col: cols.append(cur_col)
+            if cur_col:
+                cols.append(cur_col)
             best_cols = cols if cols else [text]
             max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else min_size
             best_col_widths = [max_char_w] * len(best_cols)
             best_size = min_size
-        return best_size, best_cols, best_col_widths
+        return best_size, best_cols, best_col_widths, inner_w, inner_h
 
+    # ── Horizontal text: binary search for largest font that fits inner box ──
     lo, hi = min_size, max_size
     best_size = None
     best_lines = None
     best_heights = None
-    
+
     while lo <= hi:
         mid = (lo + hi) // 2
         key = (font_path, mid)
         if key not in cache:
-            try: cache[key] = ImageFont.truetype(font_path, mid)
-            except Exception: cache[key] = ImageFont.load_default()
+            try:
+                cache[key] = ImageFont.truetype(font_path, mid)
+            except Exception:
+                cache[key] = ImageFont.load_default()
         font = cache[key]
-        
-        lines = wrap_text(draw, text, font, box_w - 4, allow_break=False, is_vertical=False)
-        
-        # wrap_text now always returns a list of lines, never None
+
+        lines = wrap_text(draw, text, font, inner_w - 4, allow_break=False, is_vertical=False)
         heights, total_h, max_w = _measure_block(draw, lines, font)
-        
-        if max_w <= box_w - 4 and total_h <= box_h - 4:
+
+        if max_w <= inner_w - 4 and total_h <= inner_h - 4:
             best_size, best_lines, best_heights = mid, lines, heights
             lo = mid + 1
         else:
             hi = mid - 1
-            
+
     if best_lines is None:
         key = (font_path, min_size)
         if key not in cache:
-            try: cache[key] = ImageFont.truetype(font_path, min_size)
-            except Exception: cache[key] = ImageFont.load_default()
+            try:
+                cache[key] = ImageFont.truetype(font_path, min_size)
+            except Exception:
+                cache[key] = ImageFont.load_default()
         font = cache[key]
-        
-        # Even in fallback, wrap_text will not break words. 
-        # If it's too wide, it just overflows on one line.
-        fallback_lines = wrap_text(draw, text, font, box_w - 4, allow_break=True, is_vertical=False)
+
+        fallback_lines = wrap_text(draw, text, font, inner_w - 4, allow_break=True, is_vertical=False)
         best_lines = fallback_lines if fallback_lines else [text]
         heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
         best_heights = heights
-        
-    return best_size, best_lines, best_heights
 
+    return best_size, best_lines, best_heights, inner_w, inner_h
 
 # ===========================================================================
 # Text drawing with configurable stroke
@@ -2906,6 +2938,336 @@ async def get_translate_job(job_id: str):
 
 @app.post("/v1/translate/{job_id}/image")
 async def get_translated_image(job_id: str):
+    """Generate the final translated image.
+
+    Text is rendered within an INNER box that is smaller than the inpainting
+    region (10% padding per side by default). For Google Lens OCR, padding is
+    set to 0.0 so text fits the entire detected region.
+    """
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        if job["status"] != "completed":
+            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
+
+        pil_img = job["image"]
+        translations = job["result"].get("translations", [])
+        do_inpaint = job.get("inpaint", True)
+        ocr_mode = job.get("ocr_mode", _ocr_mode)
+
+    if not translations:
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+
+    img_bgr = pil_to_cv2(pil_img)
+    h, w = img_bgr.shape[:2]
+
+    boxes_to_inpaint = []
+    items_to_draw = []
+
+    # ── Collect inpaint boxes (all original sub-boxes) and draw items (union bbox) ──
+    for item in translations:
+        text = item.get("translation", "")
+        if not text or not text.strip():
+            continue
+        bbox = item.get("bbox")
+        if not bbox:
+            continue
+
+        bboxes = item.get("bboxes", [bbox])
+        for bx in bboxes:
+            bx1, by1, bx2, by2 = bx
+            if (bx2 - bx1) < 10 or (by2 - by1) < 10:
+                continue
+            boxes_to_inpaint.append(bx)
+
+        x1, y1, x2, y2 = bbox
+        if (x2 - x1) < 10 or (y2 - y1) < 10:
+            continue
+        items_to_draw.append({
+            "translation": text,
+            "bbox": bbox,
+        })
+
+    # ── Inpaint original text ──
+    if do_inpaint and boxes_to_inpaint:
+        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
+                     f"(from {len(translations)} translation groups)...")
+        mask = build_inpaint_mask(
+            img_bgr.shape,
+            boxes_to_inpaint,
+            padding=2,
+            dilate_kernel=3,
+        )
+
+        with _inpaint_mode_lock:
+            inpaint_mode = _inpaint_mode
+        use_lama = inpaint_mode == "high" or SimpleLama is not None
+        img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
+        logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
+
+    orig_bgr = pil_to_cv2(pil_img)
+
+    out_pil = cv2_to_pil(img_bgr)
+    draw = ImageDraw.Draw(out_pil)
+
+    with _font_config_lock:
+        fp = str(_current_font_path)
+
+    # ── Detect text/background colors with global polarity voting ──
+    all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
+    all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
+    color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
+
+    # ── Font size limits ──
+    HARD_MAX_SIZE = 30
+    HARD_MIN_SIZE = 15
+
+    is_lens = (ocr_mode == "lens")
+
+    for item_idx, item in enumerate(items_to_draw):
+        text = item["translation"]
+        bbox = item["bbox"]
+        x1, y1, x2, y2 = bbox
+        box_w = x2 - x1
+        box_h = y2 - y1
+
+        text_color, bg_color = color_by_idx[item_idx]
+
+        # ── Inner box padding ratio ──
+        # 0.10 (10% per side) for standard OCR to keep text away from edges.
+        # 0.0 (no padding) for Google Lens so text fills the ENTIRE region.
+        if is_lens:
+            INNER_PADDING_RATIO = 0.0
+        else:
+            INNER_PADDING_RATIO = 0.10
+
+        # ── Fit text to INNER box (or full box for Lens) ──
+        font_size, lines, heights, inner_w, inner_h = fit_font_and_wrap(
+            draw, text, box_w, box_h, font_path=fp,
+            max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE,
+            inner_padding_ratio=INNER_PADDING_RATIO,
+        )
+        font = get_font(fp, font_size)
+
+        # ── Hard clamp to [15, 30] and re-measure if needed ──
+        if font_size > HARD_MAX_SIZE:
+            font_size = HARD_MAX_SIZE
+            font = get_font(fp, font_size)
+            lines = wrap_text(draw, text, font,
+                              max_width=inner_w - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
+        elif font_size < HARD_MIN_SIZE:
+            font_size = HARD_MIN_SIZE
+            font = get_font(fp, font_size)
+            lines = wrap_text(draw, text, font,
+                              max_width=inner_w - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
+
+        # ── Compute inner box position (centered within outer bbox) ──
+        inner_x = x1 + (box_w - inner_w) // 2
+        inner_y = y1 + (box_h - inner_h) // 2
+
+        # ── Compute vertical placement (center text block within inner box) ──
+        if heights:
+            total_text_h = sum(heights)
+        else:
+            total_text_h = font_size * len(lines)
+
+        start_y = inner_y + (inner_h - total_text_h) // 2
+
+        # ── Draw each line centered horizontally within inner box ──
+        current_y = start_y
+        for i, line in enumerate(lines):
+            if not line:
+                current_y += heights[i] if i < len(heights) else font_size
+                continue
+
+            line_w = draw.textlength(line, font=font)
+            line_x = inner_x + (inner_w - line_w) / 2
+
+            draw_text_with_config(
+                draw,
+                (line_x, current_y),
+                line,
+                font=font,
+                fill=text_color,
+                stroke_fill=bg_color,
+            )
+
+            current_y += heights[i] if i < len(heights) else font_size
+
+    buf = io.BytesIO()
+    out_pil.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
+    """Generate the final translated image.
+
+    Text is rendered within an INNER box that is smaller than the inpainting
+    region (10% padding per side by default). This keeps text within the
+    cleaned area with proper margins while maximizing font size.
+    """
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        if job["status"] != "completed":
+            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
+
+        pil_img = job["image"]
+        translations = job["result"].get("translations", [])
+        do_inpaint = job.get("inpaint", True)
+        ocr_mode = job.get("ocr_mode", _ocr_mode)
+
+    if not translations:
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+
+    img_bgr = pil_to_cv2(pil_img)
+    h, w = img_bgr.shape[:2]
+
+    boxes_to_inpaint = []
+    items_to_draw = []
+
+    # ── Collect inpaint boxes (all original sub-boxes) and draw items (union bbox) ──
+    for item in translations:
+        text = item.get("translation", "")
+        if not text or not text.strip():
+            continue
+        bbox = item.get("bbox")
+        if not bbox:
+            continue
+
+        bboxes = item.get("bboxes", [bbox])
+        for bx in bboxes:
+            bx1, by1, bx2, by2 = bx
+            if (bx2 - bx1) < 10 or (by2 - by1) < 10:
+                continue
+            boxes_to_inpaint.append(bx)
+
+        x1, y1, x2, y2 = bbox
+        if (x2 - x1) < 10 or (y2 - y1) < 10:
+            continue
+        items_to_draw.append({
+            "translation": text,
+            "bbox": bbox,
+        })
+
+    # ── Inpaint original text ──
+    if do_inpaint and boxes_to_inpaint:
+        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
+                     f"(from {len(translations)} translation groups)...")
+        mask = build_inpaint_mask(
+            img_bgr.shape,
+            boxes_to_inpaint,
+            padding=2,
+            dilate_kernel=3,
+        )
+
+        with _inpaint_mode_lock:
+            inpaint_mode = _inpaint_mode
+        use_lama = inpaint_mode == "high" or SimpleLama is not None
+        img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
+        logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
+
+    orig_bgr = pil_to_cv2(pil_img)
+
+    out_pil = cv2_to_pil(img_bgr)
+    draw = ImageDraw.Draw(out_pil)
+
+    with _font_config_lock:
+        fp = str(_current_font_path)
+
+    # ── Detect text/background colors with global polarity voting ──
+    all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
+    all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
+    color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
+
+    # ── Font size limits ──
+    HARD_MAX_SIZE = 30
+    HARD_MIN_SIZE = 15
+
+    # ── Inner box padding: shrinks inpainting region to create text-safe area ──
+    # 10% padding per side → 80% of the inpainted area is usable for text
+    INNER_PADDING_RATIO = 0.10
+
+    for item_idx, item in enumerate(items_to_draw):
+        text = item["translation"]
+        bbox = item["bbox"]
+        x1, y1, x2, y2 = bbox
+        box_w = x2 - x1
+        box_h = y2 - y1
+
+        text_color, bg_color = color_by_idx[item_idx]
+
+        # ── Fit text to INNER box (smaller than inpainting region) ──
+        # fit_font_and_wrap shrinks box_w/box_h by INNER_PADDING_RATIO on each
+        # side, then binary-searches for the largest font that fits.
+        font_size, lines, heights, inner_w, inner_h = fit_font_and_wrap(
+            draw, text, box_w, box_h, font_path=fp,
+            max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE,
+            inner_padding_ratio=INNER_PADDING_RATIO,
+        )
+        font = get_font(fp, font_size)
+
+        # ── Hard clamp to [15, 30] and re-measure if needed ──
+        if font_size > HARD_MAX_SIZE:
+            font_size = HARD_MAX_SIZE
+            font = get_font(fp, font_size)
+            lines = wrap_text(draw, text, font,
+                              max_width=inner_w - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
+        elif font_size < HARD_MIN_SIZE:
+            font_size = HARD_MIN_SIZE
+            font = get_font(fp, font_size)
+            lines = wrap_text(draw, text, font,
+                              max_width=inner_w - 4,
+                              allow_break=False, is_vertical=False)
+            heights, _, _ = _measure_block(draw, lines, font)
+
+        # ── Compute inner box position (centered within outer bbox) ──
+        # The inner box is centered inside the inpainting region so text
+        # has equal margins on all sides.
+        inner_x = x1 + (box_w - inner_w) // 2
+        inner_y = y1 + (box_h - inner_h) // 2
+
+        # ── Compute vertical placement (center text block within inner box) ──
+        if heights:
+            total_text_h = sum(heights)
+        else:
+            total_text_h = font_size * len(lines)
+
+        start_y = inner_y + (inner_h - total_text_h) // 2
+
+        # ── Draw each line centered horizontally within inner box ──
+        current_y = start_y
+        for i, line in enumerate(lines):
+            if not line:
+                current_y += heights[i] if i < len(heights) else font_size
+                continue
+
+            line_w = draw.textlength(line, font=font)
+            line_x = inner_x + (inner_w - line_w) / 2
+
+            draw_text_with_config(
+                draw,
+                (line_x, current_y),
+                line,
+                font=font,
+                fill=text_color,
+                stroke_fill=bg_color,
+            )
+
+            current_y += heights[i] if i < len(heights) else font_size
+
+    buf = io.BytesIO()
+    out_pil.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
     """Generate the final translated image.
 
     The inpainting mask uses ALL original bounding boxes ("bboxes") so it
