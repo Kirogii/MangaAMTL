@@ -1,5 +1,5 @@
 <p align="center">
-  <b>Languages</b><br>
+  <b>语言 (MTL)</b><br>
   🇺🇸 <a href="README.md">English</a> |
   🇨🇳 <a href="README_cn.md">简体中文</a> |
   🇰🇷 <a href="README_ko.md">한국어</a>
