@@ -288,120 +288,148 @@
   }
 
   function injectUI() {
-    // 1. Floating Button
+    // 1. Floating Button — transparent translate button with a modern icon.
     floatBtn = document.createElement('button');
-    floatBtn.innerText = '⚙️';
+    floatBtn.title = 'Manga Translator';
+    floatBtn.setAttribute('aria-label', 'Manga Translator');
+    floatBtn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#ffffff"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/>
+        <path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>
+      </svg>`;
     floatBtn.style.cssText = `
       position: fixed; top: 50%; left: 15px; transform: translateY(-50%);
-      z-index: 2147483647; width: 50px; height: 50px;
-      background: #0052a3; color: white; border: 1px solid #007bff; border-radius: 50%;
-      cursor: pointer; font-size: 24px; box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+      z-index: 2147483647; width: 46px; height: 46px;
+      background: rgba(20,20,31,0.35); color: #fff;
+      border: 1px solid rgba(255,255,255,0.25); border-radius: 12px;
+      cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,0.25);
       display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+      opacity: 0.55; transition: opacity .15s, background .15s, border-color .15s;
+      padding: 0;
     `;
-    floatBtn.onmouseover = () => floatBtn.style.background = '#0066cc';
-    floatBtn.onmouseout  = () => floatBtn.style.background = '#0052a3';
+    floatBtn.onmouseover = () => {
+      floatBtn.style.opacity = '1';
+      floatBtn.style.background = 'rgba(34,165,82,0.85)';
+      floatBtn.style.borderColor = 'rgba(255,255,255,0.55)';
+    };
+    floatBtn.onmouseout = () => {
+      floatBtn.style.opacity = '0.55';
+      floatBtn.style.background = 'rgba(20,20,31,0.35)';
+      floatBtn.style.borderColor = 'rgba(255,255,255,0.25)';
+    };
     floatBtn.onclick = (e) => { e.stopPropagation(); toggleFloatPopup(); };
     document.body.appendChild(floatBtn);
 
-    // 2. Popup Menu — includes Target Language, Font Boldness, and Model selectors
+    // 2. Popup Menu — matches the extension popup: focal Translate button on
+    //    top, a collapsible detailed-settings panel, modern white SVG icons.
     floatPopup = document.createElement('div');
     floatPopup.style.cssText = `
-      position: fixed; top: 50%; left: 75px; transform: translateY(-50%);
-      z-index: 2147483647; padding: 15px; background: #1e1e2e;
-      border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-      font-family: Arial, sans-serif; display: none; width: 260px;
-      color: #e0e0e0; border: 1px solid #444;
-      max-height: 85vh; overflow-y: auto;
+      position: fixed; top: 50%; left: 78px; transform: translateY(-50%);
+      z-index: 2147483647; padding: 16px; background: #16161f;
+      border-radius: 12px; box-shadow: 0 8px 28px rgba(0,0,0,0.55);
+      font-family: 'Segoe UI', Arial, sans-serif; display: none; width: 300px;
+      color: #e6e6ec; border: 1px solid #2c2c3a; font-size: 14px; line-height: 1.4;
+      max-height: 88vh; overflow-y: auto; overflow-x: hidden; box-sizing: border-box;
     `;
+    // Shared style snippets (inline because content scripts can't rely on the
+    // page's CSS). `mt_` prefixed helpers mirror popup.html's classes.
+    const ICON = {
+      arrow: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:8px;"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>',
+      globe: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+      cloud: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><path d="M17.5 19a4.5 4.5 0 1 0 0-9h-1.8A7 7 0 1 0 4 15.9"/></svg>',
+      scan: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><path d="M4 7V5a2 2 0 0 1 2-2h2"/><path d="M4 17v2a2 2 0 0 0 2 2h2"/><path d="M16 3h2a2 2 0 0 1 2 2v2"/><path d="M16 21h2a2 2 0 0 0 2-2v-2"/><path d="M7 12h10"/></svg>',
+      type: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><path d="M4 20h16"/><path d="m6 16 6-12 6 12"/><path d="M8 12h8"/></svg>',
+      brain: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><path d="M12 2a3 3 0 0 0-3 3v7.5"/><path d="M12 2a3 3 0 0 1 3 3v.5"/><path d="M9 12.5A3 3 0 1 0 6 17a3 3 0 0 0 3 1"/><path d="M15 6a3 3 0 1 1 3 5"/><path d="M9 18a3 3 0 0 0 6 0v-6"/><path d="M18 11a3 3 0 1 1-3 5"/></svg>',
+      gear: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:8px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+      wrench: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:8px;"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
+    };
+    const selCss = "width:100%; padding:9px; margin:0 0 12px 0; box-sizing:border-box; border:1px solid #3a3a4c; border-radius:6px; background:#22222e; color:#e6e6ec; font-size:13px; cursor:pointer;";
+    const inCss  = "width:100%; padding:9px; margin:6px 0; box-sizing:border-box; border:1px solid #3a3a4c; border-radius:6px; background:#22222e; color:#e6e6ec; font-size:13px;";
+    const labCss = "display:flex; align-items:center; font-weight:600; color:#a9a9bd; margin-bottom:4px; font-size:13px;";
+    const secCss = "display:flex; align-items:center; font-size:12px; text-transform:uppercase; letter-spacing:.5px; color:#7a7a8c; margin:6px 0 8px 0;";
     floatPopup.innerHTML = `
-      <div style="margin-bottom: 14px;">
-        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">OCR Engine</div>
-        <select id="mtOcrModeSelect" style="
-          width: 100%; padding: 7px 8px; border-radius: 4px;
-          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
-          font-size: 13px; cursor: pointer; margin-bottom: 10px;
-        ">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#22a552" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>
+        <div style="flex:1; font-weight:700; color:#fff; font-size:16px;">Manga Translator</div>
+        <button id="mtSettingsBtn" title="Settings" aria-label="Settings" style="width:34px; height:34px; padding:0; flex:0 0 auto; background:#2a2a3c; border:1px solid #444; border-radius:8px; color:#fff; cursor:pointer; display:flex; align-items:center; justify-content:center;">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+
+      <button id="mtStartBtn" style="
+        width:100%; box-sizing:border-box; padding:15px; background:#22a552; color:#fff; border:none;
+        border-radius:8px; cursor:pointer; font-weight:600; font-size:16px; margin-bottom:12px;
+        box-shadow:0 3px 10px rgba(34,165,82,0.35); display:flex; align-items:center; justify-content:center;
+      ">${ICON.arrow}<span>Translate All</span></button>
+
+      <label style="${labCss}">${ICON.globe}Translate to</label>
+      <select id="mtTargetLangSelect" style="${selCss}"><!-- populated by JS --></select>
+
+      <div style="margin:0 0 12px 0; padding:10px; background:#1b2430; border-radius:8px; border:1px solid #3a6ea5; display:flex; align-items:center;">
+        <input type="checkbox" id="mtCloudMode" style="width:auto; margin:0;">
+        <label for="mtCloudMode" style="display:flex; align-items:center; font-weight:500; margin:0 0 0 8px; cursor:pointer; color:#d5d5e2;">${ICON.cloud}Cloud Mode — minimal PC load</label>
+      </div>
+
+      <div id="mtStatus" style="font-size:12px; color:#46c877; text-align:center; min-height:15px; margin-bottom:4px;"></div>
+
+      <div id="mtSettingsPanel" style="display:none; border-top:1px solid #2c2c3a; margin-top:4px; padding-top:14px;">
+        <div style="${secCss}">${ICON.scan}OCR</div>
+        <label style="${labCss}">OCR Engine</label>
+        <select id="mtOcrModeSelect" style="${selCss}">
           <option value="hayai">Hayai (Local, Japanese)</option>
           <option value="glm">GLM (Local, Korean)</option>
           <option value="lens">Google Lens (Cloud, All)</option>
         </select>
-        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">OCR Language</div>
-        <select id="mtOcrLangSelect" style="
-          width: 100%; padding: 7px 8px; border-radius: 4px;
-          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
-          font-size: 13px; cursor: pointer;
-        "><!-- populated by JS --></select>
-      </div>
+        <label style="${labCss}">Source Language</label>
+        <select id="mtOcrLangSelect" style="${selCss}"><!-- populated by JS --></select>
 
-      <div style="margin-bottom: 14px;">
-        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Target Language</div>
-        <select id="mtTargetLangSelect" style="
-          width: 100%; padding: 7px 8px; border-radius: 4px;
-          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
-          font-size: 13px; cursor: pointer;
-        "><!-- populated by JS --></select>
-      </div>
-
-      <div style="margin-bottom: 14px;">
-        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Font Family</div>
+        <div style="${secCss}">${ICON.type}Typesetting</div>
+        <label style="${labCss}">Font Family</label>
         <div id="mtFontFamilyScroll" style="display:flex; gap:6px; overflow-x:auto; overflow-y:hidden; white-space:nowrap; padding-bottom:4px;">
           <div style="font-size:11px; color:#888;">Loading fonts…</div>
         </div>
-        <div id="mtFontFamilyStatus" style="font-size:11px; color:#28a745; margin-top:4px; min-height:14px;"></div>
-      </div>
+        <div id="mtFontFamilyStatus" style="font-size:11px; color:#46c877; margin:4px 0 12px; min-height:14px;"></div>
 
-      <div style="margin-bottom: 14px;">
-        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Font Boldness</div>
-        <div id="mtFontWeightPicker" style="display:flex; gap:6px;">
+        <label style="${labCss}">Font Boldness</label>
+        <div id="mtFontWeightPicker" style="display:flex; gap:6px; margin-bottom:12px;">
           <div style="font-size:11px; color:#888;">Loading preview…</div>
         </div>
         <input type="hidden" id="mtFontWeightHidden" value="2">
-      </div>
 
-      <div style="margin-bottom: 14px;">
-        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Translation Model</div>
-        <select id="mtModelTypeSelect" style="
-          width: 100%; padding: 7px 8px; border-radius: 4px;
-          border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
-          font-size: 13px; cursor: pointer; margin-bottom: 8px;
-        ">
+        <div style="${secCss}">${ICON.brain}Translation Model</div>
+        <select id="mtModelTypeSelect" style="${selCss}">
           <option value="local">Local (GGUF)</option>
           <option value="openrouter">OpenRouter</option>
         </select>
-        <div id="mtOpenrouterRow" style="display:none; padding: 8px; background: #16161f; border-radius: 4px; border: 1px solid #333;">
-          <input type="text" id="mtOpenrouterModel" placeholder="e.g. openai/gpt-4o-mini" style="
-            width: 100%; padding: 7px 8px; margin-bottom: 6px; box-sizing: border-box;
-            border: 1px solid #555; border-radius: 4px; background: #2a2a3c; color: #e0e0e0; font-size: 12px;">
-          <input type="password" id="mtOpenrouterKey" placeholder="OpenRouter API Key" style="
-            width: 100%; padding: 7px 8px; margin-bottom: 6px; box-sizing: border-box;
-            border: 1px solid #555; border-radius: 4px; background: #2a2a3c; color: #e0e0e0; font-size: 12px;">
-          <button id="mtSetModelBtn" style="
-            width: 100%; padding: 8px; background: #3a3f4b; color: #fff;
-            border: 1px solid #555; border-radius: 4px; cursor: pointer;
-            font-weight: bold; font-size: 12px;
-          ">Set Model</button>
-          <div id="mtModelStatus" style="margin-top: 6px; font-size: 11px; color: #28a745;"></div>
+        <div id="mtOpenrouterRow" style="display:none; padding:10px; background:#1c1c26; border-radius:8px; border:1px solid #3a3a4c; margin-bottom:12px;">
+          <input type="text" id="mtOpenrouterModel" placeholder="e.g. openai/gpt-4o-mini" style="${inCss}">
+          <input type="password" id="mtOpenrouterKey" placeholder="OpenRouter API Key" style="${inCss}">
+          <button id="mtSetModelBtn" style="width:100%; box-sizing:border-box; padding:9px; background:#2a2a3c; color:#fff; border:1px solid #4a4a5e; border-radius:8px; cursor:pointer; font-weight:600; font-size:13px;">Set Model</button>
+          <div id="mtModelStatus" style="margin-top:6px; font-size:11px; color:#46c877;"></div>
         </div>
-      </div>
 
-      <button id="mtStartBtn" style="
-        width: 100%; padding: 10px; background: #28a745; color: white;
-        border: none; border-radius: 4px; cursor: pointer;
-        font-weight: bold; margin-bottom: 10px; font-size: 14px;
-      ">Translate All</button>
-      <button id="mtSettingsBtn" style="
-        width: 100%; padding: 10px; background: #3a3f4b; color: #fff;
-        border: 1px solid #555; border-radius: 4px; cursor: pointer;
-        font-weight: bold; font-size: 14px;
-      ">⚙️ Advanced Settings</button>
+        <button id="mtAdvancedBtn" style="width:100%; box-sizing:border-box; padding:11px; background:transparent; color:#b9b9cc; border:1px solid #3a3a4c; border-radius:8px; cursor:pointer; font-weight:500; font-size:14px; display:flex; align-items:center; justify-content:center;">${ICON.wrench}Advanced Settings</button>
+      </div>
     `;
     document.body.appendChild(floatPopup);
 
-    // Restore saved settings into the dropdowns (autoload from cache)
-    loadCachedSettingsIntoPopup();
+    // ── Wire the focal Translate button FIRST, before anything that could
+    //    throw, so it always works even if a later picker/handler errors. ──
+    wireTranslateButton();
 
-    initFontWeightPicker();
-    chrome.storage.local.get(['serverUrl'], (d) => initFontFamilyPicker(d.serverUrl || ''));
+    // Everything below is best-effort: a failure here must never stop the
+    // Translate button from working.
+    try {
+      // Restore saved settings into the dropdowns (autoload from cache)
+      loadCachedSettingsIntoPopup();
+
+      initFontWeightPicker();
+      chrome.storage.local.get(['serverUrl'], (d) => initFontFamilyPicker(d.serverUrl || ''));
+    } catch (e) {
+      console.warn('[MangaTranslator] Popup init (pickers/cache) failed:', e);
+    }
 
     // Toggle OpenRouter fields when model type changes
     document.getElementById('mtModelTypeSelect').onchange = (e) => {
@@ -442,7 +470,10 @@
       }
     };
 
-    // Translate All button — reads OCR mode/lang, target language, font weight, and model type
+    // Translate All button — reads OCR mode/lang, target language, font weight, and model type.
+    // Defined as a hoisted function so it can be wired FIRST (see above), before any
+    // best-effort init that might throw.
+    function wireTranslateButton() {
     document.getElementById('mtStartBtn').onclick = async () => {
       const selectedOcrMode   = document.getElementById('mtOcrModeSelect').value;
       const selectedOcrLang   = document.getElementById('mtOcrLangSelect').value;
@@ -509,11 +540,97 @@
 
       startTranslationProcess(selectedOcrLang, selectedLang);
     };
+    }
 
-    document.getElementById('mtSettingsBtn').onclick = () => {
-      floatPopup.style.display = 'none';
-      openSettingsModal();
-    };
+    // Remaining wiring is best-effort — guarded so a failure here can never stop
+    // the Translate button (already wired above) from working.
+    try {
+      // Gear button toggles the collapsible detailed-settings panel (keeps the
+      // Translate button the focal point, matching the extension popup).
+      document.getElementById('mtSettingsBtn').onclick = () => {
+        const panel = document.getElementById('mtSettingsPanel');
+        const open = panel.style.display === 'none';
+        panel.style.display = open ? 'block' : 'none';
+        chrome.storage.local.set({ settingsPanelOpen: open });
+      };
+      chrome.storage.local.get(['settingsPanelOpen'], (d) => {
+        document.getElementById('mtSettingsPanel').style.display = d.settingsPanelOpen === true ? 'block' : 'none';
+      });
+
+      // Advanced Settings button (inside the panel) opens the full models modal.
+      document.getElementById('mtAdvancedBtn').onclick = () => {
+        floatPopup.style.display = 'none';
+        openSettingsModal();
+      };
+
+      // Cloud Mode toggle — mirrors the popup: force lens + openrouter + none and
+      // reuse cached OpenRouter details so nothing needs re-entering.
+      const cloudEl = document.getElementById('mtCloudMode');
+      cloudEl.onchange = async (e) => {
+        const on = e.target.checked;
+        applyCloudModeToPopup(on);
+        const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
+        if (on) {
+          chrome.storage.local.set({ cloudMode: true, ocrMode: 'lens', modelType: 'openrouter', inpaintMode: 'none', colorize: false });
+          await pushCloudModeFromPopup(serverUrl);
+        } else {
+          chrome.storage.local.set({ cloudMode: false });
+          if (serverUrl) {
+            try {
+              await fetch(`${serverUrl}/SetCloudMode`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: false })
+              });
+            } catch (err) { console.warn('[MangaTranslator] Failed to disable cloud mode:', err); }
+          }
+        }
+      };
+    } catch (e) {
+      console.warn('[MangaTranslator] Popup secondary wiring failed:', e);
+    }
+  }
+
+  // Lock/unlock the local-only controls when cloud mode is toggled in the popup.
+  function applyCloudModeToPopup(on) {
+    const ocr = document.getElementById('mtOcrModeSelect');
+    const model = document.getElementById('mtModelTypeSelect');
+    const orRow = document.getElementById('mtOpenrouterRow');
+    if (on) {
+      if (ocr) ocr.value = 'lens';
+      if (model) model.value = 'openrouter';
+      if (orRow) orRow.style.display = 'block';
+    }
+    if (ocr) ocr.disabled = on;
+    if (model) model.disabled = on;
+  }
+
+  // Push cloud settings to the server, reusing cached OpenRouter details.
+  async function pushCloudModeFromPopup(serverUrl) {
+    if (!serverUrl) return;
+    const statusEl = document.getElementById('mtStatus');
+    const liveModel = document.getElementById('mtOpenrouterModel').value.trim();
+    const liveKey = document.getElementById('mtOpenrouterKey').value.trim();
+    const cached = await chrome.storage.local.get(['openrouterModel', 'openrouterApiKey']);
+    const model = liveModel || cached.openrouterModel || '';
+    const apiKey = liveKey || cached.openrouterApiKey || '';
+    try {
+      const body = { enabled: true };
+      if (model) body.model = model;
+      if (apiKey) body.api_key = apiKey;
+      const res = await fetch(`${serverUrl}/SetCloudMode`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (!res.ok) { if (statusEl) statusEl.innerText = data.detail || 'Cloud mode failed to enable.'; return; }
+      chrome.storage.local.set({
+        modelType: 'openrouter', ocrMode: 'lens', inpaintMode: 'none',
+        openrouterModel: data.openrouter_model || model, openrouterApiKey: apiKey || cached.openrouterApiKey
+      });
+      if (statusEl) statusEl.innerText = `Cloud mode on — Lens + ${data.openrouter_model || 'OpenRouter'}`;
+    } catch (e) {
+      if (statusEl) statusEl.innerText = 'Could not reach server to enable cloud mode.';
+    }
   }
 
   function toggleFloatPopup() {
