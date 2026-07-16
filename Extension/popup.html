@@ -42,15 +42,7 @@
   <input type="text" id="serverUrl" placeholder="http://localhost:7860">
 
   <label for="targetLang">Target Language:</label>
-  <select id="targetLang">
-    <option value="en">English</option>
-    <option value="ja">Japanese</option>
-    <option value="ko">Korean</option>
-    <option value="id">Indonesian</option>
-    <option value="ru">Russian</option>
-    <option value="es">Spanish</option>
-    <option value="cz">Chinese</option>
-  </select>
+  <select id="targetLang"><!-- populated by popup.js --></select>
 
   <label for="ocrMode">OCR Engine:</label>
   <select id="ocrMode">
@@ -61,13 +53,7 @@
   <div id="ocrModeStatus" class="status"></div>
 
   <label for="ocrLang">OCR Language:</label>
-  <select id="ocrLang">
-    <option value="ja">Japanese</option>
-    <option value="ko">Korean</option>
-    <option value="en">English</option>
-    <option value="zh">Chinese</option>
-    <option value="ru">Russian</option>
-  </select>
+  <select id="ocrLang"><!-- populated by popup.js --></select>
 
   <label>Font Family:</label>
   <div id="fontFamilyScroll" class="font-scroll">
@@ -116,6 +102,7 @@
 
   <div id="status" class="status"></div>
 
+  <script src="languages.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -29,6 +29,29 @@ async function getActiveFontFace(serverUrl) {
   return { face, filename, strokeWidth: info.stroke_width };
 }
 
+// Load a specific font (by filename) as a FontFace so a preview element can be
+// rendered in that font's own typeface. Returns the CSS family name, or null
+// if the font could not be loaded.
+async function loadFontFaceByName(serverUrl, filename) {
+  if (!serverUrl || !filename) return null;
+  const cacheKey = `${serverUrl}::${filename}`;
+  const family = `MTFont_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
+  if (_mtFontByteCache.has(cacheKey)) return family;
+  try {
+    const res = await fetch(`${serverUrl}/v1/font/${encodeURIComponent(filename)}`);
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    const face = new FontFace(family, buf);
+    await face.load();
+    document.fonts.add(face);
+    _mtFontByteCache.set(cacheKey, face);
+    return family;
+  } catch (e) {
+    console.warn(`[MangaTranslator] Could not load font preview for ${filename}:`, e);
+    return null;
+  }
+}
+
 function drawFontWeightSwatch(canvas, level, fontFamily) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
@@ -163,6 +186,11 @@ async function initFontFamilyPicker(serverUrl) {
     chip.dataset.filename = f.filename;
     chip.onclick = () => selectFontFamily(serverUrl, f.filename, container);
     container.appendChild(chip);
+
+    // Render each chip in its OWN typeface so the picker is a true preview.
+    loadFontFaceByName(serverUrl, f.filename).then(family => {
+      if (family) chip.style.fontFamily = `"${family}", sans-serif`;
+    });
   });
 }
 
@@ -294,35 +322,48 @@ async function pushOcrMode(serverUrl, mode) {
 // INIT — autoload all cached settings into dropdowns/fields
 // ============================================================================
 document.addEventListener('DOMContentLoaded', async () => {
-  chrome.storage.local.get(
-    ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode'],
-    (data) => {
-      document.getElementById('serverUrl').value = data.serverUrl || 'http://localhost:7860';
-      document.getElementById('ocrLang').value = data.ocrLang || 'ja';
-      document.getElementById('colorize').checked = data.colorize !== false;
-      document.getElementById('targetLang').value = data.targetLang || 'en';
-      document.getElementById('inpaintMode').value = data.inpaintMode || 'low';
-      document.getElementById('ocrMode').value = data.ocrMode || 'hayai';
+  const targetSel = document.getElementById('targetLang');
+  const ocrLangSel = document.getElementById('ocrLang');
 
-      const modelType = data.modelType || 'local';
-      document.getElementById('modelType').value = modelType;
-      document.getElementById('openrouterBox').style.display = modelType === 'openrouter' ? 'block' : 'none';
-      if (data.openrouterModel) {
-        document.getElementById('openrouterModel').value = data.openrouterModel;
-      }
-      // ★ Load cached API key (displays as •••• because input is type="password")
-      if (data.openrouterApiKey) {
-        document.getElementById('openrouterKey').value = data.openrouterApiKey;
-      }
-
-      syncInpaintModeFromServer(data.serverUrl);
-      syncOcrModeFromServer(data.serverUrl);
-    }
+  const data = await chrome.storage.local.get(
+    ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType',
+     'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode']
   );
 
-  const initUrl = (await chrome.storage.local.get(['serverUrl'])).serverUrl || '';
+  // Populate language dropdowns from the built-in list first so they're never
+  // empty, then refresh from the server (which may add/rename languages).
+  mtPopulateLangSelect(targetSel, data.targetLang || 'en');
+  mtPopulateLangSelect(ocrLangSel, data.ocrLang || 'ja');
+
+  document.getElementById('serverUrl').value = data.serverUrl || 'http://localhost:7860';
+  document.getElementById('colorize').checked = data.colorize !== false;
+  document.getElementById('inpaintMode').value = data.inpaintMode || 'low';
+  document.getElementById('ocrMode').value = data.ocrMode || 'hayai';
+
+  const modelType = data.modelType || 'local';
+  document.getElementById('modelType').value = modelType;
+  document.getElementById('openrouterBox').style.display = modelType === 'openrouter' ? 'block' : 'none';
+  if (data.openrouterModel) {
+    document.getElementById('openrouterModel').value = data.openrouterModel;
+  }
+  // ★ Load cached API key (displays as •••• because input is type="password")
+  if (data.openrouterApiKey) {
+    document.getElementById('openrouterKey').value = data.openrouterApiKey;
+  }
+
+  syncInpaintModeFromServer(data.serverUrl);
+  syncOcrModeFromServer(data.serverUrl);
+
+  const initUrl = data.serverUrl || '';
   initFontFamilyPicker(initUrl);
   initFontWeightPicker();
+
+  // Refresh language lists from the server (falls back to built-in on error).
+  if (initUrl) {
+    const langs = await mtFetchLanguages(initUrl);
+    mtPopulateLangSelect(targetSel, targetSel.value || data.targetLang || 'en', langs);
+    mtPopulateLangSelect(ocrLangSel, ocrLangSel.value || data.ocrLang || 'ja', langs);
+  }
 });
 
 document.getElementById('serverUrl').addEventListener('change', (e) => {
@@ -456,12 +497,27 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
 });
 
 document.getElementById('translateBtn').addEventListener('click', () => {
-  chrome.storage.local.get(['ocrLang', 'targetLang'], (data) => {
+  // Snapshot every current control so the choices persist across popup reopens
+  // and stay in sync with the content-script popup and options page.
+  const settings = {
+    serverUrl: document.getElementById('serverUrl').value.trim().replace(/\/$/, ''),
+    ocrMode: document.getElementById('ocrMode').value,
+    ocrLang: document.getElementById('ocrLang').value,
+    targetLang: document.getElementById('targetLang').value,
+    colorize: document.getElementById('colorize').checked,
+    inpaintMode: document.getElementById('inpaintMode').value,
+    modelType: document.getElementById('modelType').value,
+    fontWeight: document.getElementById('fontWeightHidden').value,
+    openrouterModel: document.getElementById('openrouterModel').value.trim(),
+    openrouterApiKey: document.getElementById('openrouterKey').value.trim(),
+  };
+
+  chrome.storage.local.set(settings, () => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       chrome.tabs.sendMessage(tabs[0].id, {
         action: "translateAllImages",
-        ocrLang: data.ocrLang || 'ja',
-        targetLang: data.targetLang || 'en'
+        ocrLang: settings.ocrLang,
+        targetLang: settings.targetLang
       });
       window.close();
     });

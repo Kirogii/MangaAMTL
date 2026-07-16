@@ -115,6 +115,115 @@
     });
   }
 
+  // ========================================================================
+  // FONT FAMILY PICKER (in-page popup) — renders each chip in its own typeface
+  // ========================================================================
+  const _mtFontFamilyCache = new Map();
+
+  function _mtFilenameFromPath(p) { return (p || '').split(/[\\/]/).pop(); }
+
+  async function loadFontFaceByName(serverUrl, filename) {
+    if (!serverUrl || !filename) return null;
+    const cacheKey = `${serverUrl}::${filename}`;
+    const family = `MTFamily_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    if (_mtFontFamilyCache.has(cacheKey)) return family;
+    try {
+      const res = await fetch(`${serverUrl}/v1/font/${encodeURIComponent(filename)}`);
+      if (!res.ok) return null;
+      const buf = await res.arrayBuffer();
+      const face = new FontFace(family, buf);
+      await face.load();
+      document.fonts.add(face);
+      _mtFontFamilyCache.set(cacheKey, face);
+      return family;
+    } catch (e) {
+      console.warn(`[MangaTranslator] Could not load font preview for ${filename}:`, e);
+      return null;
+    }
+  }
+
+  async function initFontFamilyPicker(serverUrl) {
+    const container = document.getElementById('mtFontFamilyScroll');
+    if (!container) return;
+
+    if (!serverUrl) {
+      container.innerHTML = '<div style="font-size:11px;color:#888;">Set a Server URL in Advanced Settings first</div>';
+      return;
+    }
+    container.innerHTML = '<div style="font-size:11px;color:#888;">Loading fonts…</div>';
+
+    let fonts = [];
+    let activeFilename = null;
+    try {
+      const [fontsRes, activeRes] = await Promise.all([
+        fetch(`${serverUrl}/GetFonts`),
+        fetch(`${serverUrl}/GetFont`)
+      ]);
+      const fontsData = await fontsRes.json();
+      const activeData = await activeRes.json();
+      fonts = fontsData.fonts || [];
+      activeFilename = _mtFilenameFromPath(activeData.font_path);
+    } catch (e) {
+      container.innerHTML = `<div style="font-size:11px;color:#ff4d4d;">Could not load fonts: ${e}</div>`;
+      return;
+    }
+
+    container.innerHTML = '';
+    if (fonts.length === 0) {
+      container.innerHTML = '<div style="font-size:11px;color:#888;">No fonts found in server fonts folder.</div>';
+      return;
+    }
+
+    fonts.forEach(f => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.dataset.filename = f.filename;
+      chip.textContent = f.name;
+      chip.title = `${f.filename} (${f.size_kb} KB)`;
+      const isActive = f.filename === activeFilename;
+      chip.style.cssText = `
+        flex: 0 0 auto; padding: 6px 11px; border-radius: 14px; cursor: pointer;
+        font-size: 12px; white-space: nowrap; color: ${isActive ? '#fff' : '#ccc'};
+        background: #2a2a3c; border: 2px solid ${isActive ? '#28a745' : '#555'};
+      `;
+      chip.onclick = () => selectFontFamily(serverUrl, f.filename, container);
+      container.appendChild(chip);
+
+      // Preview each chip in its own typeface.
+      loadFontFaceByName(serverUrl, f.filename).then(family => {
+        if (family) chip.style.fontFamily = `"${family}", sans-serif`;
+      });
+    });
+  }
+
+  async function selectFontFamily(serverUrl, filename, container) {
+    const statusEl = document.getElementById('mtFontFamilyStatus');
+    if (statusEl) statusEl.innerText = `Switching to ${filename}...`;
+    try {
+      const { fontWeight } = await chrome.storage.local.get(['fontWeight']);
+      const strokeWidth = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
+      const res = await fetch(`${serverUrl}/SetFont`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ font_name: filename, stroke_width: strokeWidth })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
+        return;
+      }
+      if (statusEl) statusEl.innerText = `Active: ${filename}`;
+      chrome.storage.local.set({ fontFamily: filename });
+      container.querySelectorAll('button').forEach(c => {
+        const on = c.dataset.filename === filename;
+        c.style.borderColor = on ? '#28a745' : '#555';
+        c.style.color = on ? '#fff' : '#ccc';
+      });
+    } catch (e) {
+      if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
+    }
+  }
+
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "translateAllImages") {
@@ -137,9 +246,23 @@
   // ========================================================================
   function loadCachedSettingsIntoPopup() {
     chrome.storage.local.get(
-      ['targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'openrouterApiKey', 'ocrMode', 'ocrLang'],
+      ['serverUrl', 'targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'openrouterApiKey', 'ocrMode', 'ocrLang'],
       (data) => {
         const sel = document.getElementById('mtTargetLangSelect');
+        const ocrLangSel = document.getElementById('mtOcrLangSelect');
+
+        // Populate language dropdowns from the built-in list (never empty),
+        // then refresh from the server so newly added languages show up.
+        if (typeof mtPopulateLangSelect === 'function') {
+          mtPopulateLangSelect(sel, data.targetLang || 'en');
+          mtPopulateLangSelect(ocrLangSel, data.ocrLang || 'ja');
+          if (data.serverUrl && typeof mtFetchLanguages === 'function') {
+            mtFetchLanguages(data.serverUrl).then(langs => {
+              mtPopulateLangSelect(sel, sel.value || data.targetLang || 'en', langs);
+              mtPopulateLangSelect(ocrLangSel, ocrLangSel.value || data.ocrLang || 'ja', langs);
+            });
+          }
+        }
         if (sel && data.targetLang) sel.value = data.targetLang;
 
         const modelTypeSel = document.getElementById('mtModelTypeSelect');
@@ -159,8 +282,7 @@
         }
         const ocrModeSel = document.getElementById('mtOcrModeSelect');
         if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
-        const ocrLangSel = document.getElementById('mtOcrLangSelect');
-        if (ocrLangSel) ocrLangSel.value = data.ocrLang || 'ja';
+        if (ocrLangSel && data.ocrLang) ocrLangSel.value = data.ocrLang;
       }
     );
   }
@@ -208,13 +330,7 @@
           width: 100%; padding: 7px 8px; border-radius: 4px;
           border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
           font-size: 13px; cursor: pointer;
-        ">
-          <option value="ja">Japanese</option>
-          <option value="ko">Korean</option>
-          <option value="en">English</option>
-          <option value="zh">Chinese</option>
-          <option value="ru">Russian</option>
-        </select>
+        "><!-- populated by JS --></select>
       </div>
 
       <div style="margin-bottom: 14px;">
@@ -223,15 +339,15 @@
           width: 100%; padding: 7px 8px; border-radius: 4px;
           border: 1px solid #555; background: #2a2a3c; color: #e0e0e0;
           font-size: 13px; cursor: pointer;
-        ">
-          <option value="en">English</option>
-          <option value="es">Spanish</option>
-          <option value="ru">Russian</option>
-          <option value="id">Indonesian</option>
-          <option value="ko">Korean</option>
-          <option value="ja">Japanese</option>
-          <option value="zh">Chinese</option>
-        </select>
+        "><!-- populated by JS --></select>
+      </div>
+
+      <div style="margin-bottom: 14px;">
+        <div style="font-weight: bold; color: #ffffff; margin-bottom: 6px;">Font Family</div>
+        <div id="mtFontFamilyScroll" style="display:flex; gap:6px; overflow-x:auto; overflow-y:hidden; white-space:nowrap; padding-bottom:4px;">
+          <div style="font-size:11px; color:#888;">Loading fonts…</div>
+        </div>
+        <div id="mtFontFamilyStatus" style="font-size:11px; color:#28a745; margin-top:4px; min-height:14px;"></div>
       </div>
 
       <div style="margin-bottom: 14px;">
@@ -285,6 +401,7 @@
     loadCachedSettingsIntoPopup();
 
     initFontWeightPicker();
+    chrome.storage.local.get(['serverUrl'], (d) => initFontFamilyPicker(d.serverUrl || ''));
 
     // Toggle OpenRouter fields when model type changes
     document.getElementById('mtModelTypeSelect').onchange = (e) => {
@@ -333,14 +450,23 @@
       const selectedWeight    = document.getElementById('mtFontWeightHidden').value;
       const selectedModelType = document.getElementById('mtModelTypeSelect').value;
 
-      // Persist choices so the extension popup stays in sync
-      chrome.storage.local.set({
+      // Persist every choice so the extension popup + options page stay in sync
+      const orModelEl = document.getElementById('mtOpenrouterModel');
+      const orKeyEl = document.getElementById('mtOpenrouterKey');
+      const settingsToCache = {
         targetLang: selectedLang,
         fontWeight: selectedWeight,
         modelType: selectedModelType,
         ocrMode: selectedOcrMode,
         ocrLang: selectedOcrLang
-      });
+      };
+      if (orModelEl && orModelEl.value.trim()) settingsToCache.openrouterModel = orModelEl.value.trim();
+      if (orKeyEl && orKeyEl.value.trim()) settingsToCache.openrouterApiKey = orKeyEl.value.trim();
+      // Include the active font family (the chip with the green border), if any.
+      const activeFamilyChip = Array.from(document.querySelectorAll('#mtFontFamilyScroll button[data-filename]'))
+        .find(c => c.style.borderColor === 'rgb(40, 167, 69)' || c.style.borderColor === '#28a745');
+      if (activeFamilyChip) settingsToCache.fontFamily = activeFamilyChip.dataset.filename;
+      chrome.storage.local.set(settingsToCache);
       floatPopup.style.display = 'none';
 
       const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
@@ -397,6 +523,7 @@
       // Re-sync dropdowns + API key with cache every time popup opens
       loadCachedSettingsIntoPopup();
       refreshFontWeightSelection();
+      chrome.storage.local.get(['serverUrl'], (d) => initFontFamilyPicker(d.serverUrl || ''));
       floatPopup.style.display = 'block';
     }
   }

@@ -936,11 +936,7 @@ async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Di
     api = get_lens_api()
     w, h = pil_img.size
     logging.info(f"[Google Lens] Running OCR on {w}x{h} image (lang={ocr_lang})...")
-    lens_lang_map = {
-        "ja": "ja", "ko": "ko", "en": "en", "zh": "zh",
-        "ru": "ru", "es": "es", "id": "id", "cz": "zh",
-    }
-    lens_lang = lens_lang_map.get(ocr_lang, ocr_lang)
+    lens_lang = lens_lang_code(ocr_lang)
     try:
         result = await api.process_image(
             image_path=pil_img, ocr_language=lens_lang, output_format='blocks'
@@ -996,22 +992,87 @@ async def get_ocr_results(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Di
 # ===========================================================================
 # Qwen GGUF translator
 # ===========================================================================
-LANG_MAP = {
-    "en": "English", "ja": "Japanese", "ko": "Korean",
-    "id": "Indonesian", "ru": "Russian", "es": "Spanish", 
-    "zh": "Chinese", "cz": "Chinese"  # cz often mistakenly used for Chinese, support both
+# ---------------------------------------------------------------------------
+# Language support — single source of truth
+# ---------------------------------------------------------------------------
+# Each entry: code -> {"name": display/prompt name, "script": writing system,
+#                      "featured": shown by default in the extension dropdowns,
+#                      "lens": Google Lens language code}
+# "script" is one of: latin, cyrillic, cjk, hangul, arabic, hebrew, thai,
+# devanagari, greek, other. It drives the output sanity-check.
+LANGUAGES: Dict[str, Dict[str, Any]] = {
+    # ── Featured (shown first in the extension) ──
+    "en": {"name": "English",    "script": "latin",    "featured": True,  "lens": "en"},
+    "ja": {"name": "Japanese",   "script": "cjk",       "featured": True,  "lens": "ja"},
+    "ko": {"name": "Korean",     "script": "hangul",    "featured": True,  "lens": "ko"},
+    "zh": {"name": "Chinese",    "script": "cjk",       "featured": True,  "lens": "zh"},
+    "id": {"name": "Indonesian", "script": "latin",     "featured": True,  "lens": "id"},
+    "ru": {"name": "Russian",    "script": "cyrillic",  "featured": True,  "lens": "ru"},
+    "es": {"name": "Spanish",    "script": "latin",     "featured": True,  "lens": "es"},
+    # ── The long tail (revealed via "More…") ──
+    "zh-tw": {"name": "Chinese (Traditional)", "script": "cjk",      "featured": False, "lens": "zh-TW"},
+    "fr": {"name": "French",      "script": "latin",     "featured": False, "lens": "fr"},
+    "de": {"name": "German",      "script": "latin",     "featured": False, "lens": "de"},
+    "it": {"name": "Italian",     "script": "latin",     "featured": False, "lens": "it"},
+    "pt": {"name": "Portuguese",  "script": "latin",     "featured": False, "lens": "pt"},
+    "pt-br": {"name": "Portuguese (Brazil)", "script": "latin",   "featured": False, "lens": "pt"},
+    "nl": {"name": "Dutch",       "script": "latin",     "featured": False, "lens": "nl"},
+    "pl": {"name": "Polish",      "script": "latin",     "featured": False, "lens": "pl"},
+    "tr": {"name": "Turkish",     "script": "latin",     "featured": False, "lens": "tr"},
+    "vi": {"name": "Vietnamese",  "script": "latin",     "featured": False, "lens": "vi"},
+    "th": {"name": "Thai",        "script": "thai",      "featured": False, "lens": "th"},
+    "ar": {"name": "Arabic",      "script": "arabic",    "featured": False, "lens": "ar"},
+    "he": {"name": "Hebrew",      "script": "hebrew",    "featured": False, "lens": "he"},
+    "hi": {"name": "Hindi",       "script": "devanagari","featured": False, "lens": "hi"},
+    "el": {"name": "Greek",       "script": "greek",     "featured": False, "lens": "el"},
+    "uk": {"name": "Ukrainian",   "script": "cyrillic",  "featured": False, "lens": "uk"},
+    "cs": {"name": "Czech",       "script": "latin",     "featured": False, "lens": "cs"},
+    "sv": {"name": "Swedish",     "script": "latin",     "featured": False, "lens": "sv"},
+    "fi": {"name": "Finnish",     "script": "latin",     "featured": False, "lens": "fi"},
+    "no": {"name": "Norwegian",   "script": "latin",     "featured": False, "lens": "no"},
+    "da": {"name": "Danish",      "script": "latin",     "featured": False, "lens": "da"},
+    "hu": {"name": "Hungarian",   "script": "latin",     "featured": False, "lens": "hu"},
+    "ro": {"name": "Romanian",    "script": "latin",     "featured": False, "lens": "ro"},
+    "fil": {"name": "Filipino",   "script": "latin",     "featured": False, "lens": "fil"},
+    "ms": {"name": "Malay",       "script": "latin",     "featured": False, "lens": "ms"},
+    "fa": {"name": "Persian",     "script": "arabic",    "featured": False, "lens": "fa"},
 }
 
-SRC_LANG_MAP = {
-    "ja": "Japanese", "ko": "Korean", "en": "English", "zh": "Chinese",
-    "ru": "Russian", "es": "Spanish", "id": "Indonesian", "cz": "Chinese"
-}
+# Aliases kept for backward compatibility with older clients.
+_LANG_ALIASES = {"cz": "zh"}
+
+def _norm_lang(code: Optional[str]) -> str:
+    """Normalize an incoming language code to a key in LANGUAGES."""
+    if not code:
+        return "en"
+    c = code.strip().lower()
+    c = _LANG_ALIASES.get(c, c)
+    return c
+
+def get_lang_name(code: str) -> str:
+    return LANGUAGES.get(_norm_lang(code), {}).get("name", "English")
+
+def lang_script(code: str) -> str:
+    return LANGUAGES.get(_norm_lang(code), {}).get("script", "latin")
+
+def lens_lang_code(code: str) -> str:
+    entry = LANGUAGES.get(_norm_lang(code))
+    return entry["lens"] if entry else _norm_lang(code)
+
+# Backward-compatible name maps (some code paths still reference these directly).
+LANG_MAP = {code: meta["name"] for code, meta in LANGUAGES.items()}
+LANG_MAP["cz"] = "Chinese"
+SRC_LANG_MAP = dict(LANG_MAP)
 
 def _script_hint(lang_name: str) -> str:
-    """Provides explicit instructions for CJK languages to prevent romanization."""
-    if lang_name in ("Japanese", "Korean", "Chinese"):
+    """Provides explicit instructions for non-Latin scripts to prevent romanization."""
+    if lang_name in ("Japanese", "Korean", "Chinese", "Chinese (Traditional)"):
         return (f"Write the translation using the native {lang_name} writing system "
                 f"(e.g. kanji/kana for Japanese, hangul for Korean, hanzi for Chinese). "
+                f"Do NOT romanize. Do NOT transliterate.")
+    if lang_name in ("Arabic", "Persian", "Hebrew", "Thai", "Hindi", "Greek", "Russian",
+                     "Ukrainian"):
+        return (f"Write the translation using the native {lang_name} script. "
                 f"Do NOT romanize. Do NOT transliterate.")
     return ""
 
@@ -1022,26 +1083,69 @@ SYSTEM_PROMPT = (
     "{script_hint}"
 )
 
+def _count_script(trans: str) -> Dict[str, int]:
+    """Count how many characters belong to each writing system."""
+    counts = {"cjk": 0, "hangul": 0, "cyrillic": 0, "arabic": 0,
+              "hebrew": 0, "thai": 0, "devanagari": 0, "greek": 0, "latin": 0}
+    for c in trans:
+        cp = ord(c)
+        if (0x3000 <= cp <= 0x2FFF + 0x1000) and not (0xAC00 <= cp <= 0xD7AF):
+            # Hiragana/Katakana/CJK ideographs/fullwidth (excluding hangul range)
+            if (0x3040 <= cp <= 0x30FF) or (0x3400 <= cp <= 0x9FFF) or (0xF900 <= cp <= 0xFAFF) or (0xFF00 <= cp <= 0xFFEF):
+                counts["cjk"] += 1
+        elif 0xAC00 <= cp <= 0xD7AF:
+            counts["hangul"] += 1
+        elif (0x0400 <= cp <= 0x04FF) or (0x0500 <= cp <= 0x052F):
+            counts["cyrillic"] += 1
+        elif (0x0600 <= cp <= 0x06FF) or (0x0750 <= cp <= 0x077F) or (0xFB50 <= cp <= 0xFDFF):
+            counts["arabic"] += 1
+        elif 0x0590 <= cp <= 0x05FF:
+            counts["hebrew"] += 1
+        elif 0x0E00 <= cp <= 0x0E7F:
+            counts["thai"] += 1
+        elif 0x0900 <= cp <= 0x097F:
+            counts["devanagari"] += 1
+        elif 0x0370 <= cp <= 0x03FF:
+            counts["greek"] += 1
+        elif (0x0041 <= cp <= 0x005A) or (0x0061 <= cp <= 0x007A) or (0x00C0 <= cp <= 0x024F):
+            counts["latin"] += 1
+    return counts
+
 def _looks_like_target(trans: str, target_lang: str) -> bool:
-    """Sanity check that the output matches the expected target language script."""
+    """Sanity check that the output matches the expected target language script.
+
+    Only rejects clear mismatches (e.g. a Latin-script target that came back
+    mostly in CJK, meaning the model echoed the source). Scripts we cannot
+    reliably distinguish are accepted rather than falsely rejected.
+    """
     if not trans:
         return False
-    # Normalize cz to zh
-    lang_code = "zh" if target_lang == "cz" else target_lang
-    
-    # Count CJK characters (Hiragana, Katakana, CJK Unified Ideographs, Hangul, Fullwidth)
-    cjk = sum(1 for c in trans if 0x3000 <= ord(c) <= 0x9FFF 
-              or 0xAC00 <= ord(c) <= 0xD7AF 
-              or 0xFF00 <= ord(c) <= 0xFFEF)
-    
-    # If target is Latin/Cyrillic script, and text is mostly CJK, it's likely a failed translation (echoing source)
-    if lang_code in ("en", "es", "id", "ru") and cjk > len(trans) * 0.3:
+
+    target_script = lang_script(target_lang)
+    counts = _count_script(trans)
+    total_scripted = sum(counts.values())
+
+    # CJK-family targets must contain their own script (else romanized/echoed).
+    if target_script == "cjk" and (counts["cjk"] + counts["hangul"]) == 0:
         return False
-        
-    # If target is CJK, and there are NO CJK characters, it's likely romanized or failed
-    if lang_code in ("ja", "ko", "zh") and cjk == 0:
+    if target_script == "hangul" and counts["hangul"] == 0:
         return False
-        
+
+    # For non-CJK targets, reject output that is mostly CJK/Hangul — the model
+    # almost certainly echoed an untranslated CJK source instead of translating.
+    if target_script not in ("cjk", "hangul"):
+        cjk_like = counts["cjk"] + counts["hangul"]
+        if cjk_like > max(2, len(trans) * 0.3):
+            return False
+
+    # Script-specific targets should show at least some of that script when the
+    # output has a meaningful amount of scripted characters.
+    strict_scripts = {"cyrillic", "arabic", "hebrew", "thai", "devanagari", "greek"}
+    if target_script in strict_scripts and total_scripted >= 4:
+        if counts[target_script] == 0 and counts["latin"] > total_scripted * 0.6:
+            # All Latin, no target script → likely romanized/failed.
+            return False
+
     return True
 
 def get_qwen():
@@ -1125,8 +1229,8 @@ def qwen_translate(text: str, target_lang: str = "en", ocr_lang: str = "ja") -> 
     text = text.strip()
     if not text:
         return ""
-    lang_name = LANG_MAP.get(target_lang, "English")
-    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
+    lang_name = get_lang_name(target_lang)
+    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
     
     max_tok = max(64, min(256, len(text) + 32))
     logging.info(f"[LLM] Starting translation for: '{text[:40]}' -> {lang_name}")
@@ -1173,8 +1277,8 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: st
     if not indexed_texts:
         return [""] * len(texts)
 
-    lang_name = LANG_MAP.get(target_lang, "English")
-    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
+    lang_name = get_lang_name(target_lang)
+    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
 
     prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (_, text) in enumerate(indexed_texts)]
     batch_text = f"[Source language: {src_lang_name}]\n" + "\n".join(prompt_lines)
@@ -1268,8 +1372,8 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
     if not indexed_texts:
         return [""] * len(texts)
 
-    lang_name = LANG_MAP.get(target_lang, "English")
-    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
+    lang_name = get_lang_name(target_lang)
+    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
     total_chars = sum(len(t) for _, t in indexed_texts)
     max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 20)))
 
@@ -1443,8 +1547,8 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
     if not text.strip():
         return ""
 
-    lang_name = LANG_MAP.get(target_lang, "English")
-    src_lang_name = SRC_LANG_MAP.get(ocr_lang, "the original language")
+    lang_name = get_lang_name(target_lang)
+    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
     max_tok = max(16, min(96, len(text) + 16))
 
     logging.info(f"[OpenRouter] Translating '{text[:40]}' -> {lang_name} using {model}")
@@ -2104,21 +2208,39 @@ def get_current_font(size: int) -> ImageFont.FreeTypeFont:
         font_path = _current_font_path
     return get_font(font_path, size)
 
+def _break_long_word(draw, word, font, max_width):
+    """Break a single word that is wider than max_width into chunks that each
+    fit. Used only as a last resort (allow_break=True) so very long strings
+    stay inside the bubble instead of overflowing horizontally."""
+    pieces = []
+    cur = ""
+    for ch in word:
+        test = cur + ch
+        if cur and draw.textlength(test, font=font) > max_width:
+            pieces.append(cur)
+            cur = ch
+        else:
+            cur = test
+    if cur:
+        pieces.append(cur)
+    return pieces or [word]
+
 def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False):
-    """Wraps text by words only. NEVER breaks a word into characters.
-    If a single word is wider than max_width, it will be placed on its own
-    line and allowed to overflow horizontally.
+    """Wraps text by words. By default a word that is wider than max_width is
+    placed on its own line and allowed to overflow. When allow_break is True
+    (last-resort fallback), such a word is split by characters so nothing
+    spills outside the bubble.
     """
     if is_vertical:
         return [text] if text else [""]
-        
+
     words = text.split()
     if not words:
         return [""]
-        
+
     lines = []
     cur = ""
-    
+
     for word in words:
         test = (cur + " " + word) if cur else word
         if draw.textlength(test, font=font) <= max_width:
@@ -2126,13 +2248,19 @@ def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False)
         else:
             if cur:
                 lines.append(cur)
-            # If the single word itself is wider than max_width, 
-            # just put it on its own line. Do not break it.
-            cur = word
-            
+                cur = ""
+            # The word itself is wider than max_width.
+            if allow_break and draw.textlength(word, font=font) > max_width:
+                pieces = _break_long_word(draw, word, font, max_width)
+                # All but the last piece are complete lines.
+                lines.extend(pieces[:-1])
+                cur = pieces[-1]
+            else:
+                cur = word
+
     if cur:
         lines.append(cur)
-        
+
     return lines
 
 def _measure_block(draw, lines, font):
@@ -2426,6 +2554,44 @@ async def get_font_file():
 
     return FileResponse(str(path), media_type=media_type, filename=path.name)
 
+@app.get("/v1/font/{filename}")
+async def get_font_file_by_name(filename: str):
+    """Serve any font file (by filename) from the fonts folder so clients can
+    render an accurate preview of *each* available font in its own typeface,
+    not just the currently-active one."""
+    # Guard against path traversal — only allow bare filenames inside FONT_DIR.
+    safe_name = pathlib.Path(filename).name
+    path = (FONT_DIR / safe_name).resolve()
+    try:
+        path.relative_to(FONT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400, "Invalid font filename")
+    if not path.exists() or path.suffix.lower() not in ('.ttf', '.otf', '.ttc'):
+        raise HTTPException(404, f"Font '{safe_name}' not found")
+
+    media_type = {
+        ".ttf": "font/ttf",
+        ".otf": "font/otf",
+        ".ttc": "font/collection",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(str(path), media_type=media_type, filename=path.name)
+
+
+# ===========================================================================
+# Languages endpoint — full list + which are featured (shown by default)
+# ===========================================================================
+@app.get("/languages")
+async def get_languages():
+    """Expose the full supported language list plus which codes are 'featured'
+    (shown by default in the extension, the rest behind a 'More…' toggle)."""
+    langs = [
+        {"code": code, "name": meta["name"],
+         "script": meta["script"], "featured": meta["featured"]}
+        for code, meta in LANGUAGES.items()
+    ]
+    featured = [l["code"] for l in langs if l["featured"]]
+    return {"languages": langs, "featured": featured, "count": len(langs)}
+
 
 # ===========================================================================
 # SetInpaintMode Endpoint (Low/High inpainting model switching)
@@ -2658,27 +2824,6 @@ async def meta():
         "inpaint_high_model_downloaded": LAMA_LARGE_PATH.exists(),
         "inpaint_high_model_path": str(LAMA_LARGE_PATH),
     }
-    with _inpaint_mode_lock:
-        inpaint_mode = _inpaint_mode
-    with _ocr_mode_lock:
-        ocr_mode = _ocr_mode
-    return {
-        "version": BUILD_ID,
-        "cuda": has_cuda(),
-        "device": get_torch_device(),
-        "ocr_mode": ocr_mode,
-        "ocr_model": _current_ocr_model,
-        "lens_available": LensAPI is not None,
-        "font_path": str(_current_font_path),
-        "stroke_width": _current_stroke_width,
-        "model_type": _current_model_type,
-        "openrouter_model": _openrouter_model if _current_model_type == "openrouter" else None,
-        "local_model": f"{_current_qwen_repo_id}/{_current_qwen_filename}" if _current_model_type == "local" else None,
-        "inpaint_lama_available": SimpleLama is not None,
-        "inpaint_mode": inpaint_mode,
-        "inpaint_high_model_downloaded": LAMA_LARGE_PATH.exists(),
-        "inpaint_high_model_path": str(LAMA_LARGE_PATH),
-    }
 
 @app.post("/warmup")
 async def warmup():
@@ -2789,6 +2934,7 @@ button:hover { background: #3a5a9a; }
 <div class="controls">
 <button onclick="fetchLogs()">Refresh</button>
 <button onclick="autoRefresh=!autoRefresh;this.textContent=autoRefresh?'Stop Auto':'Auto Refresh'">Auto Refresh</button>
+<button onclick="location.href='/fonts'">Fonts</button>
 <span id="count"></span>
 </div>
 <div id="logs"></div>
@@ -2813,6 +2959,102 @@ setInterval(() => { if(autoRefresh) fetchLogs(); }, 2000);
 @app.get("/console/json")
 async def console_json():
     return JSONResponse(content=log_handler.get_logs())
+
+# ===========================================================================
+# Fonts preview page — renders every available font in its OWN typeface
+# ===========================================================================
+@app.get("/fonts")
+async def fonts_page():
+    """A small web page that lists every font in the fonts folder and renders a
+    live sample of each in its own typeface (via @font-face + /v1/font/{name}).
+    Clicking a card sets it as the active font through /SetFont."""
+    html = """<!DOCTYPE html>
+<html><head><title>Fonts</title><meta charset="utf-8">
+<style>
+body { background: #14141f; color: #e0e0e0; font-family: Arial, sans-serif; padding: 20px; margin: 0; }
+h1 { color: #60a0ff; margin: 0 0 4px 0; }
+.sub { color: #888; font-size: 13px; margin-bottom: 16px; }
+.controls { margin-bottom: 16px; }
+input[type=text] { padding: 8px; border-radius: 4px; border: 1px solid #444; background: #2a2a3c; color: #e0e0e0; width: 260px; }
+button { background: #2a4a8a; color: #fff; border: 1px solid #4080c0; padding: 8px 14px; cursor: pointer; border-radius: 4px; margin-left: 8px; }
+button:hover { background: #3a5a9a; }
+#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+.card { background: #1e1e2e; border: 2px solid #333; border-radius: 8px; padding: 14px; cursor: pointer; transition: border-color .15s; }
+.card:hover { border-color: #4080c0; }
+.card.active { border-color: #28a745; }
+.name { font-size: 12px; color: #aaa; margin-bottom: 6px; word-break: break-all; }
+.sample { font-size: 30px; line-height: 1.25; color: #fff; min-height: 44px; }
+.sample.small { font-size: 15px; }
+.meta { font-size: 11px; color: #666; margin-top: 8px; }
+.badge { color: #28a745; font-size: 11px; font-weight: bold; }
+#status { margin-top: 14px; font-size: 13px; color: #28a745; min-height: 18px; }
+</style></head><body>
+<h1>Fonts</h1>
+<div class="sub">Each card previews a font in its own typeface. Click one to make it the active font.</div>
+<div class="controls">
+  <input type="text" id="sampleText" value="The quick brown fox — 123 あア 한글" placeholder="Preview text">
+  <button onclick="render()">Update preview</button>
+  <button onclick="load()">Refresh list</button>
+</div>
+<div id="grid"></div>
+<div id="status"></div>
+<script>
+let FONTS = [];
+let ACTIVE = '';
+let STROKE = 0;
+function filenameFromPath(p){ return (p||'').split(/[\\\\/]/).pop(); }
+async function load(){
+  const [fr, ar] = await Promise.all([fetch('/GetFonts'), fetch('/GetFont')]);
+  const fd = await fr.json(); const ad = await ar.json();
+  FONTS = fd.fonts || [];
+  ACTIVE = filenameFromPath(ad.font_path);
+  STROKE = (typeof ad.stroke_width === 'number') ? ad.stroke_width : 0;
+  // Inject an @font-face for each font so previews use the real typeface.
+  let css = '';
+  FONTS.forEach(f => {
+    const fam = 'PF_' + f.filename.replace(/[^a-zA-Z0-9]/g,'_');
+    css += '@font-face{font-family:"'+fam+'";src:url("/v1/font/'+encodeURIComponent(f.filename)+'");}\\n';
+  });
+  let styleEl = document.getElementById('pfFaces');
+  if (!styleEl){ styleEl = document.createElement('style'); styleEl.id='pfFaces'; document.head.appendChild(styleEl); }
+  styleEl.textContent = css;
+  render();
+}
+function render(){
+  const sample = document.getElementById('sampleText').value || 'AaBbCc';
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  if (!FONTS.length){ grid.innerHTML = '<div class="sub">No fonts found in the fonts folder.</div>'; return; }
+  FONTS.forEach(f => {
+    const fam = 'PF_' + f.filename.replace(/[^a-zA-Z0-9]/g,'_');
+    const card = document.createElement('div');
+    card.className = 'card' + (f.filename === ACTIVE ? ' active' : '');
+    const isActive = f.filename === ACTIVE;
+    card.innerHTML =
+      '<div class="name">'+f.name+(isActive?' <span class="badge">● active</span>':'')+'</div>'+
+      '<div class="sample" style="font-family:\\''+fam+'\\',sans-serif">'+
+        sample.replace(/</g,'&lt;')+'</div>'+
+      '<div class="meta">'+f.filename+' · '+f.size_kb+' KB</div>';
+    card.onclick = () => setActive(f.filename);
+    grid.appendChild(card);
+  });
+}
+async function setActive(filename){
+  const status = document.getElementById('status');
+  status.textContent = 'Switching to '+filename+'…';
+  try {
+    const res = await fetch('/SetFont', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({font_name: filename, stroke_width: STROKE})});
+    const data = await res.json();
+    if (!res.ok){ status.innerHTML = '<span style="color:#ff6060">Error: '+(data.detail||res.status)+'</span>'; return; }
+    ACTIVE = filenameFromPath(data.font_path) || filename;
+    status.textContent = 'Active font: '+ACTIVE;
+    render();
+  } catch(e){ status.innerHTML = '<span style="color:#ff6060">Error: '+e+'</span>'; }
+}
+load();
+</script></body></html>"""
+    return HTMLResponse(content=html)
 
 # ===========================================================================
 # Model management endpoints
@@ -3152,8 +3394,11 @@ async def get_translated_image(job_id: str):
         fp = str(_current_font_path)
 
     # ── Font size limits ──
-    HARD_MAX_SIZE = 30
-    HARD_MIN_SIZE = 15
+    # Sizing is now proportional to each bubble instead of a fixed 15–30px
+    # clamp. Large bubbles get large text; tiny bubbles shrink so the text
+    # always fits inside the region.
+    ABS_MIN_SIZE = 20    # never smaller than this (readability floor)
+    ABS_MAX_SIZE = 96   # never larger than this (sanity ceiling)
 
     is_lens = (ocr_mode == "lens")
 
@@ -3174,195 +3419,31 @@ async def get_translated_image(job_id: str):
         else:
             INNER_PADDING_RATIO = 0.10
 
-        # ── Fit text to INNER box (or full box for Lens) ──
-        font_size, lines, heights, inner_w, inner_h = fit_font_and_wrap(
-            draw, text, box_w, box_h, font_path=fp,
-            max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE,
-            inner_padding_ratio=INNER_PADDING_RATIO,
-        )
-        font = get_font(fp, font_size)
-
-        # ── Hard clamp to [15, 30] and re-measure if needed ──
-        if font_size > HARD_MAX_SIZE:
-            font_size = HARD_MAX_SIZE
-            font = get_font(fp, font_size)
-            lines = wrap_text(draw, text, font,
-                              max_width=inner_w - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
-        elif font_size < HARD_MIN_SIZE:
-            font_size = HARD_MIN_SIZE
-            font = get_font(fp, font_size)
-            lines = wrap_text(draw, text, font,
-                              max_width=inner_w - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
-
-        # ── Compute inner box position (centered within outer bbox) ──
-        inner_x = x1 + (box_w - inner_w) // 2
-        inner_y = y1 + (box_h - inner_h) // 2
-
-        # ── Compute vertical placement (center text block within inner box) ──
-        if heights:
-            total_text_h = sum(heights)
-        else:
-            total_text_h = font_size * len(lines)
-
-        start_y = inner_y + (inner_h - total_text_h) // 2
-
-        # ── Draw each line centered horizontally within inner box ──
-        current_y = start_y
-        for i, line in enumerate(lines):
-            if not line:
-                current_y += heights[i] if i < len(heights) else font_size
-                continue
-
-            line_w = draw.textlength(line, font=font)
-            line_x = inner_x + (inner_w - line_w) / 2
-
-            draw_text_with_config(
-                draw,
-                (line_x, current_y),
-                line,
-                font=font,
-                fill=text_color,
-                stroke_fill=bg_color,
-            )
-
-            current_y += heights[i] if i < len(heights) else font_size
-
-    buf = io.BytesIO()
-    out_pil.save(buf, format="PNG")
-    return Response(content=buf.getvalue(), media_type="image/png")
-    """Generate the final translated image.
-
-    Text is rendered within an INNER box that is smaller than the inpainting
-    region (10% padding per side by default). For Google Lens OCR, padding is
-    set to 0.0 so text fits the entire detected region.
-    """
-    async with _job_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(404, f"Job {job_id} not found")
-        if job["status"] != "completed":
-            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
-
-        pil_img = job["image"]
-        translations = job["result"].get("translations", [])
-        do_inpaint = job.get("inpaint", True)
-        ocr_mode = job.get("ocr_mode", _ocr_mode)
-
-    if not translations:
-        buf = io.BytesIO()
-        pil_img.save(buf, format="PNG")
-        return Response(content=buf.getvalue(), media_type="image/png")
-
-    img_bgr = pil_to_cv2(pil_img)
-    h, w = img_bgr.shape[:2]
-
-    boxes_to_inpaint = []
-    items_to_draw = []
-
-    # ── Collect inpaint boxes (all original sub-boxes) and draw items (union bbox) ──
-    for item in translations:
-        text = item.get("translation", "")
-        if not text or not text.strip():
-            continue
-        bbox = item.get("bbox")
-        if not bbox:
-            continue
-
-        bboxes = item.get("bboxes", [bbox])
-        for bx in bboxes:
-            bx1, by1, bx2, by2 = bx
-            if (bx2 - bx1) < 10 or (by2 - by1) < 10:
-                continue
-            boxes_to_inpaint.append(bx)
-
-        x1, y1, x2, y2 = bbox
-        if (x2 - x1) < 10 or (y2 - y1) < 10:
-            continue
-        items_to_draw.append({
-            "translation": text,
-            "bbox": bbox,
-        })
-
-    # ── Inpaint original text ──
-    if do_inpaint and boxes_to_inpaint:
-        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
-                     f"(from {len(translations)} translation groups)...")
-        mask = build_inpaint_mask(
-            img_bgr.shape,
-            boxes_to_inpaint,
-            padding=2,
-            dilate_kernel=3,
-        )
-
-        with _inpaint_mode_lock:
-            inpaint_mode = _inpaint_mode
-        use_lama = inpaint_mode == "high" or SimpleLama is not None
-        img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
-        logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
-
-    orig_bgr = pil_to_cv2(pil_img)
-
-    out_pil = cv2_to_pil(img_bgr)
-    draw = ImageDraw.Draw(out_pil)
-
-    with _font_config_lock:
-        fp = str(_current_font_path)
-
-    # ── Detect text/background colors with global polarity voting ──
-    all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
-    all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
-    color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
-
-    # ── Font size limits ──
-    HARD_MAX_SIZE = 30
-    HARD_MIN_SIZE = 15
-
-    is_lens = (ocr_mode == "lens")
-
-    for item_idx, item in enumerate(items_to_draw):
-        text = item["translation"]
-        bbox = item["bbox"]
-        x1, y1, x2, y2 = bbox
-        box_w = x2 - x1
-        box_h = y2 - y1
-
-        text_color, bg_color = color_by_idx[item_idx]
-
-        # ── Inner box padding ratio ──
-        # 0.10 (10% per side) for standard OCR to keep text away from edges.
-        # 0.0 (no padding) for Google Lens so text fills the ENTIRE region.
-        if is_lens:
-            INNER_PADDING_RATIO = 0.0
-        else:
-            INNER_PADDING_RATIO = 0.10
+        # ── Per-bubble dynamic size range ──
+        # The upper bound scales with the box so a big bubble can host big
+        # text. The binary search inside fit_font_and_wrap still guarantees
+        # the wrapped block fits both the inner width and height.
+        dyn_max = int(box_h * (1.0 if is_lens else 0.9))
+        dyn_max = max(ABS_MIN_SIZE + 1, min(ABS_MAX_SIZE, dyn_max))
+        dyn_min = ABS_MIN_SIZE
 
         # ── Fit text to INNER box (or full box for Lens) ──
         font_size, lines, heights, inner_w, inner_h = fit_font_and_wrap(
             draw, text, box_w, box_h, font_path=fp,
-            max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE,
+            max_size=dyn_max, min_size=dyn_min,
             inner_padding_ratio=INNER_PADDING_RATIO,
         )
         font = get_font(fp, font_size)
 
-        # ── Hard clamp to [15, 30] and re-measure if needed ──
-        if font_size > HARD_MAX_SIZE:
-            font_size = HARD_MAX_SIZE
-            font = get_font(fp, font_size)
-            lines = wrap_text(draw, text, font,
-                              max_width=inner_w - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
-        elif font_size < HARD_MIN_SIZE:
-            font_size = HARD_MIN_SIZE
-            font = get_font(fp, font_size)
-            lines = wrap_text(draw, text, font,
-                              max_width=inner_w - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
+        # ── If even the smallest size overflowed vertically, allow
+        #    character-level breaking so long words wrap instead of
+        #    spilling outside the bubble ──
+        if heights and sum(heights) > inner_h - 4:
+            broken = wrap_text(draw, text, font,
+                               max_width=inner_w - 4,
+                               allow_break=True, is_vertical=False)
+            heights, _, _ = _measure_block(draw, broken, font)
+            lines = broken
 
         # ── Compute inner box position (centered within outer bbox) ──
         inner_x = x1 + (box_w - inner_w) // 2
@@ -3400,364 +3481,7 @@ async def get_translated_image(job_id: str):
     buf = io.BytesIO()
     out_pil.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
-    """Generate the final translated image.
 
-    Text is rendered within an INNER box that is smaller than the inpainting
-    region (10% padding per side by default). This keeps text within the
-    cleaned area with proper margins while maximizing font size.
-    """
-    async with _job_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(404, f"Job {job_id} not found")
-        if job["status"] != "completed":
-            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
-
-        pil_img = job["image"]
-        translations = job["result"].get("translations", [])
-        do_inpaint = job.get("inpaint", True)
-        ocr_mode = job.get("ocr_mode", _ocr_mode)
-
-    if not translations:
-        buf = io.BytesIO()
-        pil_img.save(buf, format="PNG")
-        return Response(content=buf.getvalue(), media_type="image/png")
-
-    img_bgr = pil_to_cv2(pil_img)
-    h, w = img_bgr.shape[:2]
-
-    boxes_to_inpaint = []
-    items_to_draw = []
-
-    # ── Collect inpaint boxes (all original sub-boxes) and draw items (union bbox) ──
-    for item in translations:
-        text = item.get("translation", "")
-        if not text or not text.strip():
-            continue
-        bbox = item.get("bbox")
-        if not bbox:
-            continue
-
-        bboxes = item.get("bboxes", [bbox])
-        for bx in bboxes:
-            bx1, by1, bx2, by2 = bx
-            if (bx2 - bx1) < 10 or (by2 - by1) < 10:
-                continue
-            boxes_to_inpaint.append(bx)
-
-        x1, y1, x2, y2 = bbox
-        if (x2 - x1) < 10 or (y2 - y1) < 10:
-            continue
-        items_to_draw.append({
-            "translation": text,
-            "bbox": bbox,
-        })
-
-    # ── Inpaint original text ──
-    if do_inpaint and boxes_to_inpaint:
-        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
-                     f"(from {len(translations)} translation groups)...")
-        mask = build_inpaint_mask(
-            img_bgr.shape,
-            boxes_to_inpaint,
-            padding=2,
-            dilate_kernel=3,
-        )
-
-        with _inpaint_mode_lock:
-            inpaint_mode = _inpaint_mode
-        use_lama = inpaint_mode == "high" or SimpleLama is not None
-        img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
-        logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
-
-    orig_bgr = pil_to_cv2(pil_img)
-
-    out_pil = cv2_to_pil(img_bgr)
-    draw = ImageDraw.Draw(out_pil)
-
-    with _font_config_lock:
-        fp = str(_current_font_path)
-
-    # ── Detect text/background colors with global polarity voting ──
-    all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
-    all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
-    color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
-
-    # ── Font size limits ──
-    HARD_MAX_SIZE = 30
-    HARD_MIN_SIZE = 15
-
-    # ── Inner box padding: shrinks inpainting region to create text-safe area ──
-    # 10% padding per side → 80% of the inpainted area is usable for text
-    INNER_PADDING_RATIO = 0.10
-
-    for item_idx, item in enumerate(items_to_draw):
-        text = item["translation"]
-        bbox = item["bbox"]
-        x1, y1, x2, y2 = bbox
-        box_w = x2 - x1
-        box_h = y2 - y1
-
-        text_color, bg_color = color_by_idx[item_idx]
-
-        # ── Fit text to INNER box (smaller than inpainting region) ──
-        # fit_font_and_wrap shrinks box_w/box_h by INNER_PADDING_RATIO on each
-        # side, then binary-searches for the largest font that fits.
-        font_size, lines, heights, inner_w, inner_h = fit_font_and_wrap(
-            draw, text, box_w, box_h, font_path=fp,
-            max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE,
-            inner_padding_ratio=INNER_PADDING_RATIO,
-        )
-        font = get_font(fp, font_size)
-
-        # ── Hard clamp to [15, 30] and re-measure if needed ──
-        if font_size > HARD_MAX_SIZE:
-            font_size = HARD_MAX_SIZE
-            font = get_font(fp, font_size)
-            lines = wrap_text(draw, text, font,
-                              max_width=inner_w - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
-        elif font_size < HARD_MIN_SIZE:
-            font_size = HARD_MIN_SIZE
-            font = get_font(fp, font_size)
-            lines = wrap_text(draw, text, font,
-                              max_width=inner_w - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
-
-        # ── Compute inner box position (centered within outer bbox) ──
-        # The inner box is centered inside the inpainting region so text
-        # has equal margins on all sides.
-        inner_x = x1 + (box_w - inner_w) // 2
-        inner_y = y1 + (box_h - inner_h) // 2
-
-        # ── Compute vertical placement (center text block within inner box) ──
-        if heights:
-            total_text_h = sum(heights)
-        else:
-            total_text_h = font_size * len(lines)
-
-        start_y = inner_y + (inner_h - total_text_h) // 2
-
-        # ── Draw each line centered horizontally within inner box ──
-        current_y = start_y
-        for i, line in enumerate(lines):
-            if not line:
-                current_y += heights[i] if i < len(heights) else font_size
-                continue
-
-            line_w = draw.textlength(line, font=font)
-            line_x = inner_x + (inner_w - line_w) / 2
-
-            draw_text_with_config(
-                draw,
-                (line_x, current_y),
-                line,
-                font=font,
-                fill=text_color,
-                stroke_fill=bg_color,
-            )
-
-            current_y += heights[i] if i < len(heights) else font_size
-
-    buf = io.BytesIO()
-    out_pil.save(buf, format="PNG")
-    return Response(content=buf.getvalue(), media_type="image/png")
-    """Generate the final translated image.
-
-    The inpainting mask uses ALL original bounding boxes ("bboxes") so it
-    erases text in place without covering the middle empty space.
-    The text rendering uses the union "bbox" so the combined translation
-    is drawn once cleanly without duplicating or squishing.
-    """
-    async with _job_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(404, f"Job {job_id} not found")
-        if job["status"] != "completed":
-            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
-
-        pil_img = job["image"]
-        translations = job["result"].get("translations", [])
-        do_inpaint = job.get("inpaint", True)
-        ocr_mode = job.get("ocr_mode", _ocr_mode)
-
-    if not translations:
-        buf = io.BytesIO()
-        pil_img.save(buf, format="PNG")
-        return Response(content=buf.getvalue(), media_type="image/png")
-
-    img_bgr = pil_to_cv2(pil_img)
-    h, w = img_bgr.shape[:2]
-
-    boxes_to_inpaint = []
-    items_to_draw = []
-
-    # ── Expand regions for inpainting, but keep text as 1 union box ──
-    for item in translations:
-        text = item.get("translation", "")
-        if not text or not text.strip():
-            continue
-        bbox = item.get("bbox")
-        if not bbox:
-            continue
-
-        # 1. Add ALL original bboxes to the inpainting list (combine in place)
-        bboxes = item.get("bboxes", [bbox])
-        for bx in bboxes:
-            bx1, by1, bx2, by2 = bx
-            if (bx2 - bx1) < 10 or (by2 - by1) < 10:
-                continue
-            boxes_to_inpaint.append(bx)
-
-        # 2. Add the UNION bbox to the draw list (don't split text)
-        x1, y1, x2, y2 = bbox
-        if (x2 - x1) < 10 or (y2 - y1) < 10:
-            continue
-        items_to_draw.append({
-            "translation": text,
-            "bbox": bbox,  # The merged union box
-        })
-
-    if do_inpaint and boxes_to_inpaint:
-        logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
-                     f"(expanded from {len(translations)} translation groups)...")
-        mask = build_inpaint_mask(
-            img_bgr.shape,
-            boxes_to_inpaint,
-            padding=2,
-            dilate_kernel=3,
-        )
-
-        with _inpaint_mode_lock:
-            inpaint_mode = _inpaint_mode
-        use_lama = inpaint_mode == "high" or SimpleLama is not None
-        img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
-        logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
-
-    orig_bgr = pil_to_cv2(pil_img)
-
-    out_pil = cv2_to_pil(img_bgr)
-    draw = ImageDraw.Draw(out_pil)
-
-    with _font_config_lock:
-        fp = str(_current_font_path)
-
-    # --- Detect colors for ALL union boxes at once with global polarity voting ---
-    all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
-    all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
-    color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
-
-    # ---- FIXED SIZE RANGE: 15-30 px (hard cap, both Lens & non-Lens) ----
-    HARD_MAX_SIZE = 30
-    HARD_MIN_SIZE = 15
-
-    LENS_OVERFLOW_PX          = 1
-    LENS_SMALL_BOX_THRESHOLD  = 24
-
-    is_lens = (ocr_mode == "lens")
-
-    for item_idx, item in enumerate(items_to_draw):
-        text = item["translation"]
-        bbox = item["bbox"]
-        x1, y1, x2, y2 = bbox
-        box_w = x2 - x1
-        box_h = y2 - y1
-
-        text_color, bg_color = color_by_idx[item_idx]
-
-        # -------- Pick font size + lines (always clamped to 15-30) --------
-        if is_lens:
-            really_small = (box_w < LENS_SMALL_BOX_THRESHOLD or
-                            box_h < LENS_SMALL_BOX_THRESHOLD)
-
-            if really_small:
-                # Even for tiny boxes, never exceed 30 or go below 15
-                font_size = HARD_MIN_SIZE
-                font = get_font(fp, font_size)
-                lines = wrap_text(draw, text, font,
-                                  max_width=max(box_w, font_size * 3),
-                                  allow_break=True, is_vertical=False)
-                if not lines:
-                    lines = [text]
-                heights, _, _ = _measure_block(draw, lines, font)
-            else:
-                fit_w = box_w + LENS_OVERFLOW_PX * 2
-                fit_h = box_h + LENS_OVERFLOW_PX * 2
-                font_size, lines, heights = fit_font_and_wrap(
-                    draw, text, fit_w, fit_h, font_path=fp,
-                    max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE
-                )
-                font = get_font(fp, font_size)
-        else:
-            font_size, lines, heights = fit_font_and_wrap(
-                draw, text, box_w, box_h, font_path=fp,
-                max_size=HARD_MAX_SIZE, min_size=HARD_MIN_SIZE
-            )
-            font = get_font(fp, font_size)
-
-        # ---- FINAL HARD CLAMP: guarantee 15-30 ----
-        if font_size > HARD_MAX_SIZE:
-            font_size = HARD_MAX_SIZE
-            font = get_font(fp, font_size)
-            # re-measure lines with the clamped font
-            lines = wrap_text(draw, text, font,
-                              max_width=(box_w + (LENS_OVERFLOW_PX * 2 if is_lens else 0)) - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
-        elif font_size < HARD_MIN_SIZE:
-            font_size = HARD_MIN_SIZE
-            font = get_font(fp, font_size)
-            lines = wrap_text(draw, text, font,
-                              max_width=(box_w + (LENS_OVERFLOW_PX * 2 if is_lens else 0)) - 4,
-                              allow_break=False, is_vertical=False)
-            heights, _, _ = _measure_block(draw, lines, font)
-
-        # -------- Compute vertical placement --------
-        if heights:
-            total_text_h = sum(heights)
-        else:
-            total_text_h = font_size * len(lines)
-
-        if is_lens and not (box_w < LENS_SMALL_BOX_THRESHOLD or
-                            box_h < LENS_SMALL_BOX_THRESHOLD):
-            outer_h = box_h + LENS_OVERFLOW_PX * 2
-            start_y = (y1 - LENS_OVERFLOW_PX) + (outer_h - total_text_h) // 2
-        else:
-            start_y = y1 + (box_h - total_text_h) // 2
-
-        # -------- Draw each line --------
-        current_y = start_y
-        for i, line in enumerate(lines):
-            if not line:
-                current_y += heights[i] if i < len(heights) else font_size
-                continue
-
-            line_w = draw.textlength(line, font=font)
-
-            if is_lens and not (box_w < LENS_SMALL_BOX_THRESHOLD or
-                                box_h < LENS_SMALL_BOX_THRESHOLD):
-                outer_w = box_w + LENS_OVERFLOW_PX * 2
-                line_x = (x1 - LENS_OVERFLOW_PX) + (outer_w - line_w) / 2
-            else:
-                line_x = x1 + (box_w - line_w) / 2
-
-            draw_text_with_config(
-                draw,
-                (line_x, current_y),
-                line,
-                font=font,
-                fill=text_color,
-                stroke_fill=bg_color,
-            )
-
-            current_y += heights[i] if i < len(heights) else font_size
-
-    buf = io.BytesIO()
-    out_pil.save(buf, format="PNG")
-    return Response(content=buf.getvalue(), media_type="image/png")
- 
 # ===========================================================================
 # Main entry point
 # ===========================================================================

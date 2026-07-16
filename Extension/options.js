@@ -7,6 +7,28 @@ function _mtFontFilenameFromPath(fontPath) {
   return (fontPath || '').split(/[\\/]/).pop();
 }
 
+// Load an arbitrary font file (by filename) as a FontFace so each chip in the
+// font picker can be rendered in its OWN typeface — a true preview.
+async function loadFontFaceByName(serverUrl, filename) {
+  if (!serverUrl || !filename) return null;
+  const cacheKey = `${serverUrl}::${filename}`;
+  const family = `MTFontOptions_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
+  if (_mtFontByteCache.has(cacheKey)) return family;
+  try {
+    const res = await fetch(`${serverUrl}/v1/font/${encodeURIComponent(filename)}`);
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    const face = new FontFace(family, buf);
+    await face.load();
+    document.fonts.add(face);
+    _mtFontByteCache.set(cacheKey, face);
+    return family;
+  } catch (e) {
+    console.warn(`[MangaTranslator] Could not load font preview for ${filename}:`, e);
+    return null;
+  }
+}
+
 async function getActiveFontFace(serverUrl) {
   const infoRes = await fetch(`${serverUrl}/GetFont`);
   if (!infoRes.ok) throw new Error(`GetFont failed: HTTP ${infoRes.status}`);
@@ -178,6 +200,11 @@ async function initFontFamilyPicker(serverUrl) {
     chip.dataset.filename = f.filename;
     chip.onclick = () => selectFontFamily(serverUrl, f.filename, container);
     container.appendChild(chip);
+
+    // Render each chip in its OWN typeface so the picker is a true preview.
+    loadFontFaceByName(serverUrl, f.filename).then(family => {
+      if (family) chip.style.fontFamily = `"${family}", sans-serif`;
+    });
   });
 }
 
