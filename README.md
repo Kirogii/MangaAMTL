@@ -1,3 +1,9 @@
+<p align="center">
+  <b>Languages  (MTL)</b><br>
+  🇺🇸 <a href="README.md">English</a> |
+  🇨🇳 <a href="README_cn.md">简体中文</a> |
+  🇰🇷 <a href="README_ko.md">한국어</a>
+</p>
 <div align="center">
 
 <img src="https://github.com/Kirogii/MangaAMTL/blob/main/Images/English2.png?raw=true" alt="Preview1" width="45%" />
