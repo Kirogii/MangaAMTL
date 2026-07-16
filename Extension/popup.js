@@ -319,6 +319,67 @@ async function pushOcrMode(serverUrl, mode) {
 }
 
 // ============================================================================
+// CLOUD MODE — offload everything to the cloud, use minimum local resources.
+// Forces Google Lens OCR + OpenRouter translation + no local inpainting model,
+// and disables colorization (a heavy local model). The local-only controls are
+// disabled while cloud mode is on so the choices can't drift out of sync.
+// ============================================================================
+function applyCloudMode(on) {
+  const ocrModeEl   = document.getElementById('ocrMode');
+  const modelTypeEl = document.getElementById('modelType');
+  const inpaintEl   = document.getElementById('inpaintMode');
+  const colorizeEl  = document.getElementById('colorize');
+  const orBox       = document.getElementById('openrouterBox');
+
+  if (on) {
+    ocrModeEl.value = 'lens';
+    modelTypeEl.value = 'openrouter';
+    inpaintEl.value = 'none';
+    colorizeEl.checked = false;
+    orBox.style.display = 'block';          // still need the API key/model fields
+  }
+  // Lock the local-resource controls while cloud mode is active.
+  [ocrModeEl, inpaintEl, colorizeEl].forEach(el => { el.disabled = on; });
+  modelTypeEl.disabled = on;
+}
+
+// Push the cloud-mode server settings (lens + openrouter + none) so the backend
+// stops loading local models. Reuses the OpenRouter model + API key the user
+// already saved so they don't have to re-enter them. Best-effort; errors are
+// logged, not fatal.
+async function pushCloudModeToServer(serverUrl) {
+  if (!serverUrl) return;
+  await pushOcrMode(serverUrl, 'lens');
+  await pushInpaintMode(serverUrl, 'none');
+
+  // Reuse previously entered OpenRouter details (prefer the live fields, fall
+  // back to what's cached in storage) so cloud mode works without re-typing.
+  const liveModel = document.getElementById('openrouterModel').value.trim();
+  const liveKey = document.getElementById('openrouterKey').value.trim();
+  const cached = await chrome.storage.local.get(['openrouterModel', 'openrouterApiKey']);
+  const model = liveModel || cached.openrouterModel || '';
+  const apiKey = liveKey || cached.openrouterApiKey || '';
+
+  if (!model || !apiKey) {
+    const statusEl = document.getElementById('status');
+    if (statusEl) statusEl.innerText = 'Cloud mode needs an OpenRouter model + API key (set once in the model box).';
+    return;
+  }
+
+  try {
+    await fetch(`${serverUrl}/SetModelType`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_type: 'openrouter', model, api_key: apiKey }),
+    });
+    // Re-cache so both popups + options stay in sync.
+    chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model, openrouterApiKey: apiKey });
+  } catch (e) {
+    console.warn('[MangaTranslator] Cloud mode: failed to push OpenRouter model to server:', e);
+  }
+}
+
+// ============================================================================
 // INIT — autoload all cached settings into dropdowns/fields
 // ============================================================================
 document.addEventListener('DOMContentLoaded', async () => {
@@ -327,7 +388,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const data = await chrome.storage.local.get(
     ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType',
-     'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode']
+     'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'cloudMode']
   );
 
   // Populate language dropdowns from the built-in list first so they're never
@@ -350,6 +411,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (data.openrouterApiKey) {
     document.getElementById('openrouterKey').value = data.openrouterApiKey;
   }
+
+  // ★ Cloud Mode — restore the toggle and apply its locked state.
+  const cloudOn = data.cloudMode === true;
+  document.getElementById('cloudMode').checked = cloudOn;
+  applyCloudMode(cloudOn);
 
   syncInpaintModeFromServer(data.serverUrl);
   syncOcrModeFromServer(data.serverUrl);
@@ -392,6 +458,27 @@ document.getElementById('ocrMode').addEventListener('change', (e) => {
   const serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
   chrome.storage.local.set({ ocrMode: e.target.value });
   pushOcrMode(serverUrl, e.target.value);
+});
+
+document.getElementById('cloudMode').addEventListener('change', async (e) => {
+  const on = e.target.checked;
+  applyCloudMode(on);
+  const serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+
+  if (on) {
+    // Persist the forced cloud selections so every surface stays in sync.
+    chrome.storage.local.set({
+      cloudMode: true,
+      ocrMode: 'lens',
+      modelType: 'openrouter',
+      inpaintMode: 'none',
+      colorize: false,
+    });
+    await pushCloudModeToServer(serverUrl);
+  } else {
+    // Leaving cloud mode: keep the current (now re-enabled) selections as-is.
+    chrome.storage.local.set({ cloudMode: false });
+  }
 });
 
 // ============================================================================
@@ -449,6 +536,7 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
   const inpaintMode = document.getElementById('inpaintMode').value;
   const openrouterModel = document.getElementById('openrouterModel').value.trim();
   const openrouterApiKey = document.getElementById('openrouterKey').value.trim();
+  const cloudMode = document.getElementById('cloudMode').checked;
 
   // ★ Cache all settings including the API key
   chrome.storage.local.set({
@@ -461,7 +549,8 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
     modelType: modelType,
     inpaintMode: inpaintMode,
     openrouterModel: openrouterModel,
-    openrouterApiKey: openrouterApiKey
+    openrouterApiKey: openrouterApiKey,
+    cloudMode: cloudMode
   }, () => {
     const status = document.getElementById('status');
     status.innerText = 'Settings saved & cached!';
@@ -496,9 +585,10 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
   }
 });
 
-document.getElementById('translateBtn').addEventListener('click', () => {
+document.getElementById('translateBtn').addEventListener('click', async () => {
   // Snapshot every current control so the choices persist across popup reopens
   // and stay in sync with the content-script popup and options page.
+  const cloudMode = document.getElementById('cloudMode').checked;
   const settings = {
     serverUrl: document.getElementById('serverUrl').value.trim().replace(/\/$/, ''),
     ocrMode: document.getElementById('ocrMode').value,
@@ -510,7 +600,15 @@ document.getElementById('translateBtn').addEventListener('click', () => {
     fontWeight: document.getElementById('fontWeightHidden').value,
     openrouterModel: document.getElementById('openrouterModel').value.trim(),
     openrouterApiKey: document.getElementById('openrouterKey').value.trim(),
+    cloudMode: cloudMode,
   };
+
+  // In cloud mode, make sure the server is actually configured for the cloud
+  // path (Google Lens + OpenRouter + no local inpaint) using the OpenRouter
+  // details the user already entered — no need to re-type them.
+  if (cloudMode && settings.serverUrl) {
+    await pushCloudModeToServer(settings.serverUrl);
+  }
 
   chrome.storage.local.set(settings, () => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {

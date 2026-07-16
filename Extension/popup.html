@@ -38,6 +38,13 @@
 </head>
 <body>
   <h3>Manga Translator API</h3>
+
+  <div class="checkbox-group" style="border-color:#4080c0;">
+    <input type="checkbox" id="cloudMode">
+    <label for="cloudMode">☁️ Cloud Mode (minimal local resources)</label>
+  </div>
+  <div class="hint">Forces Google Lens OCR + OpenRouter translation and skips local inpainting/colorization so nothing heavy runs on this PC. Set your OpenRouter key below.</div>
+
   <label for="serverUrl">FastAPI Server URL:</label>
   <input type="text" id="serverUrl" placeholder="http://localhost:7860">
 

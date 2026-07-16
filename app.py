@@ -1813,40 +1813,68 @@ class HighQualityLama:
         result = (inpainted_acc / inpainted_weight_safe[:, :, None]).clip(0, 255).astype(np.uint8)
         return result
 
-    def _color_correct(self, inpainted: np.ndarray, mask: np.ndarray, original: np.ndarray) -> np.ndarray:
-        """Match inpainted region's LAB mean/std to surrounding context."""
-        # Convert to LAB for perceptually uniform color matching
-        inp_lab = cv2.cvtColor(inpainted, cv2.COLOR_RGB2LAB)
-        orig_lab = cv2.cvtColor(original, cv2.COLOR_RGB2LAB)
-        
+    def _border_ring(self, mask: np.ndarray):
+        """Return a boolean mask of the ring of ORIGINAL pixels just outside the
+        text mask — the local background that the fill should match."""
         border = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=2)
-        border = (border > 0) & (mask == 0)
-        
+        return (border > 0) & (mask == 0)
+
+    def _flat_fill(self, mask: np.ndarray, original: np.ndarray, border: np.ndarray):
+        """If the surrounding background is essentially a single flat colour
+        (the common case for manga speech bubbles / solid panels), fill the
+        masked region with that exact colour.
+
+        Returns the filled RGB image, or None if the background is textured and
+        needs real inpainting. Filling directly is both faster (no model call)
+        and eliminates the washed-out lightening LaMa introduces on flat areas.
+        """
+        if border.sum() < 20 or mask.sum() == 0:
+            return None
+        ref = original[border]  # (N, 3) RGB
+        # Per-channel spread of the surrounding background.
+        std = ref.std(axis=0)
+        if std.max() > 6.0:
+            return None  # textured background — let LaMa handle it
+        fill_color = np.median(ref, axis=0)
+        out = original.copy()
+        out[mask > 0] = fill_color.astype(np.uint8)
+        return out
+
+    def _color_correct(self, inpainted: np.ndarray, mask: np.ndarray,
+                       original: np.ndarray, border: np.ndarray) -> np.ndarray:
+        """Pin the inpainted region's colour to the surrounding background.
+
+        Uses a robust MEDIAN offset per LAB channel instead of mean/std
+        scaling. Std-scaling was what let the fill drift brighter than the
+        background; a pure median offset aligns the central tone exactly and
+        cannot systematically lighten the region.
+        """
         if border.sum() < 20 or mask.sum() == 0:
             return inpainted
-            
-        out = inp_lab.astype(np.float32)
+
+        inp_lab = cv2.cvtColor(inpainted, cv2.COLOR_RGB2LAB).astype(np.float32)
+        orig_lab = cv2.cvtColor(original, cv2.COLOR_RGB2LAB).astype(np.float32)
         mask_bool = mask > 0
-        
+
         for c in range(3):
-            ref = orig_lab[border, c].astype(np.float32)
-            if len(ref) < 10: continue
-            ref_mean = ref.mean()
-            ref_std = max(ref.std(), 1.0)
-            
-            inp = out[mask_bool, c]
-            if len(inp) < 10: continue
-            inp_mean = inp.mean()
+            ref = orig_lab[border, c]
+            inp = inp_lab[mask_bool, c]
+            if len(ref) < 10 or len(inp) < 10:
+                continue
+            ref_med = np.median(ref)
+            inp_med = np.median(inp)
+            ref_std = ref.std()
             inp_std = max(inp.std(), 1.0)
-            
-            # Shift and scale the inpainted pixels to match the border
-            out[:, :, c] = np.where(
-                mask_bool, 
-                (out[:, :, c] - inp_mean) / inp_std * ref_std + ref_mean, 
-                out[:, :, c]
-            )
-            
-        out = np.clip(out, 0, 255).astype(np.uint8)
+
+            # Central-tone offset (never brightens on average).
+            shifted = inp_lab[:, :, c] - inp_med + ref_med
+            # Gently pull texture variance toward the background, but only ever
+            # REDUCE spread (scale <= 1) so we can't amplify into a bright halo.
+            scale = min(1.0, ref_std / inp_std)
+            shifted = (shifted - ref_med) * scale + ref_med
+            inp_lab[:, :, c] = np.where(mask_bool, shifted, inp_lab[:, :, c])
+
+        out = np.clip(inp_lab, 0, 255).astype(np.uint8)
         return cv2.cvtColor(out, cv2.COLOR_LAB2RGB)
 
     def __call__(self, pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
@@ -1884,13 +1912,21 @@ class HighQualityLama:
             
             crop_img = img[y1:y2, x1:x2].copy()
             crop_mask = mask[y1:y2, x1:x2].copy()
-            
-            # 3. Inpaint the crop
-            inpainted_crop = self._infer_crop(crop_img, crop_mask)
-            
-            # 4. Color correct the crop in LAB space
-            corrected_crop = self._color_correct(inpainted_crop, crop_mask, crop_img)
-            
+
+            border = self._border_ring(crop_mask)
+
+            # 3a. Fast path: if the local background is a flat colour (most
+            #     manga bubbles/panels), fill it directly. No model call → much
+            #     faster, and an exact colour match → no washed-out lightening.
+            flat = self._flat_fill(crop_mask, crop_img, border)
+            if flat is not None:
+                corrected_crop = flat
+            else:
+                # 3b. Textured background: run LaMa, then pin its colour to the
+                #     surrounding background with a median offset (no brightening).
+                inpainted_crop = self._infer_crop(crop_img, crop_mask)
+                corrected_crop = self._color_correct(inpainted_crop, crop_mask, crop_img, border)
+
             # 5. Blend the crop back into the original image
             # Feather the mask edges slightly for a seamless transition
             blend_mask = cv2.GaussianBlur(crop_mask, (7, 7), 2.0)
@@ -2415,7 +2451,9 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 cache[key] = ImageFont.load_default()
         font = cache[key]
 
-        fallback_lines = wrap_text(draw, text, font, inner_w - 4, allow_break=True, is_vertical=False)
+        # Wrap by whole words only — never split a word across lines. If a word
+        # is wider than the box it overflows horizontally rather than being cut.
+        fallback_lines = wrap_text(draw, text, font, inner_w - 4, allow_break=False, is_vertical=False)
         best_lines = fallback_lines if fallback_lines else [text]
         heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
@@ -3394,11 +3432,14 @@ async def get_translated_image(job_id: str):
         fp = str(_current_font_path)
 
     # ── Font size limits ──
-    # Sizing is now proportional to each bubble instead of a fixed 15–30px
-    # clamp. Large bubbles get large text; tiny bubbles shrink so the text
-    # always fits inside the region.
-    ABS_MIN_SIZE = 20    # never smaller than this (readability floor)
-    ABS_MAX_SIZE = 96   # never larger than this (sanity ceiling)
+    # Sizing is proportional to each bubble instead of a fixed clamp: large
+    # bubbles host large text, tight bubbles shrink to fit. But there is a hard
+    # readability floor — text is never rendered below ABS_MIN_SIZE even if that
+    # means it slightly overflows a very small bubble. Unreadably tiny text is
+    # worse than a little overflow (the character-break pass below keeps the
+    # overflow contained to width).
+    ABS_MIN_SIZE = 20   # readability floor — never render text smaller than this
+    ABS_MAX_SIZE = 40   # ceiling — keep text from ballooning in large bubbles
 
     is_lens = (ocr_mode == "lens")
 
@@ -3423,7 +3464,7 @@ async def get_translated_image(job_id: str):
         # The upper bound scales with the box so a big bubble can host big
         # text. The binary search inside fit_font_and_wrap still guarantees
         # the wrapped block fits both the inner width and height.
-        dyn_max = int(box_h * (1.0 if is_lens else 0.9))
+        dyn_max = int(box_h * (0.6 if is_lens else 0.55))
         dyn_max = max(ABS_MIN_SIZE + 1, min(ABS_MAX_SIZE, dyn_max))
         dyn_min = ABS_MIN_SIZE
 
@@ -3435,15 +3476,10 @@ async def get_translated_image(job_id: str):
         )
         font = get_font(fp, font_size)
 
-        # ── If even the smallest size overflowed vertically, allow
-        #    character-level breaking so long words wrap instead of
-        #    spilling outside the bubble ──
-        if heights and sum(heights) > inner_h - 4:
-            broken = wrap_text(draw, text, font,
-                               max_width=inner_w - 4,
-                               allow_break=True, is_vertical=False)
-            heights, _, _ = _measure_block(draw, broken, font)
-            lines = broken
+        # Never split words: text is always wrapped by whole words only. If the
+        # block is taller than the bubble it overflows (the whole translation
+        # stays intact and readable) rather than being cut off or broken into
+        # fragments across many lines.
 
         # ── Compute inner box position (centered within outer bbox) ──
         inner_x = x1 + (box_w - inner_w) // 2
