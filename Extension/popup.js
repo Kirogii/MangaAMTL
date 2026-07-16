@@ -349,8 +349,6 @@ function applyCloudMode(on) {
 // logged, not fatal.
 async function pushCloudModeToServer(serverUrl) {
   if (!serverUrl) return;
-  await pushOcrMode(serverUrl, 'lens');
-  await pushInpaintMode(serverUrl, 'none');
 
   // Reuse previously entered OpenRouter details (prefer the live fields, fall
   // back to what's cached in storage) so cloud mode works without re-typing.
@@ -360,22 +358,48 @@ async function pushCloudModeToServer(serverUrl) {
   const model = liveModel || cached.openrouterModel || '';
   const apiKey = liveKey || cached.openrouterApiKey || '';
 
-  if (!model || !apiKey) {
-    const statusEl = document.getElementById('status');
-    if (statusEl) statusEl.innerText = 'Cloud mode needs an OpenRouter model + API key (set once in the model box).';
-    return;
-  }
-
+  const statusEl = document.getElementById('status');
   try {
-    await fetch(`${serverUrl}/SetModelType`, {
+    // One call flips the backend to lens + openrouter + none. The server reuses
+    // any key it already has, so model/api_key are optional overrides here.
+    const body = { enabled: true };
+    if (model) body.model = model;
+    if (apiKey) body.api_key = apiKey;
+
+    const res = await fetch(`${serverUrl}/SetCloudMode`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model_type: 'openrouter', model, api_key: apiKey }),
+      body: JSON.stringify(body),
     });
+    const data = await res.json();
+    if (!res.ok) {
+      if (statusEl) statusEl.innerText = data.detail || 'Cloud mode failed to enable.';
+      return;
+    }
     // Re-cache so both popups + options stay in sync.
-    chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model, openrouterApiKey: apiKey });
+    chrome.storage.local.set({
+      modelType: 'openrouter', ocrMode: 'lens', inpaintMode: 'none',
+      openrouterModel: data.openrouter_model || model,
+      openrouterApiKey: apiKey || cached.openrouterApiKey,
+    });
+    if (statusEl) statusEl.innerText = `Cloud mode on — Lens + ${data.openrouter_model || 'OpenRouter'}`;
   } catch (e) {
-    console.warn('[MangaTranslator] Cloud mode: failed to push OpenRouter model to server:', e);
+    console.warn('[MangaTranslator] Cloud mode: failed to enable on server:', e);
+    if (statusEl) statusEl.innerText = 'Could not reach server to enable cloud mode.';
+  }
+}
+
+// Tell the server to leave cloud mode (best-effort).
+async function disableCloudModeOnServer(serverUrl) {
+  if (!serverUrl) return;
+  try {
+    await fetch(`${serverUrl}/SetCloudMode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: false }),
+    });
+  } catch (e) {
+    console.warn('[MangaTranslator] Failed to disable cloud mode on server:', e);
   }
 }
 
@@ -478,6 +502,7 @@ document.getElementById('cloudMode').addEventListener('change', async (e) => {
   } else {
     // Leaving cloud mode: keep the current (now re-enabled) selections as-is.
     chrome.storage.local.set({ cloudMode: false });
+    await disableCloudModeOnServer(serverUrl);
   }
 });
 
@@ -625,3 +650,27 @@ document.getElementById('translateBtn').addEventListener('click', async () => {
 document.getElementById('optionsBtn').addEventListener('click', () => {
   chrome.runtime.openOptionsPage();
 });
+
+// ============================================================================
+// SETTINGS PANEL TOGGLE — keep the popup clean; reveal detail on demand so the
+// Translate button stays the focal point.
+// ============================================================================
+(function initSettingsToggle() {
+  const toggle = document.getElementById('settingsToggleBtn');
+  const panel = document.getElementById('settingsPanel');
+  if (!toggle || !panel) return;
+
+  const setOpen = (open) => {
+    panel.style.display = open ? 'block' : 'none';
+    toggle.classList.toggle('open', open);
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    chrome.storage.local.set({ settingsPanelOpen: open });
+  };
+
+  toggle.addEventListener('click', () => {
+    setOpen(panel.style.display === 'none');
+  });
+
+  // Restore last open/closed state.
+  chrome.storage.local.get(['settingsPanelOpen'], (d) => setOpen(d.settingsPanelOpen === true));
+})();

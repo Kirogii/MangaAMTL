@@ -1,113 +1,190 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8">
   <style>
-    body { width: 320px; padding: 15px; font-family: Arial, sans-serif; background: #1e1e2e; color: #e0e0e0; }
-    h3 { margin-top: 0; color: #ffffff; }
-    label { font-weight: bold; color: #aaaaaa; }
-    input[type="text"], input[type="password"], select { width: 100%; padding: 8px; margin: 8px 0 15px 0; box-sizing: border-box; border: 1px solid #444; border-radius: 4px; background: #2a2a3c; color: #e0e0e0; }
-    .checkbox-group { margin: 8px 0 15px 0; padding: 8px; background: #2a2a3c; border-radius: 4px; border: 1px solid #444; display: flex; align-items: center; }
-    .checkbox-group label { font-weight: normal; margin-left: 6px; cursor: pointer; color: #ccc; }
-    button { width: 100%; padding: 10px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
-    button:hover { background: #0052a3; }
-    button.success { background: #28a745; }
-    button.success:hover { background: #218838; }
-    button.secondary { background: #3a3f4b; border: 1px solid #555; }
-    button.secondary:hover { background: #4a4f5b; }
-    .status { margin-top: 10px; font-size: 12px; color: #28a745; text-align: center; }
-    .subbox { padding: 8px; background: #2a2a3c; border-radius: 4px; border: 1px solid #444; margin-bottom: 15px; }
-    .subbox input[type="text"], .subbox input[type="password"] { margin: 6px 0; }
-    .subbox button { margin-top: 4px; margin-bottom: 4px; }
-    .hint { font-size: 11px; color: #888; margin: -10px 0 12px 0; }
+    * { box-sizing: border-box; }
+    body {
+      width: 340px; margin: 0; padding: 16px;
+      font-family: 'Segoe UI', Arial, sans-serif; background: #16161f; color: #e6e6ec;
+      font-size: 14px; line-height: 1.4;
+    }
+    .header {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 14px;
+    }
+    .header h3 { margin: 0; color: #fff; font-size: 17px; flex: 1; }
+    .icon-btn {
+      width: 34px; height: 34px; padding: 0; flex: 0 0 auto;
+      background: #2a2a3c; border: 1px solid #444; border-radius: 8px;
+      color: #ffffff; cursor: pointer; line-height: 1;
+      display: flex; align-items: center; justify-content: center; margin: 0;
+    }
+    .icon-btn:hover { background: #34344a; }
+
+    /* Modern inline SVG icons — stroke inherits currentColor so they're white. */
+    .ic { width: 16px; height: 16px; flex: 0 0 auto; display: inline-block;
+          stroke: currentColor; fill: none; stroke-width: 2;
+          stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
+    .ic-sm { width: 14px; height: 14px; }
+    .btn-ic { width: 18px; height: 18px; }
+    .section-title .ic, label .ic { color: #cfcfe0; margin-right: 6px; }
+    button .ic { color: #fff; margin-right: 8px; }
+    .checkbox-group label .ic { margin-right: 6px; }
+
+    label { font-weight: 600; color: #a9a9bd; display: flex; align-items: center; margin-bottom: 4px; font-size: 13px; }
+    input[type="text"], input[type="password"], select {
+      width: 100%; padding: 9px; margin: 0 0 12px 0; box-sizing: border-box;
+      border: 1px solid #3a3a4c; border-radius: 6px; background: #22222e; color: #e6e6ec;
+      font-size: 13px;
+    }
+    select { cursor: pointer; }
+    input:focus, select:focus { outline: none; border-color: #4080c0; }
+
+    button {
+      width: 100%; padding: 11px; background: #2f6fd0; color: white; border: none;
+      border-radius: 8px; cursor: pointer; font-weight: 600; margin-bottom: 10px; font-size: 14px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    button:hover { background: #2a62b8; }
+
+    /* Focal Translate button */
+    .translate-btn {
+      background: #22a552; font-size: 16px; padding: 15px; margin-bottom: 12px;
+      box-shadow: 0 3px 10px rgba(34,165,82,0.35); letter-spacing: .2px;
+    }
+    .translate-btn:hover { background: #1c8f46; }
+    .translate-btn .big { font-size: 18px; }
+
+    button.secondary { background: #2a2a3c; border: 1px solid #4a4a5e; color: #e6e6ec; }
+    button.secondary:hover { background: #34344a; }
+    button.ghost { background: transparent; border: 1px solid #3a3a4c; color: #b9b9cc; font-weight: 500; }
+    button.ghost:hover { background: #22222e; }
+
+    .checkbox-group {
+      margin: 0 0 12px 0; padding: 10px; background: #22222e; border-radius: 8px;
+      border: 1px solid #3a3a4c; display: flex; align-items: center;
+    }
+    .checkbox-group input { width: auto; margin: 0; }
+    .checkbox-group label { font-weight: 500; margin: 0 0 0 8px; cursor: pointer; color: #d5d5e2; }
+    .cloud-card { border-color: #3a6ea5; background: #1b2430; }
+
+    .status { margin-top: 6px; font-size: 12px; color: #46c877; text-align: center; min-height: 15px; }
+    .hint { font-size: 11px; color: #8a8a9c; margin: -6px 0 12px 0; }
+
+    .subbox { padding: 10px; background: #1c1c26; border-radius: 8px; border: 1px solid #3a3a4c; margin-bottom: 12px; }
+    .subbox input { margin: 6px 0; }
+
+    /* Collapsible settings panel */
+    #settingsPanel { display: none; border-top: 1px solid #2c2c3a; margin-top: 4px; padding-top: 14px; }
+    #settingsPanel.open { display: block; }
+    .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #7a7a8c; margin: 4px 0 8px 0; display: flex; align-items: center; }
+
     .font-scroll {
       display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden;
-      white-space: nowrap; padding-bottom: 4px; margin: 8px 0 6px 0;
+      white-space: nowrap; padding-bottom: 4px; margin: 0 0 6px 0;
       scrollbar-width: none; -ms-overflow-style: none;
     }
     .font-scroll::-webkit-scrollbar { display: none; }
     .font-chip {
-      flex: 0 0 auto; padding: 7px 12px; background: #2a2a3c; color: #ccc;
-      border: 2px solid #555; border-radius: 16px; cursor: pointer;
+      flex: 0 0 auto; padding: 7px 12px; background: #22222e; color: #cfcfe0;
+      border: 2px solid #4a4a5e; border-radius: 16px; cursor: pointer;
       font-size: 12px; white-space: nowrap;
     }
     .font-chip:hover { background: #34344a; }
-    .font-chip.active { border-color: #28a745; color: #fff; }
-    .font-loading { font-size: 11px; color: #888; padding: 4px 0; }
-    .font-loading.error { color: #ff4d4d; }
+    .font-chip.active { border-color: #22a552; color: #fff; }
+    .font-loading { font-size: 11px; color: #8a8a9c; padding: 4px 0; }
+    .font-loading.error { color: #ff6b6b; }
   </style>
 </head>
 <body>
-  <h3>Manga Translator API</h3>
-
-  <div class="checkbox-group" style="border-color:#4080c0;">
-    <input type="checkbox" id="cloudMode">
-    <label for="cloudMode">☁️ Cloud Mode (minimal local resources)</label>
+  <div class="header">
+    <svg class="ic" viewBox="0 0 24 24" style="width:20px;height:20px;color:#22a552;"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>
+    <h3>Manga Translator</h3>
+    <button id="settingsToggleBtn" class="icon-btn" title="Settings" aria-label="Settings">
+      <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
   </div>
-  <div class="hint">Forces Google Lens OCR + OpenRouter translation and skips local inpainting/colorization so nothing heavy runs on this PC. Set your OpenRouter key below.</div>
 
-  <label for="serverUrl">FastAPI Server URL:</label>
-  <input type="text" id="serverUrl" placeholder="http://localhost:7860">
+  <!-- Focal action -->
+  <button id="translateBtn" class="translate-btn">
+    <svg class="ic btn-ic" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+    <span class="big">Translate All</span>
+  </button>
 
-  <label for="targetLang">Target Language:</label>
+  <label for="targetLang"><svg class="ic ic-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>Translate to</label>
   <select id="targetLang"><!-- populated by popup.js --></select>
 
-  <label for="ocrMode">OCR Engine:</label>
-  <select id="ocrMode">
-    <option value="hayai">Hayai (Local, Japanese)</option>
-    <option value="glm">GLM (Local, Korean)</option>
-    <option value="lens">Google Lens (Cloud, All)</option>
-  </select>
-  <div id="ocrModeStatus" class="status"></div>
-
-  <label for="ocrLang">OCR Language:</label>
-  <select id="ocrLang"><!-- populated by popup.js --></select>
-
-  <label>Font Family:</label>
-  <div id="fontFamilyScroll" class="font-scroll">
-    <div class="font-loading">Loading fonts…</div>
+  <div class="checkbox-group cloud-card">
+    <input type="checkbox" id="cloudMode">
+    <label for="cloudMode"><svg class="ic ic-sm" viewBox="0 0 24 24"><path d="M17.5 19a4.5 4.5 0 1 0 0-9h-1.8A7 7 0 1 0 4 15.9"/></svg>Cloud Mode — minimal PC load</label>
   </div>
-  <div id="fontFamilyStatus" class="status" style="text-align:left; margin-top:0; margin-bottom:10px;"></div>
-
-  <label>Font Boldness:</label>
-  <div id="fontWeightPicker" style="display:flex; gap:8px; margin: 8px 0 15px 0;">
-    <div style="font-size:11px; color:#888;">Loading preview…</div>
-  </div>
-  <input type="hidden" id="fontWeightHidden" value="2">
-
-  <label for="inpaintMode">Inpainting Mode:</label>
-  <select id="inpaintMode">
-    <option value="low">Low (faster, default)</option>
-    <option value="high">High (better quality, bigger model)</option>
-    <option value="none">None (fill with bg color, no model)</option>
-  </select>
-  <div class="hint">High mode auto-downloads a larger LaMa model. 'None' mode uses the detected background color to fill text regions instead of inpainting.</div>
-  <div id="inpaintModeStatus" class="status"></div>
-
-  <label for="modelType">Translation Model:</label>
-  <select id="modelType">
-    <option value="local">Local (GGUF)</option>
-    <option value="openrouter">OpenRouter</option>
-  </select>
-
-  <div id="openrouterBox" class="subbox" style="display:none;">
-    <label for="openrouterModel">OpenRouter Model:</label>
-    <input type="text" id="openrouterModel" placeholder="e.g. openai/gpt-4o-mini">
-    <label for="openrouterKey">OpenRouter API Key:</label>
-    <input type="password" id="openrouterKey" placeholder="sk-or-...">
-    <button id="setModelBtn" class="secondary">Set Model</button>
-    <div id="modelStatus" class="status"></div>
-  </div>
-
-  <div class="checkbox-group">
-    <input type="checkbox" id="colorize" checked>
-    <label for="colorize">Enable Colorization</label>
-  </div>
-
-  <button id="saveBtn">Save Settings</button>
-  <button id="translateBtn" class="success">Translate All Images Now</button>
-  <button id="optionsBtn" class="secondary">Advanced Settings (Models)</button>
 
   <div id="status" class="status"></div>
+
+  <!-- Collapsible detailed settings -->
+  <div id="settingsPanel">
+    <div class="section-title"><svg class="ic ic-sm" viewBox="0 0 24 24"><path d="M9 2v6"/><path d="M15 2v6"/><path d="M12 17v5"/><path d="M5 8h14a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2z"/></svg>Connection</div>
+    <label for="serverUrl">Server URL</label>
+    <input type="text" id="serverUrl" placeholder="http://localhost:7860">
+
+    <div class="section-title"><svg class="ic ic-sm" viewBox="0 0 24 24"><path d="M4 7V5a2 2 0 0 1 2-2h2"/><path d="M4 17v2a2 2 0 0 0 2 2h2"/><path d="M16 3h2a2 2 0 0 1 2 2v2"/><path d="M16 21h2a2 2 0 0 0 2-2v-2"/><path d="M7 12h10"/></svg>OCR</div>
+    <label for="ocrMode">OCR Engine</label>
+    <select id="ocrMode">
+      <option value="hayai">Hayai (Local, Japanese)</option>
+      <option value="glm">GLM (Local, Korean)</option>
+      <option value="lens">Google Lens (Cloud, All)</option>
+    </select>
+    <div id="ocrModeStatus" class="status"></div>
+
+    <label for="ocrLang">Source Language</label>
+    <select id="ocrLang"><!-- populated by popup.js --></select>
+
+    <div class="section-title"><svg class="ic ic-sm" viewBox="0 0 24 24"><path d="M4 20h16"/><path d="m6 16 6-12 6 12"/><path d="M8 12h8"/></svg>Typesetting</div>
+    <label>Font Family</label>
+    <div id="fontFamilyScroll" class="font-scroll">
+      <div class="font-loading">Loading fonts…</div>
+    </div>
+    <div id="fontFamilyStatus" class="status" style="text-align:left; margin-top:0; margin-bottom:10px;"></div>
+
+    <label>Font Boldness</label>
+    <div id="fontWeightPicker" style="display:flex; gap:8px; margin: 4px 0 14px 0;">
+      <div style="font-size:11px; color:#888;">Loading preview…</div>
+    </div>
+    <input type="hidden" id="fontWeightHidden" value="2">
+
+    <label for="inpaintMode"><svg class="ic ic-sm" viewBox="0 0 24 24"><path d="m15 5 4 4"/><path d="M13 7 8.7 2.7a2.4 2.4 0 0 0-3.4 0L2.7 5.3a2.4 2.4 0 0 0 0 3.4L7 13"/><path d="m8 6 2-2"/><path d="M18 12h.01"/><path d="M18 21a3 3 0 0 0 3-3c0-1.5-1-3-3-5-2 2-3 3.5-3 5a3 3 0 0 0 3 3z"/><path d="M11 15 6 20a2.83 2.83 0 0 1-4-4l5-5"/></svg>Inpainting Mode</label>
+    <select id="inpaintMode">
+      <option value="low">Low (faster, default)</option>
+      <option value="high">High (better quality, bigger model)</option>
+      <option value="none">None (fill with bg color, no model)</option>
+    </select>
+    <div class="hint">High mode auto-downloads a larger LaMa model. 'None' fills text regions with the detected background color instead of inpainting.</div>
+    <div id="inpaintModeStatus" class="status"></div>
+
+    <div class="section-title"><svg class="ic ic-sm" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7.5"/><path d="M12 2a3 3 0 0 1 3 3v.5"/><path d="M9 12.5A3 3 0 1 0 6 17a3 3 0 0 0 3 1"/><path d="M15 6a3 3 0 1 1 3 5"/><path d="M9 18a3 3 0 0 0 6 0v-6"/><path d="M18 11a3 3 0 1 1-3 5"/></svg>Translation Model</div>
+    <label for="modelType">Model Backend</label>
+    <select id="modelType">
+      <option value="local">Local (GGUF)</option>
+      <option value="openrouter">OpenRouter</option>
+    </select>
+
+    <div id="openrouterBox" class="subbox" style="display:none;">
+      <label for="openrouterModel">OpenRouter Model</label>
+      <input type="text" id="openrouterModel" placeholder="e.g. openai/gpt-4o-mini">
+      <label for="openrouterKey">OpenRouter API Key</label>
+      <input type="password" id="openrouterKey" placeholder="sk-or-...">
+      <button id="setModelBtn" class="secondary">Set Model</button>
+      <div id="modelStatus" class="status"></div>
+    </div>
+
+    <div class="checkbox-group">
+      <input type="checkbox" id="colorize" checked>
+      <label for="colorize"><svg class="ic ic-sm" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.563-2.512 5.563-5.563C22 6.012 17.5 2 12 2z"/></svg>Enable Colorization</label>
+    </div>
+
+    <button id="saveBtn"><svg class="ic btn-ic" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>Save Settings</button>
+    <button id="optionsBtn" class="ghost"><svg class="ic btn-ic" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>Advanced Settings (Models)</button>
+  </div>
 
   <script src="languages.js"></script>
   <script src="popup.js"></script>

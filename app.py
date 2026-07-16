@@ -279,6 +279,12 @@ _inpaint_mode_lock = threading.Lock()
 _ocr_mode = "hayai"  # "hayai", "glm", or "lens"
 _ocr_mode_lock = threading.Lock()
 
+# --- Cloud Mode Globals ---
+# When on, the server avoids loading heavy local models (OCR, inpainting,
+# colorizer) and relies on cloud services (Google Lens + OpenRouter) instead.
+_cloud_mode = False
+_cloud_mode_lock = threading.Lock()
+
 # --- Google Lens Globals ---
 _lens_api = None
 _lens_lock = threading.Lock()
@@ -2805,6 +2811,80 @@ async def get_model_type():
         }
 
 # ===========================================================================
+# Cloud Mode Endpoint — one switch that offloads everything to the cloud so the
+# machine running the backend uses minimal resources: Google Lens OCR +
+# OpenRouter translation + no local inpainting model (fill with bg colour).
+# Reuses any OpenRouter model/key already configured so nothing must be re-sent.
+# ===========================================================================
+class SetCloudModeRequest(BaseModel):
+    enabled: bool
+    model: Optional[str] = None       # optional OpenRouter model override
+    api_key: Optional[str] = None     # optional OpenRouter key override
+
+@app.post("/SetCloudMode")
+async def set_cloud_mode(req: SetCloudModeRequest):
+    global _cloud_mode, _ocr_mode, _inpaint_mode
+    global _current_model_type, _openrouter_api_key, _openrouter_model
+
+    if not req.enabled:
+        # Turning cloud mode OFF just clears the flag; the individual modes keep
+        # whatever they are currently set to (the client restores its own state).
+        with _cloud_mode_lock:
+            _cloud_mode = False
+        logging.info("[CloudMode] Disabled.")
+        return {"status": "ok", "cloud_mode": False}
+
+    # ── Enabling: force lens + openrouter + none ──
+    if LensAPI is None:
+        raise HTTPException(500, "chrome-lens-py not installed. Run: pip install chrome-lens-py")
+    try:
+        get_lens_api()
+    except Exception as e:
+        raise HTTPException(500, f"Failed to initialize Google Lens API: {e}")
+
+    with _model_type_lock:
+        if req.model:
+            _openrouter_model = req.model.strip()
+        if req.api_key:
+            _openrouter_api_key = req.api_key
+        if not _openrouter_api_key:
+            raise HTTPException(
+                400,
+                "Cloud mode needs an OpenRouter API key. Set one once via the model "
+                "box (or pass api_key here) — it is then reused automatically."
+            )
+        _current_model_type = "openrouter"
+        active_model = _openrouter_model
+
+    with _ocr_mode_lock:
+        _ocr_mode = "lens"
+    with _inpaint_mode_lock:
+        _inpaint_mode = "none"
+    with _cloud_mode_lock:
+        _cloud_mode = True
+
+    logging.info(f"[CloudMode] Enabled — lens OCR + OpenRouter ({active_model}) + no local inpainting.")
+    return {
+        "status": "ok",
+        "cloud_mode": True,
+        "ocr_mode": "lens",
+        "inpaint_mode": "none",
+        "model_type": "openrouter",
+        "openrouter_model": active_model,
+        "openrouter_configured": _openrouter_api_key is not None,
+    }
+
+@app.get("/GetCloudMode")
+async def get_cloud_mode():
+    with _cloud_mode_lock:
+        enabled = _cloud_mode
+    return {
+        "cloud_mode": enabled,
+        "lens_available": LensAPI is not None,
+        "openrouter_configured": _openrouter_api_key is not None,
+    }
+
+# ===========================================================================
 # SetOpenRouterModel Endpoint
 # ===========================================================================
 class SetOpenRouterModelRequest(BaseModel):
@@ -3438,7 +3518,7 @@ async def get_translated_image(job_id: str):
     # means it slightly overflows a very small bubble. Unreadably tiny text is
     # worse than a little overflow (the character-break pass below keeps the
     # overflow contained to width).
-    ABS_MIN_SIZE = 20   # readability floor — never render text smaller than this
+    ABS_MIN_SIZE = 17   # readability floor — never render text smaller than this
     ABS_MAX_SIZE = 40   # ceiling — keep text from ballooning in large bubbles
 
     is_lens = (ocr_mode == "lens")
