@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Manga Translator API",
-  "version": "v2",
+  "version": "2",
   "description": "Translates manga images on web pages using a custom FastAPI backend.",
   "permissions": [
     "storage",
