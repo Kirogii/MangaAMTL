@@ -90,12 +90,25 @@
 
       wrap.appendChild(canvas);
       wrap.appendChild(lbl);
-      wrap.onclick = () => {
+      wrap.onclick = async () => {
         document.getElementById('mtFontWeightHidden').value = level;
         chrome.storage.local.set({ fontWeight: String(level) });
         container.querySelectorAll('canvas').forEach(c => {
           c.style.border = `2px solid ${parseInt(c.dataset.level, 10) === level ? '#28a745' : '#444'}`;
         });
+        // ★ 1:1 with popup.js — push font weight to server immediately on click
+        const { serverUrl: url } = await chrome.storage.local.get(['serverUrl']);
+        if (url) {
+          try {
+            await fetch(`${url}/SetFont`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ stroke_width: level })
+            });
+          } catch (e) {
+            console.warn('[MangaTranslator] Failed to push font weight to server:', e);
+          }
+        }
       };
       container.appendChild(wrap);
     }
@@ -116,7 +129,7 @@
   }
 
   // ========================================================================
-  // FONT FAMILY PICKER (in-page popup) — renders each chip in its own typeface
+  // FONT FAMILY PICKER (in-page popup)
   // ========================================================================
   const _mtFontFamilyCache = new Map();
 
@@ -189,7 +202,6 @@
       chip.onclick = () => selectFontFamily(serverUrl, f.filename, container);
       container.appendChild(chip);
 
-      // Preview each chip in its own typeface.
       loadFontFaceByName(serverUrl, f.filename).then(family => {
         if (family) chip.style.fontFamily = `"${family}", sans-serif`;
       });
@@ -242,53 +254,240 @@
   document.head.appendChild(style);
 
   // ========================================================================
-  // Helper: load all cached settings into the floating popup dropdowns
+  // ★ INPAINTING & OCR MODE SYNC HELPERS — 1:1 with popup.js
   // ========================================================================
-  function loadCachedSettingsIntoPopup() {
-    chrome.storage.local.get(
-      ['serverUrl', 'targetLang', 'fontWeight', 'modelType', 'openrouterModel', 'openrouterApiKey', 'ocrMode', 'ocrLang'],
-      (data) => {
-        const sel = document.getElementById('mtTargetLangSelect');
-        const ocrLangSel = document.getElementById('mtOcrLangSelect');
+  async function syncInpaintModeFromServer(serverUrl) {
+    const statusEl = document.getElementById('mtInpaintModeStatus');
+    if (!serverUrl) return;
+    try {
+      const res = await fetch(`${serverUrl}/GetInpaintMode`);
+      const data = await res.json();
+      const el = document.getElementById('mtInpaintMode');
+      if (el) el.value = data.inpaint_mode || 'low';
+      chrome.storage.local.set({ inpaintMode: data.inpaint_mode || 'low' });
+      if (statusEl) {
+        if (data.inpaint_mode === 'high') {
+          statusEl.innerText = data.high_model_downloaded
+            ? `High model ready (${data.high_model_size_mb} MB)`
+            : 'High model will download on first use';
+        } else if (data.inpaint_mode === 'none') {
+          statusEl.innerText = 'None mode active (no model loaded)';
+        } else {
+          statusEl.innerText = '';
+        }
+      }
+    } catch (e) {
+      console.warn('[MangaTranslator] Could not fetch inpaint mode from server:', e);
+    }
+  }
 
-        // Populate language dropdowns from the built-in list (never empty),
-        // then refresh from the server so newly added languages show up.
-        if (typeof mtPopulateLangSelect === 'function') {
-          mtPopulateLangSelect(sel, data.targetLang || 'en');
-          mtPopulateLangSelect(ocrLangSel, data.ocrLang || 'ja');
-          if (data.serverUrl && typeof mtFetchLanguages === 'function') {
-            mtFetchLanguages(data.serverUrl).then(langs => {
-              mtPopulateLangSelect(sel, sel.value || data.targetLang || 'en', langs);
-              mtPopulateLangSelect(ocrLangSel, ocrLangSel.value || data.ocrLang || 'ja', langs);
-            });
+  async function pushInpaintMode(serverUrl, mode) {
+    const statusEl = document.getElementById('mtInpaintModeStatus');
+    if (!serverUrl) {
+      if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Set a Server URL first</span>`;
+      return;
+    }
+    if (statusEl) statusEl.innerText = mode === 'high' ? 'Switching (may download model)...' : 'Switching...';
+    try {
+      const res = await fetch(`${serverUrl}/SetInpaintMode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (statusEl) {
+          if (data.inpaint_mode === 'high') {
+            statusEl.innerText = `High model ready (${data.high_model_size_mb} MB)`;
+          } else if (data.inpaint_mode === 'none') {
+            statusEl.innerText = 'None mode active (no model loaded)';
+          } else {
+            statusEl.innerText = 'Low mode active';
           }
         }
-        if (sel && data.targetLang) sel.value = data.targetLang;
-
-        const modelTypeSel = document.getElementById('mtModelTypeSelect');
-        const openrouterRow = document.getElementById('mtOpenrouterRow');
-        if (modelTypeSel) {
-          modelTypeSel.value = data.modelType || 'local';
-          openrouterRow.style.display = modelTypeSel.value === 'openrouter' ? 'block' : 'none';
-        }
-        if (data.openrouterModel) {
-          const orModelInput = document.getElementById('mtOpenrouterModel');
-          if (orModelInput) orModelInput.value = data.openrouterModel;
-        }
-        // Load cached API key (displays as •••• because input is type="password")
-        if (data.openrouterApiKey) {
-          const orKeyInput = document.getElementById('mtOpenrouterKey');
-          if (orKeyInput) orKeyInput.value = data.openrouterApiKey;
-        }
-        const ocrModeSel = document.getElementById('mtOcrModeSelect');
-        if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
-        if (ocrLangSel && data.ocrLang) ocrLangSel.value = data.ocrLang;
+      } else {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
       }
+    } catch (e) {
+      if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
+    }
+  }
+
+  async function syncOcrModeFromServer(serverUrl) {
+    const statusEl = document.getElementById('mtOcrModeStatus');
+    if (!serverUrl) return;
+    try {
+      const res = await fetch(`${serverUrl}/GetOcrMode`);
+      const data = await res.json();
+      const el = document.getElementById('mtOcrModeSelect');
+      if (el) el.value = data.ocr_mode || 'hayai';
+      chrome.storage.local.set({ ocrMode: data.ocr_mode || 'hayai' });
+      if (statusEl) {
+        statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+      }
+    } catch (e) {
+      console.warn('[MangaTranslator] Could not fetch OCR mode from server:', e);
+    }
+  }
+
+  async function pushOcrMode(serverUrl, mode) {
+    const statusEl = document.getElementById('mtOcrModeStatus');
+    if (!serverUrl) {
+      if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Set a Server URL first</span>`;
+      return;
+    }
+    if (statusEl) statusEl.innerText = 'Switching...';
+    try {
+      const res = await fetch(`${serverUrl}/SetOcrMode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (statusEl) statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+        chrome.storage.local.set({ ocrMode: data.ocr_mode });
+      } else {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
+      }
+    } catch (e) {
+      if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
+    }
+  }
+
+  // ========================================================================
+  // ★ CLOUD MODE HELPERS — 1:1 with popup.js
+  // ========================================================================
+  function applyCloudModeToPopup(on) {
+    const ocrModeEl   = document.getElementById('mtOcrModeSelect');
+    const modelTypeEl = document.getElementById('mtModelTypeSelect');
+    const inpaintEl   = document.getElementById('mtInpaintMode');
+    const colorizeEl  = document.getElementById('mtColorize');
+    const orRow       = document.getElementById('mtOpenrouterRow');
+
+    if (on) {
+      if (ocrModeEl) ocrModeEl.value = 'lens';
+      if (modelTypeEl) modelTypeEl.value = 'openrouter';
+      if (inpaintEl) inpaintEl.value = 'none';
+      if (colorizeEl) colorizeEl.checked = false;
+      if (orRow) orRow.style.display = 'block';
+    }
+    // Lock the local-resource controls while cloud mode is active.
+    [ocrModeEl, inpaintEl, colorizeEl].forEach(el => { if (el) el.disabled = on; });
+    if (modelTypeEl) modelTypeEl.disabled = on;
+  }
+
+  async function pushCloudModeFromPopup(serverUrl) {
+    if (!serverUrl) return;
+    const statusEl = document.getElementById('mtStatus');
+    const liveModel = document.getElementById('mtOpenrouterModel').value.trim();
+    const liveKey = document.getElementById('mtOpenrouterKey').value.trim();
+    const cached = await chrome.storage.local.get(['openrouterModel', 'openrouterApiKey']);
+    const model = liveModel || cached.openrouterModel || '';
+    const apiKey = liveKey || cached.openrouterApiKey || '';
+    try {
+      const body = { enabled: true };
+      if (model) body.model = model;
+      if (apiKey) body.api_key = apiKey;
+      const res = await fetch(`${serverUrl}/SetCloudMode`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (!res.ok) { if (statusEl) statusEl.innerText = data.detail || 'Cloud mode failed to enable.'; return; }
+      chrome.storage.local.set({
+        modelType: 'openrouter', ocrMode: 'lens', inpaintMode: 'none', colorize: false,
+        openrouterModel: data.openrouter_model || model, openrouterApiKey: apiKey || cached.openrouterApiKey
+      });
+      if (statusEl) statusEl.innerText = `Cloud mode on — Lens + ${data.openrouter_model || 'OpenRouter'}`;
+    } catch (e) {
+      if (statusEl) statusEl.innerText = 'Could not reach server to enable cloud mode.';
+    }
+  }
+
+  async function disableCloudModeOnServer(serverUrl) {
+    if (!serverUrl) return;
+    try {
+      await fetch(`${serverUrl}/SetCloudMode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false })
+      });
+    } catch (e) {
+      console.warn('[MangaTranslator] Failed to disable cloud mode on server:', e);
+    }
+  }
+
+  // ========================================================================
+  // Helper: load all cached settings into the floating popup — 1:1 with popup.js
+  // ========================================================================
+  async function loadCachedSettingsIntoPopup() {
+    const sel = document.getElementById('mtTargetLangSelect');
+    const ocrLangSel = document.getElementById('mtOcrLangSelect');
+
+    const data = await chrome.storage.local.get(
+      ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType',
+       'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'cloudMode']
     );
+
+    // Populate language dropdowns from built-in list, then refresh from server
+    if (typeof mtPopulateLangSelect === 'function') {
+      mtPopulateLangSelect(sel, data.targetLang || 'en');
+      mtPopulateLangSelect(ocrLangSel, data.ocrLang || 'ja');
+      if (data.serverUrl && typeof mtFetchLanguages === 'function') {
+        const langs = await mtFetchLanguages(data.serverUrl);
+        mtPopulateLangSelect(sel, sel.value || data.targetLang || 'en', langs);
+        mtPopulateLangSelect(ocrLangSel, ocrLangSel.value || data.ocrLang || 'ja', langs);
+      }
+    }
+    if (sel && data.targetLang) sel.value = data.targetLang;
+
+    // ★ Colorize checkbox — 1:1 with popup.js
+    const colorizeEl = document.getElementById('mtColorize');
+    if (colorizeEl) colorizeEl.checked = data.colorize !== false;
+
+    // ★ Inpaint mode — 1:1 with popup.js
+    const inpaintEl = document.getElementById('mtInpaintMode');
+    if (inpaintEl) inpaintEl.value = data.inpaintMode || 'low';
+
+    // ★ OCR mode — 1:1 with popup.js
+    const ocrModeSel = document.getElementById('mtOcrModeSelect');
+    if (ocrModeSel) ocrModeSel.value = data.ocrMode || 'hayai';
+    if (ocrLangSel && data.ocrLang) ocrLangSel.value = data.ocrLang;
+
+    // Model type + OpenRouter fields
+    const modelTypeSel = document.getElementById('mtModelTypeSelect');
+    const openrouterRow = document.getElementById('mtOpenrouterRow');
+    if (modelTypeSel) {
+      modelTypeSel.value = data.modelType || 'local';
+      if (openrouterRow) openrouterRow.style.display = modelTypeSel.value === 'openrouter' ? 'block' : 'none';
+    }
+    if (data.openrouterModel) {
+      const orModelInput = document.getElementById('mtOpenrouterModel');
+      if (orModelInput) orModelInput.value = data.openrouterModel;
+    }
+    if (data.openrouterApiKey) {
+      const orKeyInput = document.getElementById('mtOpenrouterKey');
+      if (orKeyInput) orKeyInput.value = data.openrouterApiKey;
+    }
+
+    // ★ Cloud Mode — restore toggle + apply locked state — 1:1 with popup.js
+    const cloudOn = data.cloudMode === true;
+    const cloudEl = document.getElementById('mtCloudMode');
+    if (cloudEl) {
+      cloudEl.checked = cloudOn;
+      applyCloudModeToPopup(cloudOn);
+    }
+
+    // ★ Sync from server (best-effort) — 1:1 with popup.js
+    if (data.serverUrl) {
+      syncInpaintModeFromServer(data.serverUrl);
+      syncOcrModeFromServer(data.serverUrl);
+    }
   }
 
   function injectUI() {
-    // 1. Floating Button — transparent translate button with a modern icon.
+    // 1. Floating Button
     floatBtn = document.createElement('button');
     floatBtn.title = 'Manga Translator';
     floatBtn.setAttribute('aria-label', 'Manga Translator');
@@ -322,8 +521,7 @@
     floatBtn.onclick = (e) => { e.stopPropagation(); toggleFloatPopup(); };
     document.body.appendChild(floatBtn);
 
-    // 2. Popup Menu — matches the extension popup: focal Translate button on
-    //    top, a collapsible detailed-settings panel, modern white SVG icons.
+    // 2. Popup Menu
     floatPopup = document.createElement('div');
     floatPopup.style.cssText = `
       position: fixed; top: 50%; left: 78px; transform: translateY(-50%);
@@ -333,8 +531,6 @@
       color: #e6e6ec; border: 1px solid #2c2c3a; font-size: 14px; line-height: 1.4;
       max-height: 88vh; overflow-y: auto; overflow-x: hidden; box-sizing: border-box;
     `;
-    // Shared style snippets (inline because content scripts can't rely on the
-    // page's CSS). `mt_` prefixed helpers mirror popup.html's classes.
     const ICON = {
       arrow: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:8px;"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>',
       globe: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
@@ -344,11 +540,14 @@
       brain: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><path d="M12 2a3 3 0 0 0-3 3v7.5"/><path d="M12 2a3 3 0 0 1 3 3v.5"/><path d="M9 12.5A3 3 0 1 0 6 17a3 3 0 0 0 3 1"/><path d="M15 6a3 3 0 1 1 3 5"/><path d="M9 18a3 3 0 0 0 6 0v-6"/><path d="M18 11a3 3 0 1 1-3 5"/></svg>',
       gear: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:8px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
       wrench: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:8px;"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
+      inpaint: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><path d="m15 5 4 4"/><path d="M13 7 8.7 2.7a2.4 2.4 0 0 0-3.4 0L2.7 5.3a2.4 2.4 0 0 0 0 3.4L7 13"/><path d="m8 6 2-2"/><path d="M18 12h.01"/><path d="M18 21a3 3 0 0 0 3-3c0-1.5-1-3-3-5-2 2-3 3.5-3 5a3 3 0 0 0 3 3z"/><path d="M11 15 6 20a2.83 2.83 0 0 1-4-4l5-5"/></svg>',
+      palette: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:6px;"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.563-2.512 5.563-5.563C22 6.012 17.5 2 12 2z"/></svg>',
     };
     const selCss = "width:100%; padding:9px; margin:0 0 12px 0; box-sizing:border-box; border:1px solid #3a3a4c; border-radius:6px; background:#22222e; color:#e6e6ec; font-size:13px; cursor:pointer;";
     const inCss  = "width:100%; padding:9px; margin:6px 0; box-sizing:border-box; border:1px solid #3a3a4c; border-radius:6px; background:#22222e; color:#e6e6ec; font-size:13px;";
     const labCss = "display:flex; align-items:center; font-weight:600; color:#a9a9bd; margin-bottom:4px; font-size:13px;";
     const secCss = "display:flex; align-items:center; font-size:12px; text-transform:uppercase; letter-spacing:.5px; color:#7a7a8c; margin:6px 0 8px 0;";
+    const hintCss = "font-size:11px; color:#8a8a9c; margin:-6px 0 12px 0;";
     floatPopup.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#22a552" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>
@@ -382,6 +581,7 @@
           <option value="glm">GLM (Local, Korean)</option>
           <option value="lens">Google Lens (Cloud, All)</option>
         </select>
+        <div id="mtOcrModeStatus" style="font-size:12px; color:#46c877; text-align:center; min-height:15px; margin-bottom:8px;"></div>
         <label style="${labCss}">Source Language</label>
         <select id="mtOcrLangSelect" style="${selCss}"><!-- populated by JS --></select>
 
@@ -398,6 +598,16 @@
         </div>
         <input type="hidden" id="mtFontWeightHidden" value="2">
 
+        <div style="${secCss}">${ICON.inpaint}Inpainting</div>
+        <label style="${labCss}">Inpainting Mode</label>
+        <select id="mtInpaintMode" style="${selCss}">
+          <option value="low">Low (faster, default)</option>
+          <option value="high">High (better quality, bigger model)</option>
+          <option value="none">None (fill with bg color, no model)</option>
+        </select>
+        <div style="${hintCss}">High mode auto-downloads a larger LaMa model. 'None' fills text regions with the detected background color instead of inpainting.</div>
+        <div id="mtInpaintModeStatus" style="font-size:12px; color:#46c877; text-align:center; min-height:15px; margin-bottom:8px;"></div>
+
         <div style="${secCss}">${ICON.brain}Translation Model</div>
         <select id="mtModelTypeSelect" style="${selCss}">
           <option value="local">Local (GGUF)</option>
@@ -410,34 +620,72 @@
           <div id="mtModelStatus" style="margin-top:6px; font-size:11px; color:#46c877;"></div>
         </div>
 
+        <div style="margin:0 0 12px 0; padding:10px; background:#22222e; border-radius:8px; border:1px solid #3a3a4c; display:flex; align-items:center;">
+          <input type="checkbox" id="mtColorize" style="width:auto; margin:0;">
+          <label for="mtColorize" style="display:flex; align-items:center; font-weight:500; margin:0 0 0 8px; cursor:pointer; color:#d5d5e2;">${ICON.palette}Enable Colorization</label>
+        </div>
+
         <button id="mtAdvancedBtn" style="width:100%; box-sizing:border-box; padding:11px; background:transparent; color:#b9b9cc; border:1px solid #3a3a4c; border-radius:8px; cursor:pointer; font-weight:500; font-size:14px; display:flex; align-items:center; justify-content:center;">${ICON.wrench}Advanced Settings</button>
       </div>
     `;
     document.body.appendChild(floatPopup);
 
-    // ── Wire the focal Translate button FIRST, before anything that could
-    //    throw, so it always works even if a later picker/handler errors. ──
+    // ── Wire the focal Translate button FIRST ──
     wireTranslateButton();
 
-    // Everything below is best-effort: a failure here must never stop the
-    // Translate button from working.
     try {
-      // Restore saved settings into the dropdowns (autoload from cache)
       loadCachedSettingsIntoPopup();
-
       initFontWeightPicker();
       chrome.storage.local.get(['serverUrl'], (d) => initFontFamilyPicker(d.serverUrl || ''));
     } catch (e) {
       console.warn('[MangaTranslator] Popup init (pickers/cache) failed:', e);
     }
 
-    // Toggle OpenRouter fields when model type changes
+    // ★ Model type change — 1:1 with popup.js
     document.getElementById('mtModelTypeSelect').onchange = (e) => {
-      document.getElementById('mtOpenrouterRow').style.display = e.target.value === 'openrouter' ? 'block' : 'none';
+      const isOpenRouter = e.target.value === 'openrouter';
+      document.getElementById('mtOpenrouterRow').style.display = isOpenRouter ? 'block' : 'none';
       chrome.storage.local.set({ modelType: e.target.value });
+
+      if (!isOpenRouter) {
+        chrome.storage.local.get(['serverUrl'], async (d) => {
+          if (d.serverUrl) {
+            try {
+              await fetch(`${d.serverUrl}/SetModelType`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_type: 'local' })
+              });
+            } catch (e) {
+              console.warn('[MangaTranslator] Failed to switch to local model:', e);
+            }
+          }
+        });
+      }
     };
 
-    // Set OpenRouter model on the server — also caches the API key
+    // ★ Inpaint mode change — 1:1 with popup.js (real-time push to server)
+    document.getElementById('mtInpaintMode').onchange = (e) => {
+      chrome.storage.local.set({ inpaintMode: e.target.value });
+      chrome.storage.local.get(['serverUrl'], (d) => {
+        pushInpaintMode(d.serverUrl, e.target.value);
+      });
+    };
+
+    // ★ OCR mode change — 1:1 with popup.js (real-time push to server)
+    document.getElementById('mtOcrModeSelect').onchange = (e) => {
+      chrome.storage.local.set({ ocrMode: e.target.value });
+      chrome.storage.local.get(['serverUrl'], (d) => {
+        pushOcrMode(d.serverUrl, e.target.value);
+      });
+    };
+
+    // ★ Colorize change — cache immediately — 1:1 with popup.js
+    document.getElementById('mtColorize').onchange = (e) => {
+      chrome.storage.local.set({ colorize: e.target.checked });
+    };
+
+    // ★ Set OpenRouter model — 1:1 with popup.js
     document.getElementById('mtSetModelBtn').onclick = async () => {
       const statusEl = document.getElementById('mtModelStatus');
       const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
@@ -459,7 +707,6 @@
         });
         const data = await res.json();
         if (res.ok) {
-          // Cache model + API key so they persist across popup reopens
           chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model, openrouterApiKey: apiKey });
           statusEl.innerText = `Active: ${data.openrouter_model}`;
         } else {
@@ -470,83 +717,87 @@
       }
     };
 
-    // Translate All button — reads OCR mode/lang, target language, font weight, and model type.
-    // Defined as a hoisted function so it can be wired FIRST (see above), before any
-    // best-effort init that might throw.
+    // ★ Translate All button — 1:1 with popup.js (caches ALL settings + pushes to server)
     function wireTranslateButton() {
-    document.getElementById('mtStartBtn').onclick = async () => {
-      const selectedOcrMode   = document.getElementById('mtOcrModeSelect').value;
-      const selectedOcrLang   = document.getElementById('mtOcrLangSelect').value;
-      const selectedLang      = document.getElementById('mtTargetLangSelect').value;
-      const selectedWeight    = document.getElementById('mtFontWeightHidden').value;
-      const selectedModelType = document.getElementById('mtModelTypeSelect').value;
+      document.getElementById('mtStartBtn').onclick = async () => {
+        const cloudMode      = document.getElementById('mtCloudMode').checked;
+        const selectedOcrMode   = document.getElementById('mtOcrModeSelect').value;
+        const selectedOcrLang   = document.getElementById('mtOcrLangSelect').value;
+        const selectedLang      = document.getElementById('mtTargetLangSelect').value;
+        const selectedWeight    = document.getElementById('mtFontWeightHidden').value;
+        const selectedModelType = document.getElementById('mtModelTypeSelect').value;
+        const selectedInpaint   = document.getElementById('mtInpaintMode').value;
+        const colorize          = document.getElementById('mtColorize').checked;
 
-      // Persist every choice so the extension popup + options page stay in sync
-      const orModelEl = document.getElementById('mtOpenrouterModel');
-      const orKeyEl = document.getElementById('mtOpenrouterKey');
-      const settingsToCache = {
-        targetLang: selectedLang,
-        fontWeight: selectedWeight,
-        modelType: selectedModelType,
-        ocrMode: selectedOcrMode,
-        ocrLang: selectedOcrLang
-      };
-      if (orModelEl && orModelEl.value.trim()) settingsToCache.openrouterModel = orModelEl.value.trim();
-      if (orKeyEl && orKeyEl.value.trim()) settingsToCache.openrouterApiKey = orKeyEl.value.trim();
-      // Include the active font family (the chip with the green border), if any.
-      const activeFamilyChip = Array.from(document.querySelectorAll('#mtFontFamilyScroll button[data-filename]'))
-        .find(c => c.style.borderColor === 'rgb(40, 167, 69)' || c.style.borderColor === '#28a745');
-      if (activeFamilyChip) settingsToCache.fontFamily = activeFamilyChip.dataset.filename;
-      chrome.storage.local.set(settingsToCache);
-      floatPopup.style.display = 'none';
+        const orModelEl = document.getElementById('mtOpenrouterModel');
+        const orKeyEl = document.getElementById('mtOpenrouterKey');
 
-      const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
-      if (serverUrl) {
-        // Push font boldness to server
-        try {
-          await fetch(`${serverUrl}/SetFont`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ stroke_width: parseInt(selectedWeight, 10) })
-          });
-        } catch (e) {
-          console.warn('[MangaTranslator] Failed to push font weight to server:', e);
-        }
+        // ★ Cache ALL settings — 1:1 with popup.js
+        const settingsToCache = {
+          targetLang: selectedLang,
+          fontWeight: selectedWeight,
+          modelType: selectedModelType,
+          ocrMode: selectedOcrMode,
+          ocrLang: selectedOcrLang,
+          inpaintMode: selectedInpaint,
+          colorize: colorize,
+          cloudMode: cloudMode,
+        };
+        if (orModelEl && orModelEl.value.trim()) settingsToCache.openrouterModel = orModelEl.value.trim();
+        if (orKeyEl && orKeyEl.value.trim()) settingsToCache.openrouterApiKey = orKeyEl.value.trim();
 
-        // Push OCR Engine Mode to server
-        try {
-          await fetch(`${serverUrl}/SetOcrMode`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode: selectedOcrMode })
-          });
-        } catch (e) {
-          console.warn('[MangaTranslator] Failed to push OCR mode to server:', e);
-        }
+        // Include the active font family (the chip with the green border), if any.
+        const activeFamilyChip = Array.from(document.querySelectorAll('#mtFontFamilyScroll button[data-filename]'))
+          .find(c => c.style.borderColor === 'rgb(40, 167, 69)' || c.style.borderColor === '#28a745');
+        if (activeFamilyChip) settingsToCache.fontFamily = activeFamilyChip.dataset.filename;
 
-        // If Local is selected, ensure server is switched back to local model
-        if (selectedModelType === 'local') {
+        const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
+        settingsToCache.serverUrl = serverUrl || '';
+        chrome.storage.local.set(settingsToCache);
+
+        // ★ In cloud mode, push cloud settings to server first — 1:1 with popup.js
+        if (cloudMode && serverUrl) {
+          await pushCloudModeFromPopup(serverUrl);
+        } else if (serverUrl) {
+          // Push font weight
           try {
-            await fetch(`${serverUrl}/SetModelType`, {
+            await fetch(`${serverUrl}/SetFont`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ model_type: 'local' })
+              body: JSON.stringify({ stroke_width: parseInt(selectedWeight, 10) })
             });
           } catch (e) {
-            console.warn('[MangaTranslator] Failed to switch server to local model:', e);
+            console.warn('[MangaTranslator] Failed to push font weight to server:', e);
+          }
+
+          // Push inpaint mode
+          await pushInpaintMode(serverUrl, selectedInpaint);
+
+          // Push OCR mode
+          await pushOcrMode(serverUrl, selectedOcrMode);
+
+          // If Local is selected, ensure server is switched back to local model
+          if (selectedModelType === 'local') {
+            try {
+              await fetch(`${serverUrl}/SetModelType`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_type: 'local' })
+              });
+            } catch (e) {
+              console.warn('[MangaTranslator] Failed to switch server to local model:', e);
+            }
           }
         }
-      }
 
-      startTranslationProcess(selectedOcrLang, selectedLang);
-    };
+        floatPopup.style.display = 'none';
+        startTranslationProcess(selectedOcrLang, selectedLang);
+      };
     }
 
-    // Remaining wiring is best-effort — guarded so a failure here can never stop
-    // the Translate button (already wired above) from working.
+    // Remaining wiring is best-effort
     try {
-      // Gear button toggles the collapsible detailed-settings panel (keeps the
-      // Translate button the focal point, matching the extension popup).
+      // Gear button toggles settings panel
       document.getElementById('mtSettingsBtn').onclick = () => {
         const panel = document.getElementById('mtSettingsPanel');
         const open = panel.style.display === 'none';
@@ -557,79 +808,35 @@
         document.getElementById('mtSettingsPanel').style.display = d.settingsPanelOpen === true ? 'block' : 'none';
       });
 
-      // Advanced Settings button (inside the panel) opens the full models modal.
+      // Advanced Settings button
       document.getElementById('mtAdvancedBtn').onclick = () => {
         floatPopup.style.display = 'none';
         openSettingsModal();
       };
 
-      // Cloud Mode toggle — mirrors the popup: force lens + openrouter + none and
-      // reuse cached OpenRouter details so nothing needs re-entering.
+      // ★ Cloud Mode toggle — 1:1 with popup.js
       const cloudEl = document.getElementById('mtCloudMode');
       cloudEl.onchange = async (e) => {
         const on = e.target.checked;
         applyCloudModeToPopup(on);
         const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
+
         if (on) {
-          chrome.storage.local.set({ cloudMode: true, ocrMode: 'lens', modelType: 'openrouter', inpaintMode: 'none', colorize: false });
+          chrome.storage.local.set({
+            cloudMode: true,
+            ocrMode: 'lens',
+            modelType: 'openrouter',
+            inpaintMode: 'none',
+            colorize: false,
+          });
           await pushCloudModeFromPopup(serverUrl);
         } else {
           chrome.storage.local.set({ cloudMode: false });
-          if (serverUrl) {
-            try {
-              await fetch(`${serverUrl}/SetCloudMode`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ enabled: false })
-              });
-            } catch (err) { console.warn('[MangaTranslator] Failed to disable cloud mode:', err); }
-          }
+          await disableCloudModeOnServer(serverUrl);
         }
       };
     } catch (e) {
       console.warn('[MangaTranslator] Popup secondary wiring failed:', e);
-    }
-  }
-
-  // Lock/unlock the local-only controls when cloud mode is toggled in the popup.
-  function applyCloudModeToPopup(on) {
-    const ocr = document.getElementById('mtOcrModeSelect');
-    const model = document.getElementById('mtModelTypeSelect');
-    const orRow = document.getElementById('mtOpenrouterRow');
-    if (on) {
-      if (ocr) ocr.value = 'lens';
-      if (model) model.value = 'openrouter';
-      if (orRow) orRow.style.display = 'block';
-    }
-    if (ocr) ocr.disabled = on;
-    if (model) model.disabled = on;
-  }
-
-  // Push cloud settings to the server, reusing cached OpenRouter details.
-  async function pushCloudModeFromPopup(serverUrl) {
-    if (!serverUrl) return;
-    const statusEl = document.getElementById('mtStatus');
-    const liveModel = document.getElementById('mtOpenrouterModel').value.trim();
-    const liveKey = document.getElementById('mtOpenrouterKey').value.trim();
-    const cached = await chrome.storage.local.get(['openrouterModel', 'openrouterApiKey']);
-    const model = liveModel || cached.openrouterModel || '';
-    const apiKey = liveKey || cached.openrouterApiKey || '';
-    try {
-      const body = { enabled: true };
-      if (model) body.model = model;
-      if (apiKey) body.api_key = apiKey;
-      const res = await fetch(`${serverUrl}/SetCloudMode`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const data = await res.json();
-      if (!res.ok) { if (statusEl) statusEl.innerText = data.detail || 'Cloud mode failed to enable.'; return; }
-      chrome.storage.local.set({
-        modelType: 'openrouter', ocrMode: 'lens', inpaintMode: 'none',
-        openrouterModel: data.openrouter_model || model, openrouterApiKey: apiKey || cached.openrouterApiKey
-      });
-      if (statusEl) statusEl.innerText = `Cloud mode on — Lens + ${data.openrouter_model || 'OpenRouter'}`;
-    } catch (e) {
-      if (statusEl) statusEl.innerText = 'Could not reach server to enable cloud mode.';
     }
   }
 
@@ -646,7 +853,7 @@
   }
 
   // ========================================================================
-  // SETTINGS MODAL
+  // SETTINGS MODAL (unchanged)
   // ========================================================================
   function openSettingsModal() {
     if (document.getElementById('mtSettingsOverlay')) return;
@@ -756,6 +963,11 @@
         const status = modal.querySelector('#mtUrlStatus');
         status.innerText = 'URL Saved!';
         setTimeout(() => status.innerText = '', 2000);
+        // Re-sync everything from the new server URL
+        loadCachedSettingsIntoPopup();
+        initFontFamilyPicker(url);
+        syncInpaintModeFromServer(url);
+        syncOcrModeFromServer(url);
       });
     });
 
@@ -841,7 +1053,7 @@
   injectUI();
 
   // ========================================================================
-  // MAIN TRANSLATION PROCESS
+  // MAIN TRANSLATION PROCESS (unchanged)
   // ========================================================================
   async function startTranslationProcess(selectedOcrLang, selectedTargetLang) {
     if (isTranslating) {
@@ -851,7 +1063,6 @@
     isTranslating = true;
     floatPopup.style.display = 'none';
 
-    // Load all settings from storage
     const stored = await chrome.storage.local.get(['serverUrl', 'ocrLang', 'colorize', 'targetLang']);
 
     if (!stored.serverUrl) {
@@ -874,7 +1085,6 @@
       return;
     }
 
-    // Sort top to bottom
     images.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
 
     console.log(`[MangaTranslator] Found ${images.length} images to translate.`);
@@ -958,7 +1168,6 @@
       validImages.push(img);
     }
 
-    // Deduplicate by src
     const seen = new Set();
     return validImages.filter(img => {
       if (seen.has(img.dataset.mtTargetSrc)) return false;
