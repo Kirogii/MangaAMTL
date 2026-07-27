@@ -57,7 +57,8 @@
 - https://huggingface.co/Qwen/Qwen3.5-0.8B  
 - https://huggingface.co/sharky172/manga-light-colorizer/  
 - https://huggingface.co/Kirogii/Yolo-Manga_Textbox-Region_Detect/  
-- https://huggingface.co/zai-org/GLM-OCR  
+- https://huggingface.co/zai-org/GLM-OCR
+- https://www.soundjay.com/page-flip-sounds-1.html (Sound: Page Flip Sound Effect 2)
 
 # Linux 系统设置
 ### 本指南使用 wget，请勿使用 curl
