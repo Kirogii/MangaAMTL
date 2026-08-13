@@ -26,8 +26,11 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["languages.js", "content.js"],
+      "js": ["languages.js", "content.js", "reader.js"],
       "run_at": "document_idle"
     }
+  ],
+  "web_accessible_resources": [
+    { "resources": ["reader.js", "sounds/*"], "matches": ["<all_urls>"] }
   ]
 }

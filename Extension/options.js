@@ -29,119 +29,65 @@ async function loadFontFaceByName(serverUrl, filename) {
   }
 }
 
-async function getActiveFontFace(serverUrl) {
-  const infoRes = await fetch(`${serverUrl}/GetFont`);
-  if (!infoRes.ok) throw new Error(`GetFont failed: HTTP ${infoRes.status}`);
-  const info = await infoRes.json();
-  const filename = _mtFontFilenameFromPath(info.font_path);
-  const cacheKey = `${serverUrl}::${filename}`;
+// ============================================================================
+// STYLE FONT PICKERS (Context Aware → High mode)
+// ============================================================================
+const STYLE_FONT_FIELDS = [
+  { style: 'bold',   selectId: 'optStyleFontBold',   storageKey: 'styleFontBold' },
+  { style: 'italic', selectId: 'optStyleFontItalic', storageKey: 'styleFontItalic' },
+  { style: 'regular', selectId: 'optStyleFontRegular', storageKey: 'styleFontRegular' },
+];
 
-  if (_mtFontByteCache.has(cacheKey)) {
-    return { face: _mtFontByteCache.get(cacheKey), filename, strokeWidth: info.stroke_width };
+async function initStyleFontPickers(serverUrl, saved) {
+  const statusEl = document.getElementById('optStyleFontStatus');
+  const selects = STYLE_FONT_FIELDS.map(f => ({
+    ...f,
+    el: document.getElementById(f.selectId),
+    savedValue: (saved && saved[f.storageKey]) || '',
+  })).filter(f => f.el);
+  if (selects.length === 0) return;
+
+  const bind = (f) => {
+    f.el.value = f.savedValue;
+    f.el.onchange = () => chrome.storage.local.set({ [f.storageKey]: f.el.value });
+  };
+
+  if (!serverUrl) {
+    if (statusEl) statusEl.innerText = 'Set a Server URL to list fonts.';
+    selects.forEach(bind);
+    return;
   }
 
-  const res = await fetch(`${serverUrl}/v1/font`);
-  if (!res.ok) throw new Error(`font fetch failed: HTTP ${res.status}`);
-  const buf = await res.arrayBuffer();
-  const family = `MTFontOptions_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
-  const face = new FontFace(family, buf);
-  await face.load();
-  document.fonts.add(face);
-  _mtFontByteCache.set(cacheKey, face);
-  return { face, filename, strokeWidth: info.stroke_width };
-}
-
-function drawFontWeightSwatch(canvas, level, fontFamily) {
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  const dpr = window.devicePixelRatio || 1;
-
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#8a8a8a';
-  ctx.fillRect(0, 0, w, h);
-
-  const fontSize = (16 + level * 2) * dpr;
-  ctx.font = `${fontSize}px "${fontFamily}"`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.lineJoin = 'round';
-  const text = 'Aあ';
-  const cx = (w * dpr) / 2, cy = (h * dpr) / 2;
-
-  if (level > 0) {
-    ctx.lineWidth = level * 2.2 * dpr;
-    ctx.strokeStyle = '#ffffff';
-    ctx.strokeText(text, cx, cy);
-  }
-  ctx.fillStyle = '#111111';
-  ctx.fillText(text, cx, cy);
-}
-
-async function initFontWeightPicker(serverUrl) {
-  const container = document.getElementById('optFontWeightPicker');
-  if (!container) return;
-  container.innerHTML = '';
-
-  const { fontWeight } = await chrome.storage.local.get(['fontWeight']);
-  const selected = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
-  document.getElementById('optFontWeightHidden').value = selected;
-
-  let fontFamily = 'sans-serif';
-  if (serverUrl) {
-    try {
-      const { face } = await getActiveFontFace(serverUrl);
-      fontFamily = face.family;
-    } catch (e) {
-      console.warn('[MangaTranslator] Could not load server font for preview, using fallback:', e);
-    }
+  if (statusEl) statusEl.innerText = 'Loading fonts…';
+  let fonts = [];
+  try {
+    const res = await fetch(`${serverUrl}/GetFonts`);
+    const data = await res.json();
+    fonts = data.fonts || [];
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = `<span class="error">Could not load fonts: ${e}</span>`;
+    selects.forEach(bind);
+    return;
   }
 
-  const labels = ['Thin', 'Light', 'Regular', 'Bold', 'Heavy'];
-  for (let level = 0; level <= 4; level++) {
-    const wrap = document.createElement('div');
-    wrap.style.cssText = 'display:flex; flex-direction:column; align-items:center; cursor:pointer;';
-    wrap.title = `${level + 1} - ${labels[level]}`;
-
-    const dpr = window.devicePixelRatio || 1;
-    const canvas = document.createElement('canvas');
-    const cssW = 44, cssH = 34;
-    canvas.style.width = cssW + 'px';
-    canvas.style.height = cssH + 'px';
-    canvas.width = cssW * dpr;
-    canvas.height = cssH * dpr;
-    canvas.dataset.level = level;
-    canvas.style.cssText += `border-radius:4px; border:2px solid ${level === selected ? '#28a745' : '#555'}; display:block;`;
-    drawFontWeightSwatch(canvas, level, fontFamily);
-
-    const lbl = document.createElement('div');
-    lbl.innerText = level + 1;
-    lbl.style.cssText = 'font-size:10px; color:#aaa; margin-top:2px;';
-
-    wrap.appendChild(canvas);
-    wrap.appendChild(lbl);
-    wrap.onclick = async () => {
-      document.getElementById('optFontWeightHidden').value = level;
-      chrome.storage.local.set({ fontWeight: String(level) });
-      container.querySelectorAll('canvas').forEach(c => {
-        c.style.border = `2px solid ${parseInt(c.dataset.level, 10) === level ? '#28a745' : '#555'}`;
+  selects.forEach(f => {
+    while (f.el.options.length > 1) f.el.remove(1);
+    fonts.forEach(font => {
+      const opt = document.createElement('option');
+      opt.value = font.filename;
+      opt.textContent = font.name;
+      f.el.appendChild(opt);
+      loadFontFaceByName(serverUrl, font.filename).then(family => {
+        if (family) opt.style.fontFamily = `"${family}", sans-serif`;
       });
+    });
+    bind(f);
+  });
 
-      const url = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
-      const statusEl = document.getElementById('optFontStatus');
-      if (!url) return;
-      statusEl.innerText = 'Saving...';
-      try {
-        await fetch(`${url}/SetFont`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ stroke_width: level })
-        });
-        statusEl.innerText = `Stroke width set to ${level}`;
-      } catch (e) {
-        statusEl.innerHTML = `<span class="error">Error: ${e}</span>`;
-      }
-    };
-    container.appendChild(wrap);
+  if (statusEl) {
+    statusEl.innerText = fonts.length
+      ? `${fonts.length} fonts available.`
+      : 'No fonts found in server fonts folder.';
   }
 }
 
@@ -212,13 +158,10 @@ async function selectFontFamily(serverUrl, filename, container) {
   const statusEl = document.getElementById('optFontFamilyStatus');
   statusEl.innerText = `Switching to ${filename}...`;
   try {
-    const { fontWeight } = await chrome.storage.local.get(['fontWeight']);
-    const strokeWidth = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
-
     const res = await fetch(`${serverUrl}/SetFont`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ font_name: filename, stroke_width: strokeWidth })
+      body: JSON.stringify({ font_name: filename })
     });
     const data = await res.json();
     if (!res.ok) {
@@ -231,8 +174,6 @@ async function selectFontFamily(serverUrl, filename, container) {
     container.querySelectorAll('.font-chip').forEach(c => {
       c.classList.toggle('active', c.dataset.filename === filename);
     });
-
-    await initFontWeightPicker(serverUrl);
   } catch (e) {
     statusEl.innerHTML = `<span class="error">Error: ${e}</span>`;
   }
@@ -252,9 +193,39 @@ async function syncModelTypeFromServer(serverUrl) {
       document.getElementById('optOpenrouterModel').value = data.openrouter_model;
     }
     chrome.storage.local.set({ modelType: data.model_type || 'local' });
+    applyContextLevelGate();
   } catch (e) {
     console.warn('[MangaTranslator] Could not fetch model type from server:', e);
   }
+}
+
+// ============================================================================
+// CONTEXT LEVEL GATE — High rides on a vision request (the page image is sent
+// alongside the text), which only the OpenRouter backend can make. On the local
+// GGUF backend the server degrades High to Low, so the option is disabled here
+// rather than silently doing nothing.
+// ============================================================================
+// Assigned by the DOMContentLoaded handler once the context controls exist; the
+// gate calls it so the style-font button follows a forced level change.
+let applyCtxVisibility = () => {};
+
+function applyContextLevelGate() {
+  const ctxLevelEl = document.getElementById('optContextLevel');
+  if (!ctxLevelEl) return;
+  const isOpenRouter = document.getElementById('optModelType')?.value === 'openrouter';
+
+  const highOpt = ctxLevelEl.querySelector('option[value="high"]');
+  if (highOpt) highOpt.disabled = !isOpenRouter;
+
+  if (!isOpenRouter && ctxLevelEl.value === 'high') {
+    ctxLevelEl.value = 'low';
+    chrome.storage.local.set({ contextLevel: 'low' });
+  }
+
+  const note = document.getElementById('optContextHighNote');
+  if (note) note.style.display = isOpenRouter ? 'none' : 'block';
+
+  applyCtxVisibility();
 }
 
 async function syncInpaintModeFromServer(serverUrl) {
@@ -307,6 +278,17 @@ async function pushInpaintMode(serverUrl, mode) {
   }
 }
 
+function ocrModeLabel(mode) {
+  switch (mode) {
+    case 'lens': return 'Google Lens active';
+    case 'glm': return 'GLM active';
+    case 'openai_endpoint': return 'OpenAI Endpoint OCR active';
+    case 'google_ai': return 'Google AI Studio OCR active (all text)';
+    case 'local_vision': return 'Local GGUF Vision OCR active';
+    default: return 'Hayai active';
+  }
+}
+
 async function syncOcrModeFromServer(serverUrl) {
   const statusEl = document.getElementById('optOcrStatus');
   if (!serverUrl) return;
@@ -314,8 +296,10 @@ async function syncOcrModeFromServer(serverUrl) {
     const res = await fetch(`${serverUrl}/GetOcrMode`);
     const data = await res.json();
     document.getElementById('optOcrMode').value = data.ocr_mode || 'hayai';
+    document.getElementById('optOpenaiOcrRow').style.display = data.ocr_mode === 'openai_endpoint' ? 'block' : 'none';
+    document.getElementById('optGoogleAiOcrRow').style.display = data.ocr_mode === 'google_ai' ? 'block' : 'none';
     chrome.storage.local.set({ ocrMode: data.ocr_mode || 'hayai' });
-    statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+    statusEl.innerText = ocrModeLabel(data.ocr_mode);
   } catch (e) {
     console.warn('[MangaTranslator] Could not fetch OCR mode from server:', e);
   }
@@ -336,7 +320,7 @@ async function pushOcrMode(serverUrl, mode) {
     });
     const data = await res.json();
     if (res.ok) {
-      statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+      statusEl.innerText = ocrModeLabel(data.ocr_mode);
       chrome.storage.local.set({ ocrMode: data.ocr_mode });
     } else {
       statusEl.innerHTML = `<span class="error">Error: ${data.detail}</span>`;
@@ -351,13 +335,30 @@ async function pushOcrMode(serverUrl, mode) {
 // ============================================================================
 document.addEventListener('DOMContentLoaded', () => {
   chrome.storage.local.get(
-    ['serverUrl', 'modelType', 'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'fontWeight'],
+    ['serverUrl', 'modelType', 'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode',
+     'openaiOcrEndpoint', 'openaiOcrModel', 'openaiOcrApiKey',
+     'googleAiOcrApiKey', 'googleAiOcrModel', 'googleAiOcrCustomModel', 'googleAiOcrRpm',
+     'combineAmount', 'freeOpenRouter', 'contextMode', 'contextLevel',
+     'styleFontBold', 'styleFontItalic', 'styleFontRegular', 'skipSfx', 'contextAware'],
     (data) => {
       const url = data.serverUrl || 'http://localhost:7860';
       document.getElementById('optServerUrl').value = url;
 
       // ★ Autoload cached dropdown selections
       if (data.ocrMode) document.getElementById('optOcrMode').value = data.ocrMode;
+      document.getElementById('optOpenaiOcrRow').style.display = data.ocrMode === 'openai_endpoint' ? 'block' : 'none';
+      document.getElementById('optOpenaiOcrEndpoint').value = data.openaiOcrEndpoint || 'https://api.openai.com/v1';
+      document.getElementById('optOpenaiOcrModel').value = data.openaiOcrModel || 'gpt-4o-mini';
+      document.getElementById('optOpenaiOcrKey').value = data.openaiOcrApiKey || '';
+      document.getElementById('optGoogleAiOcrRow').style.display = data.ocrMode === 'google_ai' ? 'block' : 'none';
+      document.getElementById('optGoogleAiOcrKey').value = data.googleAiOcrApiKey || '';
+      const googleModel = data.googleAiOcrModel || 'gemini-2.5-flash-lite';
+      const googleModelSelect = document.getElementById('optGoogleAiOcrModel');
+      const knownGoogleModel = Array.from(googleModelSelect.options).some(option => option.value === googleModel);
+      googleModelSelect.value = knownGoogleModel ? googleModel : 'custom';
+      document.getElementById('optGoogleAiOcrCustomModel').value = data.googleAiOcrCustomModel || (knownGoogleModel ? '' : googleModel);
+      document.getElementById('optGoogleAiOcrCustomModel').style.display = googleModelSelect.value === 'custom' ? 'block' : 'none';
+      document.getElementById('optGoogleAiOcrRpm').value = data.googleAiOcrRpm || 5;
       if (data.inpaintMode) document.getElementById('optInpaintMode').value = data.inpaintMode;
 
       const cachedModelType = data.modelType || 'local';
@@ -371,8 +372,66 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('optOpenrouterKey').value = data.openrouterApiKey;
       }
 
+      // ★ Combine slider — restore value + live label
+      const combineAmount = parseInt(data.combineAmount || '1', 10);
+      const combineSlider = document.getElementById('optCombineAmount');
+      const combineLabel = document.getElementById('optCombineAmountVal');
+      if (combineSlider && combineLabel) {
+        combineSlider.value = combineAmount;
+        combineLabel.textContent = combineAmount;
+        combineSlider.oninput = () => {
+          combineLabel.textContent = combineSlider.value;
+          chrome.storage.local.set({ combineAmount: String(combineSlider.value) });
+        };
+      }
+
+      // ★ Context Aware (merged Skip SFX + old Text Context Aware) — restore
+      const ctxModeEl = document.getElementById('optContextMode');
+      const ctxLevelEl = document.getElementById('optContextLevel');
+      const ctxLevelRow = document.getElementById('optContextLevelRow');
+      const styleFontsBtn = document.getElementById('optStyleFontsBtn');
+      const styleFontsBox = document.getElementById('optStyleFontsBox');
+      if (ctxModeEl && ctxLevelEl) {
+        const ctxMode = data.contextMode
+          || ((data.skipSfx === true || data.contextAware === true) ? 'on' : 'off');
+        const ctxLevel = data.contextLevel === 'high' ? 'high' : 'low';
+        ctxModeEl.value = ctxMode;
+        ctxLevelEl.value = ctxLevel;
+        const applyCtxVisibilityLocal = () => {
+          const on = ctxModeEl.value === 'on';
+          const high = on && ctxLevelEl.value === 'high';
+          if (ctxLevelRow) ctxLevelRow.style.display = on ? 'block' : 'none';
+          if (styleFontsBtn) styleFontsBtn.style.display = high ? 'block' : 'none';
+          if (styleFontsBox && !high) styleFontsBox.style.display = 'none';
+        };
+        // Hand the gate a way to refresh this once it forces High → Low.
+        applyCtxVisibility = applyCtxVisibilityLocal;
+        applyCtxVisibilityLocal();
+        applyContextLevelGate();
+        ctxModeEl.onchange = () => {
+          chrome.storage.local.set({ contextMode: ctxModeEl.value });
+          applyCtxVisibilityLocal();
+        };
+        ctxLevelEl.onchange = () => {
+          chrome.storage.local.set({ contextLevel: ctxLevelEl.value });
+          applyCtxVisibilityLocal();
+        };
+        if (styleFontsBtn && styleFontsBox) {
+          styleFontsBtn.onclick = () => {
+            styleFontsBox.style.display = styleFontsBox.style.display === 'block' ? 'none' : 'block';
+          };
+        }
+      }
+
+      // ★ Free OpenRouter — restore (default off)
+      const freeOrEl = document.getElementById('optFreeOpenRouter');
+      if (freeOrEl) {
+        freeOrEl.checked = data.freeOpenRouter === true;
+        freeOrEl.onchange = () => chrome.storage.local.set({ freeOpenRouter: freeOrEl.checked });
+      }
+
       initFontFamilyPicker(url);
-      initFontWeightPicker(url);
+      initStyleFontPickers(url, data);
       // Server syncs run after cache load — if server is online they keep things in sync
       syncModelTypeFromServer(url);
       syncInpaintModeFromServer(url);
@@ -392,7 +451,9 @@ document.getElementById('mtSaveUrlBtn').addEventListener('click', () => {
     setTimeout(() => status.innerText = '', 2000);
   });
   initFontFamilyPicker(url);
-  initFontWeightPicker(url);
+  chrome.storage.local.get(['styleFontBold', 'styleFontItalic', 'styleFontRegular'], (saved) => {
+    initStyleFontPickers(url, saved || {});
+  });
   syncModelTypeFromServer(url);
   syncInpaintModeFromServer(url);
   syncOcrModeFromServer(url);
@@ -408,7 +469,22 @@ document.getElementById('saveAllBtn').addEventListener('click', () => {
   const openrouterModel = document.getElementById('optOpenrouterModel').value.trim();
   const openrouterApiKey = document.getElementById('optOpenrouterKey').value.trim();
   const inpaintMode = document.getElementById('optInpaintMode').value;
-  const fontWeight = document.getElementById('optFontWeightHidden').value;
+  const combineAmount = document.getElementById('optCombineAmount').value;
+  const freeOpenRouter = document.getElementById('optFreeOpenRouter').checked;
+  const openaiOcrEndpoint = document.getElementById('optOpenaiOcrEndpoint').value.trim();
+  const openaiOcrModel = document.getElementById('optOpenaiOcrModel').value.trim();
+  const openaiOcrApiKey = document.getElementById('optOpenaiOcrKey').value.trim();
+  const googleAiOcrModelSelect = document.getElementById('optGoogleAiOcrModel').value;
+  const googleAiOcrModel = googleAiOcrModelSelect === 'custom'
+    ? document.getElementById('optGoogleAiOcrCustomModel').value.trim()
+    : googleAiOcrModelSelect;
+  const googleAiOcrApiKey = document.getElementById('optGoogleAiOcrKey').value.trim();
+  const googleAiOcrRpm = parseInt(document.getElementById('optGoogleAiOcrRpm').value, 10) || 5;
+  const contextMode = document.getElementById('optContextMode').value;
+  const contextLevel = document.getElementById('optContextLevel').value;
+  const styleFontBold = document.getElementById('optStyleFontBold').value;
+  const styleFontItalic = document.getElementById('optStyleFontItalic').value;
+  const styleFontRegular = document.getElementById('optStyleFontRegular').value;
 
   chrome.storage.local.set({
     serverUrl: url,
@@ -417,7 +493,20 @@ document.getElementById('saveAllBtn').addEventListener('click', () => {
     openrouterModel: openrouterModel,
     openrouterApiKey: openrouterApiKey,
     inpaintMode: inpaintMode,
-    fontWeight: fontWeight
+    combineAmount: combineAmount,
+    freeOpenRouter: freeOpenRouter,
+    openaiOcrEndpoint: openaiOcrEndpoint,
+    openaiOcrModel: openaiOcrModel,
+    openaiOcrApiKey: openaiOcrApiKey,
+    googleAiOcrApiKey: googleAiOcrApiKey,
+    googleAiOcrModel: googleAiOcrModel,
+    googleAiOcrCustomModel: googleAiOcrModelSelect === 'custom' ? googleAiOcrModel : '',
+    googleAiOcrRpm: googleAiOcrRpm,
+    contextMode: contextMode,
+    contextLevel: contextLevel,
+    styleFontBold: styleFontBold,
+    styleFontItalic: styleFontItalic,
+    styleFontRegular: styleFontRegular
   }, () => {
     const btn = document.getElementById('saveAllBtn');
     const originalText = btn.innerText;
@@ -430,6 +519,7 @@ document.getElementById('optModelType').addEventListener('change', (e) => {
   const isOpenRouter = e.target.value === 'openrouter';
   document.getElementById('optOpenrouterRow').style.display = isOpenRouter ? 'block' : 'none';
   chrome.storage.local.set({ modelType: e.target.value });
+  applyContextLevelGate();
 
   if (!isOpenRouter) {
     const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
@@ -486,8 +576,35 @@ document.getElementById('optInpaintMode').addEventListener('change', (e) => {
 
 document.getElementById('optOcrMode').addEventListener('change', (e) => {
   const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
+  document.getElementById('optOpenaiOcrRow').style.display = e.target.value === 'openai_endpoint' ? 'block' : 'none';
+  document.getElementById('optGoogleAiOcrRow').style.display = e.target.value === 'google_ai' ? 'block' : 'none';
   chrome.storage.local.set({ ocrMode: e.target.value });
-  pushOcrMode(serverUrl, e.target.value);
+  if (e.target.value === 'openai_endpoint' || e.target.value === 'google_ai') {
+    const payload = { cloud_mode: false, ocr_mode: e.target.value };
+    if (e.target.value === 'openai_endpoint') {
+      payload.openai_ocr_endpoint = document.getElementById('optOpenaiOcrEndpoint').value.trim();
+      payload.openai_ocr_model = document.getElementById('optOpenaiOcrModel').value.trim();
+      payload.openai_ocr_api_key = document.getElementById('optOpenaiOcrKey').value.trim();
+    } else {
+      const selectedModel = document.getElementById('optGoogleAiOcrModel').value;
+      payload.google_ai_ocr_api_key = document.getElementById('optGoogleAiOcrKey').value.trim();
+      payload.google_ai_ocr_model = selectedModel === 'custom'
+        ? document.getElementById('optGoogleAiOcrCustomModel').value.trim()
+        : selectedModel;
+      payload.google_ai_ocr_rpm = parseInt(document.getElementById('optGoogleAiOcrRpm').value, 10) || 5;
+    }
+    fetch(`${serverUrl}/SetAllSettings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).catch(err => console.warn('[MangaTranslator] Failed to configure cloud OCR:', err));
+  } else {
+    pushOcrMode(serverUrl, e.target.value);
+  }
+});
+
+document.getElementById('optGoogleAiOcrModel').addEventListener('change', (e) => {
+  document.getElementById('optGoogleAiOcrCustomModel').style.display = e.target.value === 'custom' ? 'block' : 'none';
 });
 
 // ============================================================================
@@ -496,7 +613,7 @@ document.getElementById('optOcrMode').addEventListener('change', (e) => {
 document.getElementById('refreshModelsBtn').addEventListener('click', async () => {
   const serverUrl = document.getElementById('optServerUrl').value.trim().replace(/\/$/, '');
   const tableBody = document.querySelector('#modelsTable tbody');
-  tableBody.innerHTML = '<tr><td colspan="4" style="text-align:center;">Loading...</td></tr>';
+  tableBody.innerHTML = '<tr><td colspan="5" style="text-align:center;">Loading...</td></tr>';
 
   try {
     const res = await fetch(`${serverUrl}/v1/listmodels`);
@@ -509,6 +626,7 @@ document.getElementById('refreshModelsBtn').addEventListener('click', async () =
         tr.innerHTML = `
           <td>${m.repo_id}</td>
           <td>${m.filename}</td>
+          <td><span class="vision-pill${m.vision_capable ? '' : ' text-only'}">${m.vision_capable ? 'Vision OCR' : 'Text only'}</span></td>
           <td>${m.size_mb}</td>
           <td><button class="success" data-repo="${m.repo_id}" data-file="${m.filename}">Switch</button></td>
         `;
@@ -529,6 +647,10 @@ document.getElementById('refreshModelsBtn').addEventListener('click', async () =
             const data = await res.json();
             if (res.ok) {
               document.getElementById('modelStatus').innerText = `Active: ${data.repo_id}/${data.filename}`;
+              document.getElementById('optModelType').value = 'local';
+              document.getElementById('optOpenrouterRow').style.display = 'none';
+              document.getElementById('optInpaintMode').value = 'low';
+              chrome.storage.local.set({ modelType: 'local', cloudMode: false, inpaintMode: 'low' });
             } else {
               document.getElementById('modelStatus').innerHTML = `<span class="error">Error: ${data.detail}</span>`;
             }
@@ -538,10 +660,10 @@ document.getElementById('refreshModelsBtn').addEventListener('click', async () =
         });
       });
     } else {
-      tableBody.innerHTML = '<tr><td colspan="4" style="text-align:center;">No models found in API server.</td></tr>';
+      tableBody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No models found in API server.</td></tr>';
     }
   } catch (e) {
-    tableBody.innerHTML = `<tr><td colspan="4" class="error" style="text-align:center;">Error fetching models: ${e}</td></tr>`;
+    tableBody.innerHTML = `<tr><td colspan="5" class="error" style="text-align:center;">Error fetching models: ${e}</td></tr>`;
   }
 });
 
@@ -565,6 +687,9 @@ document.getElementById('installModelBtn').addEventListener('click', async () =>
     const data = await res.json();
     if (res.ok) {
       document.getElementById('modelStatus').innerText = `Success! Active model: ${data.repo_id}/${data.filename}`;
+      document.getElementById('optModelType').value = 'local';
+      document.getElementById('optOpenrouterRow').style.display = 'none';
+      chrome.storage.local.set({ modelType: 'local', cloudMode: false });
       document.getElementById('refreshModelsBtn').click();
     } else {
       document.getElementById('modelStatus').innerHTML = `<span class="error">Error: ${data.detail}</span>`;

@@ -13,10 +13,13 @@ import asyncio
 import base64
 import bisect
 import io
+import json
+import math
 import os
 import pathlib
 import time
 import traceback
+import urllib.parse
 import urllib.request
 import uuid
 import logging
@@ -29,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pydantic import BaseModel, Field
 
 # --- FastAPI ---------------------------------------------------------------
@@ -151,6 +154,14 @@ def clean_text_for_font(text: str) -> str:
 # --- Config ----------------------------------------------------------------
 ROOT_DIR = pathlib.Path(__file__).parent.resolve()
 MODEL_DIR = ROOT_DIR / "models"
+LOCAL_VISION_TEMPLATE_PATH = ROOT_DIR / "jinja.txt"
+LOCAL_VISION_CHAT_TEMPLATE = ""
+try:
+    LOCAL_VISION_CHAT_TEMPLATE = LOCAL_VISION_TEMPLATE_PATH.read_text(encoding="utf-8")
+    logging.info(f"[Local Vision OCR] Loaded chat template from {LOCAL_VISION_TEMPLATE_PATH}")
+except OSError as exc:
+    logging.warning(f"[Local Vision OCR] Could not load {LOCAL_VISION_TEMPLATE_PATH}: {exc}")
+
 MODEL_DIR.mkdir(exist_ok=True)
 YOLO_MODEL_PATH = MODEL_DIR / "yolo_manga_textbox.pt"
 YOLO_HF_RAW = "https://huggingface.co/Kirogii/Yolo-Manga_Textbox-Region_Detect/resolve/main/model.pt"
@@ -204,6 +215,7 @@ COLORIZER_DEFAULT_INFER_SIZE = 768
 # --- GGUF Model Config -----------------------------------------------------
 GGUF_DIR = MODEL_DIR / "gguf"
 GGUF_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_PATH = ROOT_DIR / "settings.json"
 
 # --- Logging / Console -----------------------------------------------------
 class MemoryLogHandler(logging.Handler):
@@ -243,6 +255,9 @@ _simple_lama_model = None       # low mode (default SimpleLama / big-lama.pt)
 _simple_lama_high_model = None  # high mode (anime-manga-big-lama.pt)
 _global_yolo       = None
 _global_qwen       = None
+_local_vision_qwen = None
+_local_vision_model_path: Optional[pathlib.Path] = None
+_local_vision_projector_path: Optional[pathlib.Path] = None
 _hayai_ocr_model   = None
 _paddle_ocr_model  = None
 
@@ -276,8 +291,22 @@ _inpaint_mode = "low"  # "low" or "high"
 _inpaint_mode_lock = threading.Lock()
 
 # --- OCR Mode Globals ---
-_ocr_mode = "hayai"  # "hayai", "glm", or "lens"
+_ocr_mode = "hayai"  # "hayai", "glm", "lens", or "openai_endpoint"
 _ocr_mode_lock = threading.Lock()
+
+# --- OpenAI-compatible OCR Endpoint Globals ---
+_openai_ocr_endpoint: str = "https://api.openai.com/v1/chat/completions"
+_openai_ocr_api_key: Optional[str] = None
+_openai_ocr_model: str = "gpt-4o-mini"
+_openai_ocr_config_lock = threading.Lock()
+
+# --- Google AI Studio OCR Globals ---
+_google_ai_ocr_api_key: Optional[str] = None
+_google_ai_ocr_model: str = "gemini-2.5-flash-lite"
+_google_ai_ocr_rpm: int = 5
+_google_ai_ocr_config_lock = threading.Lock()
+_google_ai_ocr_rate_lock = asyncio.Lock()
+_google_ai_ocr_last_request: float = 0.0
 
 # --- Cloud Mode Globals ---
 # When on, the server avoids loading heavy local models (OCR, inpainting,
@@ -299,6 +328,129 @@ _current_model_type: str = "local"
 _openrouter_api_key: Optional[str] = None
 _openrouter_model: str = "openai/gpt-4o-mini"
 _model_type_lock = threading.Lock()
+
+# --- OpenRouter Paid-Mode Global ---
+# The UI checkbox is "Paid model". A paid OpenRouter account is not on a
+# free-tier per-minute quota, so when this is True the translate functions never
+# sleep on HTTP 429 — they retry straight away — and the per-box fallback stops
+# throttling itself, which is what made translation look one-at-a-time even
+# when nothing was actually rate limited.
+# When False (free tier) a 429 is waited out properly: whatever the server tells
+# us via Retry-After / X-RateLimit-Reset, else OPENROUTER_RATELIMIT_AVG_WAIT.
+#
+# The wire field / storage key is `free_openrouter` and the endpoints are named
+# `/SetOpenRouterFreeMode`, so the canonical global keeps the "free_mode" name
+# even though the checkbox is now labelled "Paid model". True == paid account ==
+# skip 429 backoff (retry the batch immediately, no per-box fallback).
+_openrouter_free_mode: bool = False
+_openrouter_free_mode_lock = threading.Lock()
+
+# Free-tier OpenRouter quotas are per-minute windows, so a 429 clears somewhere
+# in the next 0-60s. 30s is the expected wait when the response carries no
+# reset hint of its own.
+OPENROUTER_RATELIMIT_AVG_WAIT = 30.0
+
+# Never sit on a 429 longer than this even if the server asks us to — a job that
+# blocks for ten minutes reads as a hang.
+OPENROUTER_RATELIMIT_MAX_WAIT = 300.0
+
+# Spacing between per-box fallback requests on the free tier, to stay under the
+# per-minute quota. Paid mode skips it and fans the boxes out instead.
+OPENROUTER_FREE_TIER_THROTTLE = 1.0
+
+# How many per-box fallback requests a paid account sends at once.
+OPENROUTER_FALLBACK_CONCURRENCY = 6
+
+# --- Context-Aware Mode Global ---
+# When True, the translation pipeline:
+#   1) Appends an honorific-preservation clause to the system prompt.
+#   2) Makes ONE extra LLM call per job to build a names dictionary.
+#   3) Post-processes translations to reinsert dropped honorifics.
+# Cost: ~1 extra API request per chapter + ~200-600 tokens (stated in UI).
+_context_aware_mode: bool = False
+_context_aware_lock = threading.Lock()
+_settings_lock = threading.Lock()
+
+
+def _settings_snapshot() -> Dict[str, Any]:
+    return {
+        "cloud_mode": _cloud_mode,
+        "ocr_mode": _ocr_mode,
+        "inpaint_mode": _inpaint_mode,
+        "model_type": _current_model_type,
+        "local_model_repo_id": _current_qwen_repo_id,
+        "local_model_filename": _current_qwen_filename,
+        "openrouter_model": _openrouter_model,
+        "openrouter_api_key": _openrouter_api_key,
+        "openai_ocr_endpoint": _openai_ocr_endpoint,
+        "openai_ocr_model": _openai_ocr_model,
+        "openai_ocr_api_key": _openai_ocr_api_key,
+        "google_ai_ocr_api_key": _google_ai_ocr_api_key,
+        "google_ai_ocr_model": _google_ai_ocr_model,
+        "google_ai_ocr_rpm": _google_ai_ocr_rpm,
+        "font_path": str(_current_font_path),
+        "stroke_width": _current_stroke_width,
+        "free_openrouter": _openrouter_free_mode,
+        "context_aware": _context_aware_mode,
+    }
+
+
+def _save_settings() -> None:
+    snapshot = _settings_snapshot()
+    temp_path = SETTINGS_PATH.with_suffix(".json.tmp")
+    try:
+        with _settings_lock:
+            temp_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            temp_path.replace(SETTINGS_PATH)
+    except OSError as exc:
+        logging.error(f"[Settings] Could not persist settings: {exc}")
+
+
+def _load_settings() -> None:
+    global _cloud_mode, _ocr_mode, _inpaint_mode, _current_model_type
+    global _current_qwen_repo_id, _current_qwen_filename
+    global _openrouter_model, _openrouter_api_key
+    global _openai_ocr_endpoint, _openai_ocr_model, _openai_ocr_api_key
+    global _google_ai_ocr_api_key, _google_ai_ocr_model, _google_ai_ocr_rpm
+    global _current_font_path, _current_stroke_width
+    global _openrouter_free_mode, _context_aware_mode
+    if not SETTINGS_PATH.exists():
+        return
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("settings root must be an object")
+        if data.get("ocr_mode") in {"hayai", "glm", "lens", "openai_endpoint", "google_ai", "local_vision"}:
+            _ocr_mode = data["ocr_mode"]
+        if data.get("inpaint_mode") in {"low", "high", "none"}:
+            _inpaint_mode = data["inpaint_mode"]
+        if data.get("model_type") in {"local", "openrouter"}:
+            _current_model_type = data["model_type"]
+        _cloud_mode = bool(data.get("cloud_mode", _cloud_mode))
+        _current_qwen_repo_id = str(data.get("local_model_repo_id") or _current_qwen_repo_id)
+        _current_qwen_filename = str(data.get("local_model_filename") or _current_qwen_filename)
+        _openrouter_model = str(data.get("openrouter_model") or _openrouter_model)
+        _openrouter_api_key = data.get("openrouter_api_key") or None
+        _openai_ocr_endpoint = str(data.get("openai_ocr_endpoint") or _openai_ocr_endpoint)
+        _openai_ocr_model = str(data.get("openai_ocr_model") or _openai_ocr_model)
+        _openai_ocr_api_key = data.get("openai_ocr_api_key") or None
+        _google_ai_ocr_api_key = data.get("google_ai_ocr_api_key") or None
+        _google_ai_ocr_model = str(data.get("google_ai_ocr_model") or _google_ai_ocr_model)
+        rpm = data.get("google_ai_ocr_rpm")
+        if isinstance(rpm, int) and 1 <= rpm <= 15:
+            _google_ai_ocr_rpm = rpm
+        font_path = pathlib.Path(str(data.get("font_path") or _current_font_path))
+        if font_path.exists():
+            _current_font_path = font_path
+        _current_stroke_width = max(0, min(20, int(data.get("stroke_width", _current_stroke_width))))
+        _openrouter_free_mode = bool(data.get("free_openrouter", _openrouter_free_mode))
+        _context_aware_mode = bool(data.get("context_aware", _context_aware_mode))
+        logging.info(f"[Settings] Restored settings from {SETTINGS_PATH}")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logging.error(f"[Settings] Ignoring invalid persisted settings: {exc}")
+
+
+_load_settings()
 
 # ===========================================================================
 # Download helpers
@@ -435,6 +587,89 @@ def colorize_pil(pil_img: Image.Image,
 # ===========================================================================
 # GGUF model management
 # ===========================================================================
+def _is_projector_gguf(path: pathlib.Path) -> bool:
+    name = path.name.lower()
+    return "mmproj" in name or "mmproject" in name or "projector" in name
+
+
+def _has_embedded_vision_metadata(path: pathlib.Path) -> bool:
+    """Detect GGUF multimodal models whose vision adapter is embedded in the model."""
+    if "gemma-4" not in path.name.lower() and "gemma4" not in path.name.lower():
+        return False
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(2 * 1024 * 1024).lower()
+        return b"vision" in header and (b"multimodal" in header or b"mmproj" in header or b"clip" in header)
+    except OSError:
+        return False
+
+
+def _find_external_projector(path: pathlib.Path) -> Optional[pathlib.Path]:
+    search_roots = [
+        pathlib.Path.home() / ".lmstudio" / "models",
+        pathlib.Path.home() / ".cache" / "lm-studio",
+    ]
+    model_tokens = set(re.findall(r"[a-z0-9]+", path.stem.lower())) - {
+        "q4", "q8", "q6", "q5", "q3", "q2", "k", "m", "it", "gguf"
+    }
+    model_family = set(re.findall(r"[a-z0-9]+", path.parent.name.lower()))
+    candidates: List[pathlib.Path] = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            candidates.extend(candidate for candidate in root.rglob("*.gguf") if _is_projector_gguf(candidate))
+        except OSError:
+            continue
+    def _size_markers(value: str) -> set[str]:
+        return {marker.lower() for marker in re.findall(r"\d+(?:\.\d+)?b", value.lower())}
+
+    model_sizes = _size_markers(path.stem)
+    ranked: List[Tuple[int, pathlib.Path]] = []
+    for candidate in candidates:
+        candidate_tokens = set(re.findall(r"[a-z0-9]+", candidate.stem.lower()))
+        candidate_family = set(re.findall(r"[a-z0-9]+", candidate.parent.name.lower()))
+        candidate_sizes = _size_markers(candidate.stem + " " + candidate.parent.name)
+        if model_sizes and candidate_sizes and model_sizes.isdisjoint(candidate_sizes):
+            continue
+        shared_model = len(model_tokens & candidate_tokens)
+        shared_family = len(model_family & candidate_family)
+        same_parent_family = int(path.parent.name.lower() == candidate.parent.name.lower())
+        score = shared_model * 4 + shared_family * 3 + same_parent_family * 20
+        if same_parent_family or (shared_model >= 2 and shared_family >= 1):
+            ranked.append((score, candidate))
+    return max(ranked, key=lambda item: item[0])[1] if ranked else None
+
+
+def _model_record(repo_id: str, path: pathlib.Path) -> Dict[str, Any]:
+    try:
+        size_mb = path.stat().st_size / (1024 * 1024)
+    except OSError:
+        size_mb = 0.0
+    projector_candidates = [
+        candidate for candidate in path.parent.glob("*.gguf")
+        if _is_valid_gguf(candidate) and _is_projector_gguf(candidate)
+    ]
+    if path.parent.resolve() == GGUF_DIR.resolve():
+        repo_prefix = repo_id.replace("/", "__").lower() + "__"
+        projector_candidates = [
+            candidate for candidate in projector_candidates
+            if candidate.name.lower().startswith(repo_prefix)
+        ]
+    projector = projector_candidates[0] if projector_candidates else _find_external_projector(path)
+    return {
+        "name": f"{repo_id.replace('/', '__')}__{path.name}",
+        "repo_id": repo_id,
+        "filename": path.name,
+        "size_mb": round(size_mb, 1),
+        "path": str(path.resolve()),
+        "vision_capable": projector is not None,
+        "vision_adapter": "projector" if projector else None,
+        "projector_filename": projector.name if projector else None,
+        "projector_path": str(projector.resolve()) if projector else None,
+    }
+
+
 def _is_valid_gguf(path: pathlib.Path) -> bool:
     try:
         if not path.exists():
@@ -512,19 +747,9 @@ def _scan_hf_cache_for_ggufs() -> List[Dict[str, Any]]:
             if not snap.is_dir():
                 continue
             for f in snap.glob("*.gguf"):
-                if not _is_valid_gguf(f):
+                if not _is_valid_gguf(f) or _is_projector_gguf(f):
                     continue
-                try:
-                    size_mb = f.stat().st_size / (1024 * 1024)
-                except OSError:
-                    continue
-                models.append({
-                    "name": f"{repo_id.replace('/', '__')}__{f.name}",
-                    "repo_id": repo_id,
-                    "filename": f.name,
-                    "size_mb": round(size_mb, 1),
-                    "path": str(f.resolve()),
-                })
+                models.append(_model_record(repo_id, f))
     return models
 
 def _gguf_local_path(repo_id: str, filename: str) -> pathlib.Path:
@@ -609,11 +834,7 @@ def list_local_gguf_models() -> List[Dict[str, Any]]:
     models: List[Dict[str, Any]] = []
     if GGUF_DIR.exists():
         for f in sorted(GGUF_DIR.glob("*.gguf")):
-            if not _is_valid_gguf(f):
-                continue
-            try:
-                size_mb = f.stat().st_size / (1024 * 1024)
-            except OSError:
+            if not _is_valid_gguf(f) or _is_projector_gguf(f):
                 continue
             stem = f.stem
             parts = stem.split("__")
@@ -623,13 +844,10 @@ def list_local_gguf_models() -> List[Dict[str, Any]]:
             else:
                 filename_part = stem
                 repo_part = stem
-            models.append({
-                "name": stem,
-                "repo_id": repo_part,
-                "filename": filename_part + ".gguf",
-                "size_mb": round(size_mb, 1),
-                "path": str(f),
-            })
+            record = _model_record(repo_part, f)
+            record["name"] = stem
+            record["filename"] = filename_part + ".gguf"
+            models.append(record)
     models.extend(_scan_hf_cache_for_ggufs())
     seen = set()
     unique = []
@@ -810,6 +1028,77 @@ def get_lens_api():
                 logging.info("[Google Lens] LensAPI initialized.")
     return _lens_api
 
+# ── Google Lens text tilt ──
+# Lens reports a per-block rotation (rotation_z, exposed as angle_deg by
+# chrome-lens-py). Reusing it lets the overlay lean with slanted dialogue and
+# SFX instead of sitting bolt upright on top of it. Two guards keep it tame:
+#   * angles fold into (-45, 45], so a ~90° vertical block can never flip the
+#     overlay fully sideways — it just reads as a small lean,
+#   * anything under TILT_MIN_DEG is treated as OCR noise and dropped, and the
+#     result is clamped to TILT_MAX_DEG so text stays readable.
+# Positive = clockwise on screen (image coords, y growing downward).
+TILT_MIN_DEG = 3.0
+TILT_MAX_DEG = 20.0
+# Merged blocks whose members disagree by more than this are drawn upright —
+# a mixed-tilt union box has no single honest angle.
+TILT_GROUP_SPREAD_DEG = 8.0
+
+# ── OCR block merging ──
+# Two blocks join only when the real gap between them is at most this multiple
+# of one text-line thickness, approximated by min(w, h) over both boxes. Scaling
+# the budget by a box's own width instead would let a short fragment reach far
+# across the page; the union bbox would then span the empty gap and the renderer,
+# which centers text inside the union, would draw the overlay beside the glyphs
+# instead of on them. Being a multiple of line thickness keeps this
+# scale-invariant, so a combined strip behaves like a single page.
+MERGE_GAP_RATIO = 0.8
+STACKED_GROUP_X_OVERLAP = 0.75
+STACKED_GROUP_Y_OVERLAP = 0.20
+
+# Two draw candidates carrying the same string are treated as the same overlay
+# when their boxes overlap by at least this IoU. Kept above 0.5 so a line that
+# genuinely repeats elsewhere on the page, or two stacked bubbles saying the
+# same thing, still get their own overlay.
+DUPLICATE_OVERLAY_IOU = 0.55
+
+
+def _normalize_tilt(angle_deg) -> float:
+    """Fold a raw Lens angle into a modest, readable tilt (degrees)."""
+    try:
+        a = float(angle_deg)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(a):
+        return 0.0
+    a = ((a + 45.0) % 90.0) - 45.0
+    if abs(a) < TILT_MIN_DEG:
+        return 0.0
+    return max(-TILT_MAX_DEG, min(TILT_MAX_DEG, a))
+
+
+def _geometry_angle(geometry) -> float:
+    if isinstance(geometry, dict):
+        return _normalize_tilt(geometry.get("angle_deg", 0.0))
+    return 0.0
+
+
+def _rotated_box_points(bbox: Tuple[int, int, int, int],
+                        angle_deg: float) -> List[Tuple[float, float]]:
+    """Corners of bbox rotated by angle_deg (clockwise) about its own center."""
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    hw = (x2 - x1) / 2.0
+    hh = (y2 - y1) / 2.0
+    rad = math.radians(angle_deg)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+    return [
+        (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+        for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))
+    ]
+
+
 def _geometry_to_bbox(geometry, img_w, img_h):
     if not geometry:
         return None
@@ -845,6 +1134,23 @@ def _geometry_to_bbox(geometry, img_w, img_h):
             return None
     return None
 
+def _bbox_iou(a, b) -> float:
+    """Intersection-over-union of two (x1, y1, x2, y2) boxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix = min(ax2, bx2) - max(ax1, bx1)
+    iy = min(ay2, by2) - max(ay1, by1)
+    if ix <= 0 or iy <= 0:
+        return 0.0
+    inter = ix * iy
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union_area = area_a + area_b - inter
+    if union_area <= 0:
+        return 0.0
+    return inter / union_area
+
+
 def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Merges OCR blocks that are side-by-side on the same line.
 
@@ -852,7 +1158,9 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     vertically in different speech bubbles. This keeps the union bbox
     short so text overlay doesn't stretch downward across bubbles.
 
-    Horizontal merge: aggressive (50% width expansion on each side).
+    Horizontal merge: the real gap between two boxes must be at most
+                      MERGE_GAP_RATIO × one text-line thickness, so a short
+                      fragment can't reach across an inter-bubble gap.
     Vertical merge:   STRICT — actual boxes must overlap ≥30% of the
                       smaller box's height (i.e. truly on the same line).
     """
@@ -860,6 +1168,8 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for b in blocks:
             if "bboxes" not in b:
                 b["bboxes"] = [b["bbox"]]
+            b.setdefault("angle", 0.0)
+            b.setdefault("angles", [b["angle"]] * len(b["bboxes"]))
         return blocks
 
     parent = list(range(len(blocks)))
@@ -881,21 +1191,24 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         w_i = max(1, x2_i - x1_i)
         h_i = max(1, y2_i - y1_i)
 
-        # Horizontal expansion only (for detecting side-by-side text)
-        exp_x1_i = x1_i - w_i * 0.5
-        exp_x2_i = x2_i + w_i * 0.5
-
         for j in range(i + 1, len(blocks)):
             x1_j, y1_j, x2_j, y2_j = blocks[j]["bbox"]
             w_j = max(1, x2_j - x1_j)
             h_j = max(1, y2_j - y1_j)
 
-            exp_x1_j = x1_j - w_j * 0.5
-            exp_x2_j = x2_j + w_j * 0.5
-
-            # --- Must be horizontally close (expanded boxes overlap) ---
-            h_overlap = min(exp_x2_i, exp_x2_j) - max(exp_x1_i, exp_x1_j)
-            if h_overlap <= 0:
+            # --- Must be horizontally close (small real gap between boxes) ---
+            # The gap budget is measured against the thinnest dimension of the
+            # pair, which approximates one text-line thickness for both
+            # horizontal lines (thin in h) and vertical CJK columns (thin in w).
+            # Scaling by a box's own WIDTH instead would let a short fragment
+            # reach halfway across the page: the union bbox then spans the empty
+            # gap, and since the renderer centers text inside the union, the
+            # overlay lands beside the original glyphs rather than on them.
+            # That sideways drift is most visible on combined strips, where
+            # Lens returns many small fragments.
+            gap = max(x1_i, x1_j) - min(x2_i, x2_j)
+            line_scale = min(w_i, h_i, w_j, h_j)
+            if gap > MERGE_GAP_RATIO * line_scale:
                 continue
 
             # --- Must NOT be vertically separated ---
@@ -909,6 +1222,48 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 continue  # Different vertical levels — don't merge
 
             union(i, j)
+
+    # Lens sometimes divides one vertical dialogue run into two internally
+    # merged groups. Their union boxes can overlap strongly even though no
+    # individual fragment cleared the strict 30% first-pass threshold. Merge
+    # only groups that substantially overlap on both axes; separate bubbles
+    # with whitespace between them remain untouched.
+    changed = True
+    while changed:
+        changed = False
+        roots = {}
+        for idx in range(len(blocks)):
+            roots.setdefault(find(idx), []).append(idx)
+
+        group_items = []
+        for root, members in roots.items():
+            gx1 = min(blocks[idx]["bbox"][0] for idx in members)
+            gy1 = min(blocks[idx]["bbox"][1] for idx in members)
+            gx2 = max(blocks[idx]["bbox"][2] for idx in members)
+            gy2 = max(blocks[idx]["bbox"][3] for idx in members)
+            group_items.append((root, (gx1, gy1, gx2, gy2)))
+
+        for left in range(len(group_items)):
+            root_i, box_i = group_items[left]
+            x1_i, y1_i, x2_i, y2_i = box_i
+            w_i = max(1, x2_i - x1_i)
+            h_i = max(1, y2_i - y1_i)
+            for right in range(left + 1, len(group_items)):
+                root_j, box_j = group_items[right]
+                x1_j, y1_j, x2_j, y2_j = box_j
+                w_j = max(1, x2_j - x1_j)
+                h_j = max(1, y2_j - y1_j)
+                x_overlap = min(x2_i, x2_j) - max(x1_i, x1_j)
+                y_overlap = min(y2_i, y2_j) - max(y1_i, y1_j)
+                if x_overlap < STACKED_GROUP_X_OVERLAP * min(w_i, w_j):
+                    continue
+                if y_overlap < STACKED_GROUP_Y_OVERLAP * min(h_i, h_j):
+                    continue
+                union(root_i, root_j)
+                changed = True
+                break
+            if changed:
+                break
 
     # Group blocks by their root parent
     groups = {}
@@ -924,6 +1279,13 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         y2 = max(b["bbox"][3] for b in group)
 
         original_bboxes = [b["bbox"] for b in group]
+        member_angles = [float(b.get("angle", 0.0) or 0.0) for b in group]
+
+        # A union box has one honest angle only if its members agree.
+        if member_angles and (max(member_angles) - min(member_angles)) <= TILT_GROUP_SPREAD_DEG:
+            group_angle = sum(member_angles) / len(member_angles)
+        else:
+            group_angle = 0.0
 
         # Sort texts in manga reading order (right-to-left, top-to-bottom)
         group.sort(key=lambda b: (b["bbox"][0] * -1, b["bbox"][1]))
@@ -934,6 +1296,8 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "text": merged_text,
             "bbox": (x1, y1, x2, y2),
             "bboxes": original_bboxes,
+            "angle": group_angle,
+            "angles": member_angles,
         })
 
     return merged_blocks
@@ -944,9 +1308,13 @@ async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Di
     logging.info(f"[Google Lens] Running OCR on {w}x{h} image (lang={ocr_lang})...")
     lens_lang = lens_lang_code(ocr_lang)
     try:
-        result = await api.process_image(
-            image_path=pil_img, ocr_language=lens_lang, output_format='blocks'
-        )
+        lens_kwargs = {
+            "image_path": pil_img,
+            "output_format": "blocks",
+        }
+        if _norm_lang(ocr_lang) != "auto":
+            lens_kwargs["ocr_language"] = lens_lang
+        result = await api.process_image(**lens_kwargs)
     except Exception as e:
         logging.error(f"[Google Lens] OCR failed: {e}")
         return []
@@ -976,24 +1344,1070 @@ async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Di
                 bbox = _geometry_to_bbox(all_points, w, h)
         if bbox is None:
             continue
-        out.append({"text": text, "bbox": bbox})
-    
+        out.append({"text": text, "bbox": bbox, "angle": _geometry_angle(geometry)})
+
     # Merge close blocks before returning
     merged = _merge_close_blocks(out)
     logging.info(f"[Google Lens] Found {len(out)} raw blocks -> merged to {len(merged)} blocks.")
     return merged
 
-async def get_ocr_results(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Dict[str, Any]]:
-    with _ocr_mode_lock:
-        mode = _ocr_mode
+_HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def _norm_hex_color(val: Any) -> Optional[str]:
+    """Validate a model-reported color into a '#rrggbb' string, else None.
+
+    Accepts '#rrggbb' or 'rrggbb'. Anything else (short hex, names, garbage)
+    degrades to None so the renderer falls back to local color detection.
+    """
+    if not isinstance(val, str):
+        return None
+    m = _HEX_COLOR_RE.match(val.strip())
+    if not m:
+        return None
+    return "#" + m.group(1).lower()
+
+
+def _hex_to_rgb(val: Any) -> Optional[Tuple[int, int, int]]:
+    """Convert a '#rrggbb'/'rrggbb' string to an (R, G, B) tuple, else None."""
+    norm = _norm_hex_color(val)
+    if norm is None:
+        return None
+    h = norm[1:]
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+# OpenAI-compatible endpoint OCR: the image is sent to a vision model that
+# returns the source text regions and the lettering attributes used by the
+# existing inpaint/overlay pipeline.
+OPENAI_ENDPOINT_OCR_PROMPT = (
+    "You are a manga OCR and lettering-analysis engine. Look at the attached"
+    " manga page image and find EVERY text region (speech bubbles, captions,"
+    " narration boxes, and sound effects). For each region output one JSON"
+    " object. Respond with ONLY a JSON array - no prose, no markdown fences.\n"
+    "Each object MUST have these keys:\n"
+    '  "text": the exact original text in the region, transcribed verbatim in'
+    " its original language (do NOT translate).\n"
+    '  "bbox": [x1, y1, x2, y2] pixel coordinates of the region in THIS image,'
+    " top-left origin, integers.\n"
+    '  "angle": rotation of the text baseline in degrees, positive = clockwise,'
+    " 0 for normal horizontal text.\n"
+    '  "color": the main color of the glyphs as "#rrggbb".\n'
+    '  "glow": true if the text has a glow, halo, white outline, or soft light'
+    " behind it, else false.\n"
+    '  "style": exactly one of "regular", "bold", or "italic", based on the'
+    " visible source lettering.\n"
+    '  "weight": stroke heaviness from 0 (normal) to 3 (very heavy/blocky); use'
+    " 0 for regular and italic text that is not bold.\n"
+    '  "font_px": the approximate rendered glyph height in pixels in THIS image.\n'
+    "Transcribe text exactly as printed. Do not merge separate bubbles. Do not"
+    " invent regions that have no text."
+)
+
+
+def _normalize_chat_completions_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip().rstrip("/")
+    if not endpoint:
+        return endpoint
+    if endpoint.endswith("/chat/completions"):
+        return endpoint
+    if endpoint.endswith("/v1"):
+        return endpoint + "/chat/completions"
+    return endpoint + "/v1/chat/completions"
+
+
+async def openai_endpoint_ocr(pil_img: Image.Image, ocr_lang: str = "ja",
+                              max_retries: int = 2) -> List[Dict[str, Any]]:
+    """OCR a page through an OpenAI-compatible vision chat endpoint."""
+    import aiohttp
+    import random
+
+    with _openai_ocr_config_lock:
+        api_key = _openai_ocr_api_key
+        model = _openai_ocr_model
+        endpoint = _openai_ocr_endpoint
+
+    if not endpoint or not model:
+        logging.error("[OpenAI Endpoint OCR] Endpoint and model ID must be configured")
+        return []
+
+    data_uri, scale = _page_image_data_uri_scaled(pil_img)
+    if not data_uri:
+        logging.error("[OpenAI Endpoint OCR] Image encoding failed")
+        return []
+    inv_scale = 1.0 / scale if scale else 1.0
+    img_w, img_h = pil_img.size
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": OPENAI_ENDPOINT_OCR_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": f"Source language hint: {ocr_lang}. Extract all text regions as the requested JSON array."},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ]},
+        ],
+        "max_tokens": 4096,
+        "temperature": 0.1,
+        "top_p": 0.9,
+    }
+
+    logging.info(f"[OpenAI Endpoint OCR] Sending page to {model} at {endpoint}...")
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(endpoint, headers=headers, json=payload) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logging.error(f"[OpenAI Endpoint OCR] API error {response.status}: {error_text[:300]}")
+                        if response.status in (408, 429, 500, 502, 503, 504, 524) and attempt < max_retries:
+                            retry_after = response.headers.get("Retry-After")
+                            try:
+                                wait = float(retry_after) if retry_after else float(attempt)
+                            except (TypeError, ValueError):
+                                wait = float(attempt)
+                            await asyncio.sleep(min(8.0, max(0.5, wait)))
+                            continue
+                        return []
+
+                    data = await response.json()
+                    raw = None
+                    try:
+                        message = data["choices"][0]["message"]
+                        raw = message.get("content")
+                        if isinstance(raw, list):
+                            raw = "".join(
+                                part.get("text", "") for part in raw
+                                if isinstance(part, dict) and part.get("type") in ("text", "output_text")
+                            )
+                    except (IndexError, KeyError, TypeError):
+                        pass
+                    if not raw or not isinstance(raw, str):
+                        logging.warning(f"[OpenAI Endpoint OCR] Empty content on attempt {attempt}")
+                        continue
+
+                    regions = _parse_vision_ocr_json(raw)
+                    if regions is None:
+                        logging.warning(f"[OpenAI Endpoint OCR] Could not parse JSON on attempt {attempt}. Raw: {raw[:300]!r}")
+                        continue
+
+                    out: List[Dict[str, Any]] = []
+                    for reg in regions:
+                        if not isinstance(reg, dict):
+                            continue
+                        text = (reg.get("text") or "").strip()
+                        bbox = reg.get("bbox")
+                        if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                            continue
+                        try:
+                            x1, y1, x2, y2 = (float(v) * inv_scale for v in bbox)
+                        except (TypeError, ValueError):
+                            continue
+                        x1, x2 = sorted((x1, x2))
+                        y1, y2 = sorted((y1, y2))
+                        x1 = max(0, min(img_w - 1, int(round(x1))))
+                        y1 = max(0, min(img_h - 1, int(round(y1))))
+                        x2 = max(0, min(img_w, int(round(x2))))
+                        y2 = max(0, min(img_h, int(round(y2))))
+                        if (x2 - x1) < 4 or (y2 - y1) < 4:
+                            continue
+
+                        item: Dict[str, Any] = {"text": text, "bbox": (x1, y1, x2, y2)}
+                        try:
+                            item["angle"] = float(reg.get("angle", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            item["angle"] = 0.0
+                        color = _norm_hex_color(reg.get("color"))
+                        if color:
+                            item["or_color"] = color
+                        item["or_glow"] = bool(reg.get("glow", False))
+                        style = str(reg.get("style", "regular") or "regular").lower().strip()
+                        item["or_style"] = style if style in ("regular", "bold", "italic") else "regular"
+                        try:
+                            item["or_bold"] = max(0, min(3, int(reg.get("weight", reg.get("bold", 0)) or 0)))
+                        except (TypeError, ValueError):
+                            item["or_bold"] = 0
+                        try:
+                            fp = float(reg.get("font_px", 0) or 0) * inv_scale
+                            if fp > 0:
+                                item["or_font_px"] = int(round(fp))
+                        except (TypeError, ValueError):
+                            pass
+                        out.append(item)
+
+                    logging.info(f"[OpenAI Endpoint OCR] Parsed {len(out)} text regions from {len(regions)} raw objects.")
+                    return out
+        except asyncio.TimeoutError:
+            logging.warning(f"[OpenAI Endpoint OCR] Timeout on attempt {attempt}/{max_retries}.")
+        except Exception as e:
+            logging.error(f"[OpenAI Endpoint OCR] Request failed on attempt {attempt}/{max_retries}: {e}")
+        if attempt < max_retries:
+            await asyncio.sleep(min(4.0, attempt + random.uniform(0.2, 0.8)))
+
+    logging.error(f"[OpenAI Endpoint OCR] FAILED after {max_retries} attempts.")
+    return []
+
+
+GOOGLE_AI_STUDIO_OCR_PROMPT = (
+    "You are a comprehensive manga OCR engine. Find and transcribe EVERY visible"
+    " text region in the image without filtering by purpose, size, location, or"
+    " style. Include dialogue, narration, thought bubbles, titles, chapter text,"
+    " sound effects, signs, labels, credits, watermarks, page numbers, handwritten"
+    " text, and decorative lettering. Return only a JSON array with one object per"
+    " visually distinct text region. Each object must contain the exact source text"
+    " in `text` and a Gemini-native normalized bounding box in `box_2d` using"
+    " `[ymin, xmin, ymax, xmax]`, where every coordinate is an integer from 0 to"
+    " 1000 relative to the full image. Make each box tightly cover its complete text"
+    " region with a small margin. Do not translate, omit, summarize, or merge"
+    " spatially separate regions. Do not include prose or markdown fences. Return []"
+    " only when the image contains no visible text."
+)
+
+
+def _normalize_gemini_model(model: str) -> str:
+    model = model.strip().strip("/")
+    return model[7:] if model.startswith("models/") else model
+
+
+def _gemini_box_to_pixels(box: Any, image_size: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = (float(value) for value in box)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (ymin, xmin, ymax, xmax)):
+        return None
+    ymin, ymax = sorted((max(0.0, min(1000.0, ymin)), max(0.0, min(1000.0, ymax))))
+    xmin, xmax = sorted((max(0.0, min(1000.0, xmin)), max(0.0, min(1000.0, xmax))))
+    image_w, image_h = image_size
+    x1 = max(0, min(image_w - 1, int(round(xmin * image_w / 1000.0))))
+    y1 = max(0, min(image_h - 1, int(round(ymin * image_h / 1000.0))))
+    x2 = max(0, min(image_w, int(round(xmax * image_w / 1000.0))))
+    y2 = max(0, min(image_h, int(round(ymax * image_h / 1000.0))))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    return x1, y1, x2, y2
+
+
+def _gemini_region_to_pixels(region: Any, image_size: Tuple[int, int]) -> Optional[Dict[str, Any]]:
+    if not isinstance(region, dict):
+        return None
+    text = str(
+        region.get("text")
+        or region.get("transcription")
+        or region.get("label")
+        or region.get("content")
+        or ""
+    ).strip()
+    box = (
+        region.get("box_2d")
+        or region.get("box2d")
+        or region.get("bounding_box")
+        or region.get("boundingBox")
+        or region.get("bbox")
+    )
+    pixel_box = _gemini_box_to_pixels(box, image_size)
+    if not text or pixel_box is None:
+        return None
+    return {"text": text, "bbox": pixel_box, "angle": 0.0}
+
+
+async def _wait_for_google_ai_ocr_slot(rpm: int) -> None:
+    global _google_ai_ocr_last_request
+    interval = 60.0 / max(1, rpm)
+    async with _google_ai_ocr_rate_lock:
+        now = time.monotonic()
+        wait = interval - (now - _google_ai_ocr_last_request)
+        if wait > 0:
+            logging.info(f"[Google AI OCR] Waiting {wait:.1f}s for the {rpm} RPM limiter.")
+            await asyncio.sleep(wait)
+        _google_ai_ocr_last_request = time.monotonic()
+
+
+async def google_ai_studio_ocr(pil_img: Image.Image, ocr_lang: str = "ja",
+                               max_retries: int = 2) -> List[Dict[str, Any]]:
+    """Detect all visible manga text regions with Google AI Studio Gemini."""
+    import aiohttp
+
+    with _google_ai_ocr_config_lock:
+        api_key = _google_ai_ocr_api_key
+        model = _normalize_gemini_model(_google_ai_ocr_model)
+        rpm = _google_ai_ocr_rpm
+
+    if not api_key or not model:
+        logging.error("[Google AI OCR] API key and model must be configured")
+        return []
+
+    data_uri = _page_image_data_uri_original(pil_img)
+    if not data_uri or "," not in data_uri:
+        logging.error("[Google AI OCR] Image encoding failed")
+        return []
+    mime_type = data_uri[5:data_uri.index(";")]
+    image_data = data_uri.split(",", 1)[1]
+    img_w, img_h = pil_img.size
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{urllib.parse.quote(model, safe='')}:generateContent"
+    )
+    payload = {
+        "systemInstruction": {"parts": [{"text": GOOGLE_AI_STUDIO_OCR_PROMPT}]},
+        "contents": [{"role": "user", "parts": [
+            {"text": f"Source language hint: {ocr_lang}. Return every visible text region."},
+            {"inlineData": {"mimeType": mime_type, "data": image_data}},
+        ]}],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 2048,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "text": {"type": "STRING"},
+                        "box_2d": {
+                            "type": "ARRAY",
+                            "items": {"type": "INTEGER"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                    },
+                    "required": ["text", "box_2d"],
+                },
+            },
+        },
+    }
+
+    for attempt in range(1, max_retries + 1):
+        await _wait_for_google_ai_ocr_slot(rpm)
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(endpoint, headers=headers, json=payload) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logging.error(f"[Google AI OCR] API error {response.status}: {error_text[:300]}")
+                        if response.status in (408, 429, 500, 502, 503, 504) and attempt < max_retries:
+                            retry_after = response.headers.get("Retry-After")
+                            try:
+                                wait = float(retry_after) if retry_after else 1.0
+                            except (TypeError, ValueError):
+                                wait = 1.0
+                            await asyncio.sleep(min(60.0, max(1.0, wait)))
+                            continue
+                        return []
+
+                    data = await response.json()
+                    raw = ""
+                    try:
+                        parts = data["candidates"][0]["content"]["parts"]
+                        raw = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+                    except (IndexError, KeyError, TypeError):
+                        pass
+                    regions = _parse_vision_ocr_json(raw) if raw else None
+                    if regions is None:
+                        logging.warning(f"[Google AI OCR] Invalid JSON response: {raw[:300]!r}")
+                        if attempt < max_retries:
+                            continue
+                        return []
+
+                    out: List[Dict[str, Any]] = []
+                    rejected = 0
+                    for reg in regions:
+                        item = _gemini_region_to_pixels(reg, (img_w, img_h))
+                        if item is None:
+                            rejected += 1
+                            continue
+                        out.append(item)
+                    if not out and regions:
+                        logging.warning(
+                            f"[Google AI OCR] Rejected all {len(regions)} regions. "
+                            f"Expected text + normalized box_2d; first region: {regions[0]!r}"
+                        )
+                    logging.info(
+                        f"[Google AI OCR] Parsed {len(out)} text regions from {len(regions)} raw regions "
+                        f"({rejected} rejected) with {model}."
+                    )
+                    return out
+        except asyncio.TimeoutError:
+            logging.warning(f"[Google AI OCR] Timeout on attempt {attempt}/{max_retries}.")
+        except Exception as exc:
+            logging.error(f"[Google AI OCR] Request failed on attempt {attempt}/{max_retries}: {exc}")
+    return []
+
+
+def _parse_vision_ocr_json(raw: str) -> Optional[List[Any]]:
+    """Extract a JSON array of OCR region objects from a model response.
+
+    Tolerant of markdown fences and leading/trailing prose: strips ```json
+    fences, then falls back to slicing between the first '[' and last ']'.
+    Returns the parsed list, or None if nothing parseable is found.
+    """
+    s = raw.strip()
+    if s.startswith("```"):
+        lines = s.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return v
+    except Exception:
+        pass
+    start = s.find("[")
+    end = s.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(s[start:end + 1])
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+
+    if start < 0:
+        return None
+
+    # A local model can hit its output limit after emitting several complete
+    # objects but before closing the JSON array. Recover those complete objects
+    # so later pipeline stages still receive every region that was generated.
+    recovered: List[Any] = []
+    decoder = json.JSONDecoder()
+    cursor = max(0, start + 1) if start != -1 else 0
+    while cursor < len(s):
+        object_start = s.find("{", cursor)
+        if object_start < 0:
+            break
+        try:
+            value, object_end = decoder.raw_decode(s, object_start)
+        except json.JSONDecodeError:
+            cursor = object_start + 1
+            continue
+        if isinstance(value, dict):
+            recovered.append(value)
+        cursor = object_end
+    return recovered or None
+
+
+LOCAL_VISION_REVIEW_PROMPT = (
+    "Audit the proposed OCR regions against the image. Return ONLY a corrected JSON "
+    "array using the template-required `text`, pixel `bbox`, and `angle` fields. "
+    "Remove guessed, duplicated, or illegible text. Merge character-by-character "
+    "fragments that are actually one visual text block. Correct every loose or "
+    "oversized box so it tightly surrounds its visible text. Do not invent regions "
+    "or translate text."
+)
+
+
+def _local_vision_inference_size(image_size: Tuple[int, int]) -> Tuple[int, int]:
+    return image_size
+
+
+def _page_image_data_uri_local_vision(pil_img: "Image.Image") -> str:
+    try:
+        img = pil_img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=78, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        logging.info(
+            f"[Local Vision OCR] Encoded full-resolution {img.size[0]}x{img.size[1]} image, "
+            f"{len(b64) // 1024}KB base64"
+        )
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception as exc:
+        logging.warning(f"[Local Vision OCR] Image encoding failed: {exc}")
+        return ""
+
+
+def _selected_vision_model() -> Optional[Dict[str, Any]]:
+    for model in list_local_gguf_models():
+        if (model["repo_id"] == _current_qwen_repo_id
+                and model["filename"] == _current_qwen_filename):
+            return model if model.get("vision_capable") else None
+    return None
+
+
+def _vision_chat_handler(model_name: str, projector_path: str):
+    try:
+        from llama_cpp.llama_chat_format import MTMDChatHandler
+        return MTMDChatHandler(
+            clip_model_path=projector_path,
+            use_gpu=has_cuda(),
+            verbose=False,
+        )
+    except (ImportError, TypeError) as exc:
+        raise RuntimeError(
+            "The installed llama-cpp-python build does not provide the generic "
+            f"multimodal handler required for projector {projector_path}: {exc}"
+        ) from exc
+
+
+def get_local_vision_qwen():
+    global _local_vision_qwen, _local_vision_model_path, _local_vision_projector_path
+    selected = _selected_vision_model()
+    if selected is None:
+        raise RuntimeError(
+            "The selected local GGUF has no compatible mmproj/projector GGUF. "
+            "Install the model and its projector in the same Hugging Face repository/cache."
+        )
+    model_path = pathlib.Path(selected["path"])
+    projector_path = pathlib.Path(selected["projector_path"])
+    with _qwen_model_lock:
+        if (_local_vision_qwen is not None
+                and _local_vision_model_path == model_path
+                and _local_vision_projector_path == projector_path):
+            return _local_vision_qwen
+        handler = _vision_chat_handler(model_path.name, str(projector_path))
+        if LOCAL_VISION_CHAT_TEMPLATE:
+            handler._get_chat_template = lambda _llama: LOCAL_VISION_CHAT_TEMPLATE
+            logging.info("[Local Vision OCR] Using jinja.txt as the multimodal chat template.")
+        _local_vision_qwen = Llama(
+            model_path=str(model_path),
+            chat_handler=handler,
+            n_ctx=2048,
+            n_batch=1024,
+            n_ubatch=512,
+            n_threads=max(4, os.cpu_count() or 4),
+            n_threads_batch=max(4, os.cpu_count() or 4),
+            n_gpu_layers=get_llm_gpu_layers(),
+            flash_attn=has_cuda(),
+            offload_kqv=has_cuda(),
+            verbose=False,
+        )
+        _local_vision_model_path = model_path
+        _local_vision_projector_path = projector_path
+        logging.info(f"[Local Vision OCR] Loaded {model_path.name} with {projector_path.name}")
+        return _local_vision_qwen
+
+
+def _local_vision_box_to_pixels(
+    box: Any,
+    image_size: Tuple[int, int],
+    *,
+    normalized_yx: bool = False,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Convert common vision-model box formats to pixel XYXY coordinates."""
+    if isinstance(box, dict):
+        key_sets = (
+            ("x1", "y1", "x2", "y2"),
+            ("xmin", "ymin", "xmax", "ymax"),
+            ("left", "top", "right", "bottom"),
+        )
+        values = None
+        for keys in key_sets:
+            if all(key in box for key in keys):
+                values = [box[key] for key in keys]
+                break
+        if values is None:
+            return None
+    elif isinstance(box, (list, tuple)) and len(box) == 4:
+        values = list(box)
+    else:
+        return None
+
+    try:
+        coords = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in coords):
+        return None
+
+    image_w, image_h = image_size
+    if normalized_yx:
+        y1, x1, y2, x2 = coords
+        scale = 1000.0 if max(abs(value) for value in coords) > 1.0 else 1.0
+        x1, x2 = x1 * image_w / scale, x2 * image_w / scale
+        y1, y2 = y1 * image_h / scale, y2 * image_h / scale
+    else:
+        x1, y1, x2, y2 = coords
+        max_abs = max(abs(value) for value in coords)
+        if max_abs <= 1.0:
+            x1, x2 = x1 * image_w, x2 * image_w
+            y1, y2 = y1 * image_h, y2 * image_h
+
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    x1 = max(0, min(image_w - 1, int(round(x1))))
+    y1 = max(0, min(image_h - 1, int(round(y1))))
+    x2 = max(0, min(image_w, int(round(x2))))
+    y2 = max(0, min(image_h, int(round(y2))))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    return x1, y1, x2, y2
+
+
+def _normalize_local_vision_regions(
+    regions: List[Any],
+    image_size: Tuple[int, int],
+    detected_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    used_region_ids = set()
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        text = str(
+            region.get("text")
+            or region.get("transcription")
+            or region.get("content")
+            or region.get("label")
+            or ""
+        ).strip()
+        if not text:
+            continue
+
+        bbox = None
+        if detected_boxes:
+            try:
+                region_id = int(region.get("region_id", region.get("id", region.get("region", 0))))
+            except (TypeError, ValueError):
+                region_id = 0
+            if 1 <= region_id <= len(detected_boxes) and region_id not in used_region_ids:
+                bbox = detected_boxes[region_id - 1]
+                used_region_ids.add(region_id)
+
+        if bbox is None:
+            box_key = next(
+                (key for key in ("bbox", "bounding_box", "boundingBox", "box", "box_2d", "box2d")
+                 if region.get(key) is not None),
+                None,
+            )
+            if box_key is None:
+                continue
+            bbox = _local_vision_box_to_pixels(
+                region[box_key], image_size, normalized_yx=box_key in {"box_2d", "box2d"}
+            )
+        if bbox is None:
+            continue
+
+        item: Dict[str, Any] = {"text": text, "bbox": bbox}
+        try:
+            item["angle"] = float(region.get("angle", region.get("rotation", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            item["angle"] = 0.0
+        color = _norm_hex_color(region.get("color") or region.get("text_color"))
+        if color:
+            item["or_color"] = color
+        item["or_glow"] = bool(region.get("glow", region.get("halo", False)))
+        style = str(region.get("style", "regular") or "regular").lower().strip()
+        item["or_style"] = style if style in {"regular", "bold", "italic"} else "regular"
+        try:
+            item["or_bold"] = max(
+                0, min(3, int(region.get("weight", region.get("bold", 0)) or 0))
+            )
+        except (TypeError, ValueError):
+            item["or_bold"] = 0
+        try:
+            font_px = float(region.get("font_px", region.get("font_size", 0)) or 0)
+            if font_px > 0:
+                item["or_font_px"] = int(round(font_px))
+        except (TypeError, ValueError):
+            pass
+        out.append(item)
+    return out
+
+
+def _repair_local_vision_text(text: str) -> str:
+    suspicious = sum(text.count(marker) for marker in ("π", "µ", "Φ", "Θ", "Σ", "τ", "σ"))
+    if suspicious < 2:
+        return text
+    try:
+        repaired = text.encode("cp437").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    original_japanese = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", text))
+    repaired_japanese = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", repaired))
+    return repaired if repaired_japanese > original_japanese else text
+
+
+def _repair_local_vision_regions(regions: List[Any]) -> List[Any]:
+    repaired_regions: List[Any] = []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        updated = dict(region)
+        for key in ("text", "transcription", "content", "label"):
+            value = updated.get(key)
+            if isinstance(value, str):
+                updated[key] = _repair_local_vision_text(value)
+                break
+        repaired_regions.append(updated)
+    return repaired_regions
+
+
+def _scale_local_vision_regions(
+    regions: List[Any],
+    source_size: Tuple[int, int],
+    target_size: Tuple[int, int],
+) -> List[Any]:
+    source_w, source_h = source_size
+    target_w, target_h = target_size
+    if source_size == target_size:
+        return regions
+    scaled: List[Any] = []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        box_key = next(
+            (key for key in ("bbox", "bounding_box", "boundingBox", "box") if region.get(key) is not None),
+            None,
+        )
+        if box_key is None:
+            scaled.append(region)
+            continue
+        box = region[box_key]
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            scaled.append(region)
+            continue
+        try:
+            x1, y1, x2, y2 = (float(value) for value in box)
+        except (TypeError, ValueError):
+            scaled.append(region)
+            continue
+        updated = dict(region)
+        updated[box_key] = [
+            int(round(x1 * target_w / source_w)),
+            int(round(y1 * target_h / source_h)),
+            int(round(x2 * target_w / source_w)),
+            int(round(y2 * target_h / source_h)),
+        ]
+        scaled.append(updated)
+    return scaled
+
+
+def _local_vision_regions_need_review(regions: List[Any], image_size: Tuple[int, int]) -> bool:
+    image_w, image_h = image_size
+    short_texts: Dict[str, int] = {}
+    boxes: List[Tuple[int, int, int, int]] = []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        text = str(region.get("text") or region.get("transcription") or region.get("content") or "").strip()
+        box_key = next(
+            (key for key in ("bbox", "bounding_box", "boundingBox", "box", "box_2d", "box2d")
+             if region.get(key) is not None),
+            None,
+        )
+        if not text or box_key is None:
+            continue
+        bbox = _local_vision_box_to_pixels(
+            region[box_key], image_size, normalized_yx=box_key in {"box_2d", "box2d"}
+        )
+        if bbox is None:
+            continue
+        boxes.append(bbox)
+        if len(text.replace(" ", "")) <= 2:
+            short_texts[text] = short_texts.get(text, 0) + 1
+        x1, y1, x2, y2 = bbox
+        if len(text.replace(" ", "")) <= 8 and (x2 - x1) * (y2 - y1) > image_w * image_h * 0.18:
+            return True
+    if any(count >= 3 for count in short_texts.values()):
+        return True
+    for index, first in enumerate(boxes):
+        ax1, ay1, ax2, ay2 = first
+        area = max(1, (ax2 - ax1) * (ay2 - ay1))
+        for second in boxes[index + 1:]:
+            bx1, by1, bx2, by2 = second
+            intersection = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
+            other_area = max(1, (bx2 - bx1) * (by2 - by1))
+            if intersection / min(area, other_area) >= 0.75:
+                return True
+    return False
+
+
+def _dedupe_local_vision_regions(regions: List[Any], image_size: Tuple[int, int]) -> List[Any]:
+    candidates: List[Tuple[Any, str, Tuple[int, int, int, int]]] = []
+    image_w, image_h = image_size
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        text = str(region.get("text") or region.get("transcription") or region.get("content") or "").strip()
+        box_key = next(
+            (key for key in ("bbox", "bounding_box", "boundingBox", "box", "box_2d", "box2d")
+             if region.get(key) is not None),
+            None,
+        )
+        if not text or box_key is None:
+            continue
+        bbox = _local_vision_box_to_pixels(
+            region[box_key], image_size, normalized_yx=box_key in {"box_2d", "box2d"}
+        )
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        if len(text.replace(" ", "")) <= 8 and (x2 - x1) * (y2 - y1) > image_w * image_h * 0.18:
+            continue
+        candidates.append((region, text, bbox))
+
+    fragmented = set()
+    for index, (_, text, bbox) in enumerate(candidates):
+        if len(text.replace(" ", "")) > 2:
+            continue
+        cluster = {index}
+        changed = True
+        while changed:
+            changed = False
+            for other_index, (_, other_text, other_box) in enumerate(candidates):
+                if other_index in cluster or other_text != text:
+                    continue
+                for member_index in cluster:
+                    member_box = candidates[member_index][2]
+                    mx1, my1, mx2, my2 = member_box
+                    ox1, oy1, ox2, oy2 = other_box
+                    horizontal_gap = max(0, max(mx1, ox1) - min(mx2, ox2))
+                    vertical_gap = max(0, max(my1, oy1) - min(my2, oy2))
+                    aligned = horizontal_gap <= max(mx2 - mx1, ox2 - ox1) and vertical_gap <= max(my2 - my1, oy2 - oy1)
+                    if aligned:
+                        cluster.add(other_index)
+                        changed = True
+                        break
+        if len(cluster) >= 3:
+            fragmented.update(cluster)
+
+    kept: List[Any] = []
+    kept_boxes: List[Tuple[str, Tuple[int, int, int, int]]] = []
+    for index, (region, text, bbox) in enumerate(candidates):
+        if index in fragmented:
+            continue
+        x1, y1, x2, y2 = bbox
+        area = max(1, (x2 - x1) * (y2 - y1))
+        duplicate = False
+        for prior_text, prior_box in kept_boxes:
+            if prior_text != text:
+                continue
+            px1, py1, px2, py2 = prior_box
+            overlap = max(0, min(x2, px2) - max(x1, px1)) * max(0, min(y2, py2) - max(y1, py1))
+            if overlap / min(area, max(1, (px2 - px1) * (py2 - py1))) >= 0.75:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(region)
+            kept_boxes.append((text, bbox))
+    return kept
+
+
+def _complete_local_vision_ocr(llm: Any, messages: List[Dict[str, Any]]) -> str:
+    response = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=512,
+        temperature=0,
+        top_p=1.0,
+        stop=["<|im_end|>", "</s>"],
+        stream=True,
+    )
+    if isinstance(response, dict):
+        return str(response.get("choices", [{}])[0].get("message", {}).get("content", ""))
+
+    output = ""
+    scan_offset = 0
+    array_started = False
+    array_depth = 0
+    in_string = False
+    escaped = False
+    for chunk in response:
+        try:
+            delta = chunk["choices"][0].get("delta", {}).get("content", "")
+        except (KeyError, IndexError, TypeError):
+            delta = ""
+        if not delta:
+            continue
+        output += str(delta)
+        complete_array = False
+        for char in output[scan_offset:]:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "[":
+                array_started = True
+                array_depth += 1
+            elif char == "]" and array_started:
+                array_depth -= 1
+                if array_depth == 0:
+                    complete_array = True
+                    break
+        scan_offset = len(output)
+        if complete_array:
+            parsed = _parse_vision_ocr_json(output)
+            if parsed is not None:
+                logging.info(
+                    f"[Local Vision OCR] Stopped generation after the first complete "
+                    f"JSON array ({len(parsed)} raw regions)."
+                )
+                break
+    return output
+
+
+def local_vision_ocr(pil_img: Image.Image, ocr_lang: str = "auto") -> List[Dict[str, Any]]:
+    started = time.perf_counter()
+    data_uri = _page_image_data_uri_local_vision(pil_img)
+    if not data_uri:
+        return []
+    llm = get_local_vision_qwen()
+    inference_started = time.perf_counter()
+    raw = _complete_local_vision_ocr(
+        llm,
+        [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": [
+                {"type": "text", "text": f"Source language hint: {ocr_lang}. OCR the complete page."},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ]},
+        ],
+    )
+    regions = _parse_vision_ocr_json(str(raw))
+    if regions is None:
+        logging.error(f"[Local Vision OCR] Could not parse response: {str(raw)[:300]!r}")
+        return []
+    inference_size = _local_vision_inference_size(pil_img.size)
+    regions = _repair_local_vision_regions(regions)
+    regions = _scale_local_vision_regions(regions, inference_size, pil_img.size)
+    before_dedupe = len(regions)
+    regions = _dedupe_local_vision_regions(regions, pil_img.size)
+    if len(regions) != before_dedupe:
+        logging.warning(
+            f"[Local Vision OCR] Removed {before_dedupe - len(regions)} duplicate AI regions."
+        )
+    normalized = _normalize_local_vision_regions(regions, pil_img.size)
+    rejected = len(regions) - len(normalized)
+    if not normalized and regions:
+        logging.error(
+            f"[Local Vision OCR] Rejected all {len(regions)} OCR regions; "
+            f"first raw region={regions[0]!r}"
+        )
+    logging.info(
+        f"[Local Vision OCR] Normalized {len(normalized)}/{len(regions)} regions "
+        f"for image {pil_img.width}x{pil_img.height} ({rejected} rejected); "
+        f"inference={time.perf_counter() - inference_started:.1f}s, "
+        f"total={time.perf_counter() - started:.1f}s."
+    )
+    return normalized
+
+
+async def get_ocr_results(pil_img: Image.Image, ocr_lang: str = "ja",
+                          mode_override: Optional[str] = None) -> List[Dict[str, Any]]:
+    if mode_override is None:
+        with _ocr_mode_lock:
+            mode = _ocr_mode
+    else:
+        mode = mode_override
     if mode == "lens":
         return await google_lens_ocr(pil_img, ocr_lang)
+    elif mode == "google_ai":
+        return await google_ai_studio_ocr(pil_img, ocr_lang)
+    elif mode == "openai_endpoint":
+        return await openai_endpoint_ocr(pil_img, ocr_lang)
+    elif mode == "local_vision":
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_OCR_BOX_EXECUTOR, local_vision_ocr, pil_img, ocr_lang)
     elif mode == "glm" or ocr_lang == "ko":
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_OCR_BOX_EXECUTOR, glm_ocr_korean, pil_img)
     else:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_OCR_BOX_EXECUTOR, hayai_ocr_with_yolo, pil_img)
+
+# ===========================================================================
+# SFX Classifier
+# ===========================================================================
+# Conservative multi-signal heuristic. A region is classified as SFX only when
+# at least 2 independent signals agree. This avoids false positives on big
+# narration boxes while catching merged SFX+dialogue regions that Google Lens
+# tends to produce.
+#
+# Signals:
+#   1. Low character density — few chars in a large region.
+#   2. Short text in a large region (≤8 non-space chars + region > 5% of image).
+#   3. Near-square or wide aspect ratio at large absolute size.
+#   4. Repeated kana / onomatopoeia pattern (e.g. ドドド, ゴゴゴゴ, ドゴォ).
+#
+# Returns (is_sfx: bool, score: int, reasons: List[str]).
+# A region is SFX iff score >= 2.
+def detect_sfx(
+    pil_img: Image.Image,
+    bbox: Tuple[int, int, int, int],
+    text: str,
+) -> Tuple[bool, int, List[str]]:
+    x1, y1, x2, y2 = bbox
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    box_area = box_w * box_h
+    img_w, img_h = pil_img.size
+    img_area = max(1, img_w * img_h)
+
+    cleaned = (text or "").strip()
+    # Strip whitespace for character counting.
+    nonspace = re.sub(r"\s+", "", cleaned)
+    n_chars = len(nonspace)
+
+    reasons: List[str] = []
+    score = 0
+
+    if not nonspace:
+        return False, 0, reasons
+
+    region_fraction = box_area / img_area
+
+    # Signal 1: Low character density.
+    # Density = chars per 1000 px² of the region. SFX typically have very few
+    # characters filling a large area. Threshold: < 1 char per 4000 px².
+    if n_chars > 0:
+        chars_per_kpx = n_chars / (box_area / 1000.0)
+        if chars_per_kpx < 0.25:  # < 1 char per 4000 px²
+            score += 1
+            reasons.append(f"low char density ({chars_per_kpx:.3f}/kpx)")
+
+    # Signal 2: Short text in a large region.
+    # ≤8 non-space chars AND region occupies > 5% of the image.
+    if n_chars <= 8 and region_fraction > 0.05:
+        score += 1
+        reasons.append(f"short text ({n_chars} chars) in large region ({region_fraction*100:.1f}% of image)")
+
+    # Signal 3: Near-square or wide aspect ratio at large absolute size.
+    # SFX art is often large and roughly square or wide. Avoid flagging small
+    # dialogue bubbles: require the region to be at least 8% of the image AND
+    # the longer side at least 25% of the corresponding image dimension.
+    aspect = box_w / box_h
+    large_absolute = (region_fraction > 0.08 and
+                      (box_w >= 0.25 * img_w or box_h >= 0.25 * img_h))
+    square_or_wide = 0.6 <= aspect <= 4.0
+    if large_absolute and square_or_wide:
+        score += 1
+        reasons.append(f"large {aspect:.2f}:1 region ({region_fraction*100:.1f}% of image)")
+
+    # Signal 4: Repeated kana / onomatopoeia pattern.
+    # Detects runs of 3+ identical CJK kana, possibly ending in a small vowel
+    # modifier (ドドド, ゴゴゴゴ, ドゴォ). Hiragana and katakana ranges:
+    #   ひらがな U+3040-U+309F, カタカナ U+30A0-U+30FF, CJK ext U+3400-U+4DBF.
+    kana = re.sub(r"[^\u3040-\u30ff\u3400-\u4dbf]", "", nonspace)
+    if len(kana) >= 3:
+        # 3+ identical chars in a row
+        if re.search(r"(.)\1{2,}", kana):
+            score += 1
+            reasons.append("repeated kana / onomatopoeia pattern")
+
+    is_sfx = score >= 2
+    return is_sfx, score, reasons
 
 # ===========================================================================
 # Qwen GGUF translator
@@ -1089,16 +2503,301 @@ SYSTEM_PROMPT = (
     "{script_hint}"
 )
 
+# Always appended to every translation system prompt (both backends, both
+# low and high mode). Honorifics are read straight from the OCR source text and
+# carried into the output by the model — there is no name-map or post-process
+# reinsertion. Kept short to limit token cost (~50 input tokens).
+HONORIFIC_CLAUSE = (
+    " If a name in the source text has an honorific suffix or title, romanize it"
+    " and attach it to the translated name with a hyphen — do NOT translate it"
+    " into an English word and do NOT drop it. Japanese: -kun, -chan, -san,"
+    " -sama, -senpai, -sensei, -dono, -shi. Korean: -ssi, -nim, -ya/-a, -hyung,"
+    " -noona, -oppa, -unnie, -sunbae. Chinese: -ge, -jie, -shixiong, -shijie."
+    " Examples: ユミさま → Yumi-sama, ヤンさま → Yang-sama, タナカさん → Tanaka-san,"
+    " ジャックくん → Jack-kun. So '世界が落ちた、ユミさま' → 'The world fell, Yumi-sama'."
+)
+
+# Appended to the system prompt only when context-aware mode is on.
+# Keeps the extra-token cost small (~30 input tokens per request).
+# Honorific handling lives in HONORIFIC_CLAUSE (always on); this clause only
+# covers name consistency and pronoun characterization.
+CONTEXT_AWARE_CLAUSE = (
+    " PRESERVE character names from the source text, keeping each character's"
+    " name spelled the same way everywhere. Keep gendered pronouns consistent"
+    " with the source characterization."
+)
+
+# Appended on top of CONTEXT_AWARE_CLAUSE when context level is "high".
+# Style detection rides along inside the SAME translate call — no extra
+# round-trip. The model reports how the ORIGINAL lettering looked (weight,
+# slant, glow) so the overlay can match it, and _split_style_tag() strips the
+# tag back off before the text reaches the renderer.
+#
+# Style is read off the artwork, so this clause is only ever used together with
+# an attached page image (OpenRouter high mode). There is no text-only variant:
+# you cannot see how thick a glyph was from a transcription.
+STYLE_AWARE_VISION_CLAUSE = (
+    " The manga page image is attached. Match each numbered line to the speech"
+    " bubble or caption it came from, then look at how that ORIGINAL lettering"
+    " was drawn and append a style tag in the exact form [B2], [I1], [R2] or"
+    " [B3G]. The letter is the lettering style: B = bold/heavy/thick strokes"
+    " (shouting, emphasis), I = italic/slanted/brush-swept lettering, R ="
+    " regular upright lettering with normal weight. The digit is how heavy the"
+    " strokes were, from 1 (light/thin) to 3 (very heavy/blocky) — judge it"
+    " against the other lettering on the same page, not in the absolute. Append"
+    " the letter G after the digit ONLY if the original text had a glow, halo,"
+    " white outline, or soft light behind the glyphs. Example:"
+    " '1. Get away from me! [B3G]' for heavy glowing lettering, '2. ...I see."
+    " [R1]' for thin plain lettering. Always output exactly one tag per line, at"
+    " the very end of the line. Judge style from the ARTWORK, not from the"
+    " wording. Translate ONLY the lines in the numbered list — never transcribe"
+    " extra text you can see in the image, and never add lines."
+)
+
+# Max edge length for the page image sent in high mode. Full-resolution manga
+# scans are ~2000px tall and cost far more image tokens than the extra accuracy
+# is worth; expressions and bubble outlines stay readable at this size.
+STYLE_VISION_MAX_EDGE = 1024
+
+
+def _page_image_data_uri(pil_img: "Image.Image") -> str:
+    """Downscale + JPEG-encode a page image into a data URI for OpenRouter.
+
+    Returns "" on any failure so the caller can silently fall back to the
+    text-only path rather than losing the whole translation batch.
+    """
+    try:
+        img = pil_img.convert("RGB")
+        w, h = img.size
+        longest = max(w, h)
+        if longest > STYLE_VISION_MAX_EDGE:
+            scale = STYLE_VISION_MAX_EDGE / float(longest)
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                             Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        logging.info(f"[StyleVision] Page image encoded: {img.size[0]}x{img.size[1]}, "
+                     f"{len(b64) // 1024}KB base64")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception as e:
+        logging.warning(f"[StyleVision] Could not encode page image: {e}")
+        return ""
+
+
+def _page_image_data_uri_original(pil_img: "Image.Image") -> str:
+    """JPEG-encode a page at its original pixel dimensions for vision OCR."""
+    try:
+        img = pil_img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        logging.info(
+            f"[Google AI OCR] Original-resolution image encoded: "
+            f"{img.size[0]}x{img.size[1]}, {len(b64) // 1024}KB base64"
+        )
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception as e:
+        logging.warning(f"[Google AI OCR] Could not encode original-resolution image: {e}")
+        return ""
+
+
+def _page_image_data_uri_scaled(pil_img: "Image.Image") -> Tuple[str, float]:
+    """Like _page_image_data_uri but also returns the downscale factor.
+
+    scale is (encoded edge / original edge): coordinates the model reports in
+    the encoded image are multiplied by 1/scale to map back to full-res. On
+    failure returns ("", 1.0).
+    """
+    try:
+        img = pil_img.convert("RGB")
+        w, h = img.size
+        longest = max(w, h)
+        scale = 1.0
+        if longest > STYLE_VISION_MAX_EDGE:
+            scale = STYLE_VISION_MAX_EDGE / float(longest)
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                             Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        logging.info(f"[Vision OCR] Page image encoded: {img.size[0]}x{img.size[1]}, "
+                     f"scale={scale:.4f}, {len(b64) // 1024}KB base64")
+        return f"data:image/jpeg;base64,{b64}", scale
+    except Exception as e:
+        logging.warning(f"[Vision OCR] Could not encode page image: {e}")
+        return "", 1.0
+
+
+# Letter code → lettering-style bucket used for per-style font selection.
+_STYLE_CODES = {"b": "bold", "i": "italic", "r": "regular"}
+
+# Trailing style tag, e.g. "[B2]" / "[B3G]" / "( i 1 )" — tolerant of sloppy
+# model output. Group 1 = style letter, 2 = stroke weight 1-3, 3 = glow flag.
+_STYLE_TAG_RE = re.compile(
+    r"[\[\(\{]\s*([BIRbir])\s*([1-3])?\s*([Gg])?\s*[\]\)\}]\s*$"
+)
+
+STYLE_FONT_KEYS = ("bold", "italic", "regular")
+
+
+def _parse_style_fonts(raw: str) -> Dict[str, str]:
+    """Parse the style_fonts FormData JSON into a {bold, italic, regular} map.
+
+    Always returns all three keys. Anything unparseable degrades to empty
+    strings, which the renderer treats as "use the configured main font".
+    """
+    fonts = {k: "" for k in STYLE_FONT_KEYS}
+    if not raw:
+        return fonts
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logging.warning(f"[Style] Could not parse style_fonts payload: {raw[:120]!r}")
+        return fonts
+    if not isinstance(data, dict):
+        return fonts
+    for key in STYLE_FONT_KEYS:
+        val = data.get(key)
+        if isinstance(val, str):
+            fonts[key] = os.path.basename(val.strip())
+    return fonts
+
+
+def _split_style_tag(line: str) -> Tuple[str, Optional[str], int, bool]:
+    """Strip a trailing lettering-style tag off a translated line.
+
+    Returns (clean_text, style_or_None, weight, glow). Lines without a tag come
+    back untouched with style=None so non-style jobs are unaffected.
+    """
+    if not line:
+        return line, None, 0, False
+    match = _STYLE_TAG_RE.search(line)
+    if not match:
+        return line, None, 0, False
+    style = _STYLE_CODES.get(match.group(1).lower())
+    weight = int(match.group(2)) if match.group(2) else 2
+    glow = bool(match.group(3))
+    return line[:match.start()].strip(), style, weight, glow
+
+def _extract_name_candidates(texts: List[str], max_n: int = 30) -> List[str]:
+    """Cheap candidate extraction for the two-pass name dictionary.
+    Returns short recurring CJK runs that look like proper nouns."""
+    cand_re = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]{1,6}")
+    counts: Dict[str, int] = {}
+    for t in texts:
+        for m in cand_re.findall(t or ""):
+            counts[m] = counts.get(m, 0) + 1
+    return sorted([c for c, n in counts.items() if n >= 2 or 2 <= len(c) <= 4])[:max_n]
+
+
+def _parse_name_map_response(raw: str, candidates: List[str]) -> Dict[str, str]:
+    """Parse the LLM's 'N. romanized' lines into a {source: romanized} dict."""
+    name_map: Dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        m = re.match(r"^\s*(\d+)\s*[.):\-\]]\s*(.+)$", line)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        romanized = m.group(2).strip()
+        if 0 <= idx < len(candidates) and romanized:
+            name_map[candidates[idx]] = romanized
+    return name_map
+
+
+def _build_name_map_llm(texts: List[str], src_lang_name: str, lang_name: str, llm) -> Dict[str, str]:
+    """Two-pass step 1 (local GGUF): ask the LLM for a name dictionary.
+    Returns {} if no candidates or the call fails. One extra LLM call per job."""
+    if not llm or not texts:
+        return {}
+    candidates = _extract_name_candidates(texts)
+    if not candidates:
+        return {}
+    list_text = "\n".join(f"{i+1}. {c}" for i, c in enumerate(candidates))
+    user_prompt = (
+        f"You are a manga name dictionary builder. For each numbered {src_lang_name} name, "
+        f"output the romanized {lang_name} form with any attached honorific suffix preserved "
+        f"(e.g. ジャックくん → Jack-kun). Output one line per name as 'N. romanized'. "
+        f"No explanations.\n\n{list_text}"
+    )
+    try:
+        with _llm_lock:
+            out = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": f"You build name dictionaries from {src_lang_name} into {lang_name}."},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=max(128, len(candidates) * 16),
+                temperature=0.0,
+                stop=["<|im_end|>", "</s>"],
+            )
+        raw = out["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.warning(f"[ContextAware] name-map LLM call failed: {e}")
+        return {}
+    name_map = _parse_name_map_response(raw, candidates)
+    logging.info(f"[ContextAware] Name map ({len(name_map)} entries): {name_map}")
+    return name_map
+
+
+async def _build_name_map_openrouter(texts: List[str], src_lang_name: str, lang_name: str,
+                                      api_key: str, model: str) -> Dict[str, str]:
+    """Two-pass step 1 (OpenRouter): one extra HTTP call per job for the name dictionary."""
+    import aiohttp
+    if not texts or not api_key:
+        return {}
+    candidates = _extract_name_candidates(texts)
+    if not candidates:
+        return {}
+    list_text = "\n".join(f"{i+1}. {c}" for i, c in enumerate(candidates))
+    user_prompt = (
+        f"You are a manga name dictionary builder. For each numbered {src_lang_name} name, "
+        f"output the romanized {lang_name} form with any attached honorific suffix preserved "
+        f"(e.g. ジャックくん → Jack-kun). Output one line per name as 'N. romanized'. "
+        f"No explanations.\n\n{list_text}"
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000",
+        "X-Title": "Manga Translation API",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": f"You build name dictionaries from {src_lang_name} into {lang_name}."},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max(128, len(candidates) * 16),
+        "temperature": 0.0,
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers, json=payload,
+            ) as resp:
+                data = await resp.json()
+        raw = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.warning(f"[ContextAware] name-map OpenRouter call failed: {e}")
+        return {}
+    name_map = _parse_name_map_response(raw, candidates)
+    logging.info(f"[ContextAware] Name map ({len(name_map)} entries): {name_map}")
+    return name_map
+
+
 def _count_script(trans: str) -> Dict[str, int]:
     """Count how many characters belong to each writing system."""
     counts = {"cjk": 0, "hangul": 0, "cyrillic": 0, "arabic": 0,
               "hebrew": 0, "thai": 0, "devanagari": 0, "greek": 0, "latin": 0}
     for c in trans:
         cp = ord(c)
-        if (0x3000 <= cp <= 0x2FFF + 0x1000) and not (0xAC00 <= cp <= 0xD7AF):
-            # Hiragana/Katakana/CJK ideographs/fullwidth (excluding hangul range)
-            if (0x3040 <= cp <= 0x30FF) or (0x3400 <= cp <= 0x9FFF) or (0xF900 <= cp <= 0xFAFF) or (0xFF00 <= cp <= 0xFFEF):
-                counts["cjk"] += 1
+        if ((0x3040 <= cp <= 0x30FF)
+                or (0x3400 <= cp <= 0x9FFF)
+                or (0xF900 <= cp <= 0xFAFF)
+                or (0xFF00 <= cp <= 0xFFEF)):
+            counts["cjk"] += 1
         elif 0xAC00 <= cp <= 0xD7AF:
             counts["hangul"] += 1
         elif (0x0400 <= cp <= 0x04FF) or (0x0500 <= cp <= 0x052F):
@@ -1137,11 +2836,11 @@ def _looks_like_target(trans: str, target_lang: str) -> bool:
     if target_script == "hangul" and counts["hangul"] == 0:
         return False
 
-    # For non-CJK targets, reject output that is mostly CJK/Hangul — the model
-    # almost certainly echoed an untranslated CJK source instead of translating.
+    # For non-CJK targets, reject any CJK/Hangul character. Even a short
+    # untranslated fragment can render as missing-glyph boxes in a Latin font.
     if target_script not in ("cjk", "hangul"):
         cjk_like = counts["cjk"] + counts["hangul"]
-        if cjk_like > max(2, len(trans) * 0.3):
+        if cjk_like > 0:
             return False
 
     # Script-specific targets should show at least some of that script when the
@@ -1153,6 +2852,99 @@ def _looks_like_target(trans: str, target_lang: str) -> bool:
             return False
 
     return True
+
+def _normalize_for_echo(s: str) -> str:
+    """Normalize case, spacing, and punctuation for source-echo detection."""
+    return "".join(ch.casefold() for ch in (s or "") if ch.isalnum())
+
+def _is_echo(source: str, output: str) -> bool:
+    """True when the model handed back the source instead of translating it."""
+    src = _normalize_for_echo(source)
+    out = _normalize_for_echo(output)
+    if not src or not out:
+        return False
+    if out == src:
+        return True
+    return src in out and len(out) <= max(len(src) + 4, int(len(src) * 1.25))
+
+
+def _translation_fragments(source: str, candidate: str) -> List[str]:
+    raw = (candidate or "").strip()
+    if not raw:
+        return []
+
+    fragments = [raw]
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fragments.append(line)
+        without_number = re.sub(r"^\s*[\[\(]?\d+[\]\)]?[\.\)\-:]\s*", "", line)
+        fragments.append(without_number)
+        without_label = re.sub(
+            r"^\s*(?:translation|translated|output|answer)\s*:\s*",
+            "",
+            without_number,
+            flags=re.IGNORECASE,
+        )
+        fragments.append(without_label)
+        for separator in ("->", "=>", "→", "⇒"):
+            if separator in without_label:
+                fragments.append(without_label.rsplit(separator, 1)[-1].strip())
+
+    source_clean = clean_text_for_font(source or "")
+    if source_clean:
+        for fragment in list(fragments):
+            cleaned_fragment = clean_text_for_font(fragment)
+            if source_clean in cleaned_fragment:
+                fragments.append(cleaned_fragment.replace(source_clean, " ").strip(" :-=→⇒"))
+
+    unique = []
+    seen = set()
+    for fragment in fragments:
+        cleaned = clean_text_for_font(fragment)
+        key = _normalize_for_echo(cleaned)
+        if cleaned and key and key not in seen:
+            seen.add(key)
+            unique.append(cleaned)
+    return unique
+
+
+def _validated_translation(source: str, candidate: str, target_lang: str) -> str:
+    """Return only drawable target-language text; fail closed on source echoes."""
+    valid = [
+        fragment for fragment in _translation_fragments(source, candidate)
+        if _looks_like_target(fragment, target_lang) and not _is_echo(source, fragment)
+    ]
+    if not valid:
+        return ""
+
+    source_norm = _normalize_for_echo(source)
+    valid.sort(
+        key=lambda fragment: (
+            source_norm in _normalize_for_echo(fragment),
+            bool(re.match(r"^\s*[\[\(]?\d+[\]\)]?[\.\)\-:]", fragment)),
+            bool(re.match(r"^\s*(?:translation|translated|output|answer)\s*:", fragment, re.IGNORECASE)),
+            -len(fragment),
+        )
+    )
+    return valid[0]
+
+
+def _translation_source_name(ocr_lang: str, target_lang: str) -> str:
+    """Describe the input language without creating same-language prompts."""
+    if _norm_lang(ocr_lang) == _norm_lang(target_lang):
+        return "the automatically detected source language"
+    if _norm_lang(ocr_lang) in LANGUAGES:
+        return get_lang_name(ocr_lang)
+    return "the automatically detected source language"
+
+
+def _effective_ocr_language(target_lang: str, *candidates: Optional[str]) -> str:
+    selected = next((value for value in candidates if value), "auto")
+    if _norm_lang(selected) == _norm_lang(target_lang):
+        return "auto"
+    return selected
 
 def get_qwen():
     global _global_qwen, _current_qwen_path
@@ -1187,14 +2979,35 @@ def get_qwen():
                 logging.info(f"[Qwen] loaded: {_current_qwen_repo_id}/{_current_qwen_filename}")
     return _global_qwen
 
+def _ensure_vision_projector(repo_id: str, model_filename: str) -> None:
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+        candidates = [name for name in list_repo_files(repo_id)
+                      if name.lower().endswith(".gguf") and _is_projector_gguf(pathlib.Path(name))]
+        if not candidates:
+            return
+        projector = candidates[0]
+        hf_hub_download(repo_id=repo_id, filename=projector)
+        logging.info(f"[GGUF] Vision projector available for {model_filename}: {projector}")
+    except Exception as exc:
+        logging.info(f"[GGUF] No downloadable vision projector for {model_filename}: {exc}")
+
+
 def switch_qwen_model(repo_id: str, filename: Optional[str] = None):
-    global _global_qwen, _current_qwen_repo_id, _current_qwen_filename, _current_qwen_path
+    global _global_qwen, _local_vision_qwen
+    global _local_vision_model_path, _local_vision_projector_path
+    global _current_qwen_repo_id, _current_qwen_filename, _current_qwen_path
     path = download_gguf(repo_id, filename)
+    _ensure_vision_projector(repo_id, path.name)
     with _qwen_model_lock:
         _current_qwen_repo_id = repo_id
         _current_qwen_filename = filename or path.name
         _current_qwen_path = path
         _global_qwen = None
+        _local_vision_qwen = None
+        _local_vision_model_path = None
+        _local_vision_projector_path = None
+    _save_settings()
     logging.info(f"[Qwen] Switched to {repo_id}/{filename}, preloading...")
     get_qwen()
 
@@ -1230,19 +3043,19 @@ def _retry_translate_single(text: str, lang_name: str, src_lang_name: str, llm) 
                 raw = raw[len(prefix):].strip()
         return raw
     except Exception:
-        return text  # fallback: return original
+        return ""
 def qwen_translate(text: str, target_lang: str = "en", ocr_lang: str = "ja") -> str:
     text = text.strip()
     if not text:
         return ""
     lang_name = get_lang_name(target_lang)
-    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
+    src_lang_name = _translation_source_name(ocr_lang, target_lang)
     
     max_tok = max(64, min(256, len(text) + 32))
     logging.info(f"[LLM] Starting translation for: '{text[:40]}' -> {lang_name}")
     llm = get_qwen()
     
-    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name))
+    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name)) + HONORIFIC_CLAUSE
     user_prompt = f"[Source language: {src_lang_name}]\n{text}"
     
     msgs = [
@@ -1270,21 +3083,35 @@ def qwen_translate(text: str, target_lang: str = "en", ocr_lang: str = "ja") -> 
             logging.warning(f"[LLM] Output appears to be wrong language ({target_lang}), retrying with stronger constraints...")
             raw = _retry_translate_single(text, lang_name, src_lang_name, llm)
             if not _looks_like_target(raw, target_lang):
-                logging.error(f"[LLM] Retry also failed for target={target_lang}, returning as-is")
-        logging.info(f"[LLM] Translated to: '{raw[:40]}'")
-        return clean_text_for_font(raw)
+                logging.error(f"[LLM] Local model failed target-language validation after retry; suppressing output")
+                return ""
+        validated = _validated_translation(text, raw, target_lang)
+        if not validated:
+            logging.error("[LLM] Local model output rejected as source echo or invalid target text")
+            return ""
+        logging.info(f"[LLM] Translated to: '{validated[:40]}'")
+        return validated
     except Exception as e:
         logging.error(f"[LLM] Translation failed: {e}")
         return ""
 
-def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja") -> List[str]:
-    """Translate a list of texts in a SINGLE LLM call using a numbered list."""
+def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja",
+                         context_aware: bool = False,
+                         name_map: Optional[Dict[str, str]] = None,
+                         llm: Any = None) -> List[str]:
+    """Translate a list of texts in a SINGLE LLM call using a numbered list.
+
+    Lettering-style detection is deliberately absent here: style is read off the
+    page artwork, which needs a vision model, so it is OpenRouter-only. The
+    server forces context level back to "low" for non-OpenRouter backends, so
+    this path is never asked for style tags.
+    """
     indexed_texts = [(i, t.strip()) for i, t in enumerate(texts) if t.strip()]
     if not indexed_texts:
         return [""] * len(texts)
 
     lang_name = get_lang_name(target_lang)
-    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
+    src_lang_name = _translation_source_name(ocr_lang, target_lang)
 
     prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (_, text) in enumerate(indexed_texts)]
     batch_text = f"[Source language: {src_lang_name}]\n" + "\n".join(prompt_lines)
@@ -1295,11 +3122,15 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: st
         f"Output the same numbered list, containing ONLY the {lang_name} translations. "
         f"Do not include the original text. No explanations. {_script_hint(lang_name)}"
     ).strip()
+    batch_system_prompt += HONORIFIC_CLAUSE
+    if context_aware:
+        batch_system_prompt += CONTEXT_AWARE_CLAUSE
 
     total_chars = sum(len(t) for _, t in indexed_texts)
-    max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 32)))
+    per_line_budget = 32
+    max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * per_line_budget)))
 
-    llm = get_qwen()
+    llm = llm or get_qwen()
     msgs = [
         {"role": "system", "content": batch_system_prompt},
         {"role": "user", "content": batch_text},
@@ -1332,7 +3163,7 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: st
                         trans = qwen_translate(indexed_texts[num][1], target_lang, ocr_lang)
                     results[orig_idx] = clean_text_for_font(trans)
                     matched_any = True
-                    
+
         # Fallback if model ignored numbers and just outputted translations line by line
         if not matched_any and len(parsed_lines) == len(indexed_texts):
             logging.warning("[LLM Batch] Model didn't use numbers, mapping line-by-line...")
@@ -1362,13 +3193,63 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: st
 # OpenRouter Translation
 # ===========================================================================
 
-async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja", max_retries: int = 2) -> List[str]:
+def _ratelimit_wait_seconds(response) -> float:
+    """How long to wait out an HTTP 429 before trying again.
+
+    Prefer whatever the server tells us — `Retry-After` (delay-seconds or an
+    HTTP-date) first, then `X-RateLimit-Reset` (epoch, seconds or milliseconds).
+    When neither is present or parseable, fall back to the average lifetime of a
+    free-tier per-minute window. Always clamped so a bogus header can't stall a
+    job indefinitely.
+    """
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(0.0, min(OPENROUTER_RATELIMIT_MAX_WAIT, float(retry_after)))
+        except (TypeError, ValueError):
+            try:
+                from email.utils import parsedate_to_datetime
+                parsed = parsedate_to_datetime(retry_after)
+                if parsed is not None:
+                    delta = parsed.timestamp() - time.time()
+                    return max(0.0, min(OPENROUTER_RATELIMIT_MAX_WAIT, delta))
+            except Exception:
+                pass
+
+    reset = response.headers.get("X-RateLimit-Reset")
+    if reset:
+        try:
+            reset_val = float(reset)
+            # OpenRouter reports this in milliseconds. Anything well past the
+            # plausible epoch-seconds range is a millisecond timestamp.
+            if reset_val > 1e11:
+                reset_val /= 1000.0
+            delta = reset_val - time.time()
+            if 0 < delta <= OPENROUTER_RATELIMIT_MAX_WAIT:
+                return delta
+        except (TypeError, ValueError):
+            pass
+
+    return OPENROUTER_RATELIMIT_AVG_WAIT
+
+
+async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: str = "ja",
+                                      max_retries: int = 2, context_aware: bool = False,
+                                      name_map: Optional[Dict[str, str]] = None,
+                                      style_aware: bool = False,
+                                      styles_out: Optional[List[Optional[Dict[str, Any]]]] = None,
+                                      page_image: Optional["Image.Image"] = None) -> List[str]:
     import aiohttp
     import random
+
+    if styles_out is not None and len(styles_out) < len(texts):
+        styles_out.extend([None] * (len(texts) - len(styles_out)))
 
     with _model_type_lock:
         api_key = _openrouter_api_key
         model = _openrouter_model
+    with _openrouter_free_mode_lock:
+        paid_mode = _openrouter_free_mode
 
     if not api_key:
         logging.error("[OpenRouter] API key not configured")
@@ -1379,9 +3260,10 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
         return [""] * len(texts)
 
     lang_name = get_lang_name(target_lang)
-    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
+    src_lang_name = _translation_source_name(ocr_lang, target_lang)
     total_chars = sum(len(t) for _, t in indexed_texts)
-    max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * 20)))
+    per_line_budget = 40 if style_aware else 20
+    max_tok = max(256, min(4096, total_chars + (len(indexed_texts) * per_line_budget)))
 
     prompt_lines = [f"{idx + 1}. {text.replace(chr(10), ' ')}" for idx, (orig_i, text) in enumerate(indexed_texts)]
     batch_text = f"[Source language: {src_lang_name}]\n" + "\n".join(prompt_lines)
@@ -1394,6 +3276,20 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
         f"Output ONLY the translated list, one per line, keeping the exact same numbers. "
         f"Do not include the original text. No explanations, no notes, no quotes. {_script_hint(lang_name)}"
     ).strip()
+    base_system_prompt += HONORIFIC_CLAUSE
+    if context_aware:
+        base_system_prompt += CONTEXT_AWARE_CLAUSE
+    
+    # High mode vision: send the page image for style detection from the artwork.
+    # Style is visual-only — if encoding fails, style detection is skipped.
+    page_data_uri = ""
+    if style_aware and page_image is not None:
+        page_data_uri = _page_image_data_uri(page_image)
+        if page_data_uri:
+            base_system_prompt += STYLE_AWARE_VISION_CLAUSE
+            logging.info("[OpenRouter Batch] High mode: page image attached for style detection.")
+        else:
+            logging.warning("[OpenRouter Batch] High mode: image encoding failed, style detection skipped.")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1402,11 +3298,29 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
         "X-Title": "Manga Translation API"
     }
 
+    # Build the user message: if we have a page image, use vision format; otherwise plain text.
+    if page_data_uri:
+        user_message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": page_data_uri}
+                },
+                {
+                    "type": "text",
+                    "text": batch_text
+                }
+            ]
+        }
+    else:
+        user_message = {"role": "user", "content": batch_text}
+
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": base_system_prompt},
-            {"role": "user", "content": batch_text},
+            user_message,
         ],
         "max_tokens": max_tok,
         "temperature": 0.2,
@@ -1417,20 +3331,45 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
 
     QUOTE_CHARS = "\"'“”‘’"
 
-    for attempt in range(1, max_retries + 1):
-        if attempt > 1:
-            wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
-            logging.info(f"[OpenRouter Batch] Retry {attempt}/{max_retries} after {wait_time:.1f}s wait...")
-            await asyncio.sleep(wait_time)
-            
+    # `attempt` counts translation-quality retries (echo/parse failures) and is
+    # what max_retries bounds. A 429 is not a bad response — it's a rate limit —
+    # so a 429 resend does NOT advance `attempt` or trigger the echo-escalation
+    # prompt below. RATELIMIT_RESEND_CAP just stops a permanently-throttled key
+    # from looping forever.
+    RATELIMIT_RESEND_CAP = 50
+    ratelimit_resends = 0
+    # Set only when a response came back but the translation was unusable
+    # (echoed source / unparseable). Drives the escalation prompt + backoff. A
+    # 429, timeout, or transport error leaves it False so we resend as-is.
+    retry_after_bad_translation = False
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
+        if retry_after_bad_translation:
+            retry_after_bad_translation = False
+            # An echo / wrong-script / unparseable response is a MODEL problem,
+            # not a rate limit — waiting changes nothing. Re-prompt immediately
+            # (the escalated instruction below is what actually fixes it) so a
+            # few bad attempts can't add tens of seconds of dead time per batch.
+            logging.info(f"[OpenRouter Batch] Retry {attempt}/{max_retries} (re-prompting immediately)...")
+
             # Escalate the prompt on retries to force the LLM to stop echoing
-            payload["messages"][0]["content"] = (
+            escalated_prompt = (
                 f"YOUR PREVIOUS RESPONSE WAS INVALID BECAUSE YOU ECHOED THE SOURCE TEXT. "
                 f"You MUST translate each numbered line from {src_lang_name} into {lang_name}. "
                 f"CRITICAL: Do NOT repeat the original {src_lang_name} text. You MUST output {lang_name} text only. "
                 f"Output ONLY the translated list, one per line, keeping the exact same numbers. "
                 f"No explanations, no notes, no quotes. {_script_hint(lang_name)}"
             ).strip()
+            escalated_prompt += HONORIFIC_CLAUSE
+            if context_aware:
+                escalated_prompt += CONTEXT_AWARE_CLAUSE
+            if style_aware:
+                # The image is still attached on retries, so keep the vision
+                # wording when available.
+                if page_data_uri:
+                    escalated_prompt += STYLE_AWARE_VISION_CLAUSE
+            payload["messages"][0]["content"] = escalated_prompt
 
         try:
             timeout = aiohttp.ClientTimeout(total=120)
@@ -1441,8 +3380,21 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                     json=payload
                 ) as response:
                     if response.status == 429:
-                        retry_after = response.headers.get("Retry-After")
-                        wait = float(retry_after) if retry_after else 10.0
+                        # A 429 is a rate limit, not a bad translation, so it
+                        # must not consume the echo/parse retry budget. Roll
+                        # `attempt` back and bound the resends separately.
+                        ratelimit_resends += 1
+                        if ratelimit_resends > RATELIMIT_RESEND_CAP:
+                            logging.error(f"[OpenRouter Batch] Still rate limited after {RATELIMIT_RESEND_CAP} resends, giving up.")
+                            return [""] * len(texts)
+                        attempt -= 1
+                        if paid_mode:
+                            # Paid account: no per-minute quota to wait out, so
+                            # re-send the whole batch immediately. Never fan out
+                            # to per-box requests just because of a 429.
+                            logging.warning("[OpenRouter Batch] Rate limited (429) — paid mode ON, retrying batch immediately.")
+                            continue
+                        wait = _ratelimit_wait_seconds(response)
                         logging.warning(f"[OpenRouter Batch] Rate limited (429). Waiting {wait:.1f}s...")
                         await asyncio.sleep(wait)
                         continue
@@ -1450,14 +3402,34 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                     if response.status != 200:
                         error_text = await response.text()
                         logging.error(f"[OpenRouter Batch] API error {response.status} on attempt {attempt}: {error_text[:200]}")
+                        # Transient upstream/provider errors (500, 502, 503, 504,
+                        # 524, 408) are not bad translations and not client
+                        # mistakes — OpenRouter's provider routing throws these
+                        # even on paid keys with no rate limit. Resend the batch
+                        # with a short backoff WITHOUT consuming the translation
+                        # retry budget, so a couple of hiccups can't collapse the
+                        # whole page to slow per-box requests. Bounded by the same
+                        # resend cap as 429s.
+                        if response.status in (408, 500, 502, 503, 504, 524):
+                            ratelimit_resends += 1
+                            if ratelimit_resends > RATELIMIT_RESEND_CAP:
+                                logging.error(f"[OpenRouter Batch] Persistent {response.status} after {RATELIMIT_RESEND_CAP} resends, giving up.")
+                                return [""] * len(texts)
+                            attempt -= 1
+                            backoff = min(8.0, 1.0 + ratelimit_resends * 0.5) + random.uniform(0.2, 0.8)
+                            logging.warning(f"[OpenRouter Batch] Transient {response.status}, resending batch in {backoff:.1f}s (resend {ratelimit_resends}).")
+                            await asyncio.sleep(backoff)
+                            continue
+                        # Genuine client error (400/401/403/404 etc.) — retrying
+                        # won't help. Consume the attempt and let it fail through.
                         continue
 
                     data = await response.json()
 
                     raw = None
                     try:
-                        if (data and isinstance(data.get("choices"), list) 
-                            and len(data["choices"]) > 0 
+                        if (data and isinstance(data.get("choices"), list)
+                            and len(data["choices"]) > 0
                             and isinstance(data["choices"][0].get("message"), dict)):
                             raw = data["choices"][0]["message"].get("content")
                     except (IndexError, KeyError, TypeError) as e:
@@ -1465,6 +3437,7 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
 
                     if not raw or not isinstance(raw, str):
                         logging.warning(f"[OpenRouter Batch] Empty/None content on attempt {attempt}")
+                        retry_after_bad_translation = True
                         continue
 
                     # Strip markdown code fences if present
@@ -1478,6 +3451,9 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                         raw = '\n'.join(fence_lines).strip()
 
                     results = [""] * len(texts)
+                    if styles_out is not None:
+                        for _mi in range(len(styles_out)):
+                            styles_out[_mi] = None
                     parsed_lines = [ln.strip() for ln in raw.split('\n') if ln.strip()]
 
                     # Try numbered format: "1. text", "1) text", "1: text", "[1] text"
@@ -1489,13 +3465,19 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                         if match:
                             num = int(match.group(1)) - 1
                             trans = match.group(2).strip()
+                            line_style, line_weight, line_glow = None, 0, False
+                            if style_aware:
+                                trans, line_style, line_weight, line_glow = _split_style_tag(trans)
                             # Strip wrapping quotes (standard and smart)
                             if len(trans) >= 2 and trans[0] in QUOTE_CHARS and trans[-1] in QUOTE_CHARS:
                                 trans = trans[1:-1].strip()
-                            
+
                             if 0 <= num < len(indexed_texts):
                                 orig_idx = indexed_texts[num][0]
-                                results[orig_idx] = clean_text_for_font(trans)
+                                source = indexed_texts[num][1]
+                                results[orig_idx] = _validated_translation(source, trans, target_lang)
+                                if styles_out is not None and line_style and results[orig_idx]:
+                                    styles_out[orig_idx] = {"style": line_style, "weight": line_weight, "glow": line_glow}
                                 matched_count += 1
 
                     # Fallback: line-by-line if no numbers but count matches
@@ -1503,19 +3485,30 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                         logging.warning("[OpenRouter Batch] No numbered lines found, trying line-by-line mapping...")
                         for i, line in enumerate(parsed_lines):
                             trans = line.strip()
+                            line_style, line_weight, line_glow = None, 0, False
+                            if style_aware:
+                                trans, line_style, line_weight, line_glow = _split_style_tag(trans)
                             if len(trans) >= 2 and trans[0] in QUOTE_CHARS and trans[-1] in QUOTE_CHARS:
                                 trans = trans[1:-1].strip()
                             orig_idx = indexed_texts[i][0]
-                            results[orig_idx] = clean_text_for_font(trans)
+                            source = indexed_texts[i][1]
+                            results[orig_idx] = _validated_translation(source, trans, target_lang)
+                            if styles_out is not None and line_style and results[orig_idx]:
+                                styles_out[orig_idx] = {"style": line_style, "weight": line_weight, "glow": line_glow}
                             matched_count += 1
 
-                    # Validate script and clear failures
+                    # Validate script + reject echoes, then clear failures.
+                    # Map original index -> source text so we can echo-check the
+                    # output against the exact line it was meant to translate.
+                    src_by_orig = {orig_i: src for (orig_i, src) in indexed_texts}
                     valid_count = 0
                     for i, r in enumerate(results):
-                        if r and _looks_like_target(r, target_lang):
+                        if r and _looks_like_target(r, target_lang) and not _is_echo(src_by_orig.get(i, ""), r):
                             valid_count += 1
                         else:
-                            results[i] = "" 
+                            results[i] = ""
+                            if styles_out is not None:
+                                styles_out[i] = None
 
                     logging.info(f"[OpenRouter Batch] Parsed {valid_count}/{len(indexed_texts)} valid translations "
                                  f"(matched {matched_count} lines).")
@@ -1525,13 +3518,29 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                     else:
                         logging.warning(f"[OpenRouter Batch] Failed to parse any valid translations. "
                                         f"Raw response (first 500 chars): {raw[:500]!r}")
+                        retry_after_bad_translation = True
                         continue
 
         except asyncio.TimeoutError:
-            logging.warning(f"[OpenRouter Batch] Timeout on attempt {attempt}/{max_retries}")
+            # A network timeout is transient, not a bad translation. Resend the
+            # batch without consuming the translation-retry budget, bounded by
+            # the same resend cap, so one slow response can't force sequential.
+            ratelimit_resends += 1
+            if ratelimit_resends > RATELIMIT_RESEND_CAP:
+                logging.error(f"[OpenRouter Batch] Persistent timeouts after {RATELIMIT_RESEND_CAP} resends, giving up.")
+                return [""] * len(texts)
+            attempt -= 1
+            logging.warning(f"[OpenRouter Batch] Timeout, resending batch (resend {ratelimit_resends}).")
             continue
         except Exception as e:
-            logging.error(f"[OpenRouter Batch] Error on attempt {attempt}/{max_retries}: {e}")
+            ratelimit_resends += 1
+            if ratelimit_resends > RATELIMIT_RESEND_CAP:
+                logging.error(f"[OpenRouter Batch] Persistent transport errors after {RATELIMIT_RESEND_CAP} resends, giving up.")
+                return [""] * len(texts)
+            attempt -= 1
+            backoff = min(8.0, 1.0 + ratelimit_resends * 0.5) + random.uniform(0.2, 0.8)
+            logging.error(f"[OpenRouter Batch] Transport error on resend {ratelimit_resends} (retrying in {backoff:.1f}s): {e}")
+            await asyncio.sleep(backoff)
             continue
 
     logging.error(f"[OpenRouter Batch] FAILED after {max_retries} retries. Falling back to sequential.")
@@ -1545,6 +3554,8 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
     with _model_type_lock:
         api_key = _openrouter_api_key
         model = _openrouter_model
+    with _openrouter_free_mode_lock:
+        free_mode = _openrouter_free_mode
 
     if not api_key:
         logging.error("[OpenRouter] API key not configured")
@@ -1554,12 +3565,12 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
         return ""
 
     lang_name = get_lang_name(target_lang)
-    src_lang_name = get_lang_name(ocr_lang) if _norm_lang(ocr_lang) in LANGUAGES else "the original language"
+    src_lang_name = _translation_source_name(ocr_lang, target_lang)
     max_tok = max(16, min(96, len(text) + 16))
 
     logging.info(f"[OpenRouter] Translating '{text[:40]}' -> {lang_name} using {model}")
 
-    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name))
+    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name)) + HONORIFIC_CLAUSE
     user_prompt = f"[Source language: {src_lang_name}]\n{text}"
 
     headers = {
@@ -1580,8 +3591,13 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
         "top_p": 0.9,
     }
 
+    # Only back off before a retry caused by a transient FAILURE (timeout,
+    # transport error, non-200). An echo / wrong-script rejection is a model
+    # problem that waiting won't fix, so those retries re-prompt immediately.
+    backoff_next_retry = False
     for attempt in range(1, max_retries + 1):
-        if attempt > 1:
+        if attempt > 1 and backoff_next_retry:
+            backoff_next_retry = False
             wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
             logging.info(f"[OpenRouter] Retry {attempt}/{max_retries} after {wait_time:.1f}s wait...")
             await asyncio.sleep(wait_time)
@@ -1595,6 +3611,9 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
                     json=payload
                 ) as response:
                     if response.status == 429:
+                        if free_mode:
+                            logging.warning("[OpenRouter] Rate limited (429) — free mode ON, skipping retries.")
+                            return ""
                         retry_after = response.headers.get("Retry-After")
                         if retry_after:
                             wait = float(retry_after)
@@ -1607,6 +3626,7 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
                     if response.status != 200:
                         error_text = await response.text()
                         logging.error(f"[OpenRouter] API error {response.status} on attempt {attempt}/{max_retries}: {error_text[:200]}")
+                        backoff_next_retry = True
                         continue
 
                     data = await response.json()
@@ -1623,17 +3643,30 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
 
                     if not raw or not isinstance(raw, str):
                         logging.warning(f"[OpenRouter] Empty/None content on attempt {attempt}/{max_retries} for '{text[:30]}'")
+                        backoff_next_retry = True
                         continue
 
-                    result = clean_text_for_font(raw)
+                    result = _validated_translation(text, raw, target_lang)
+                    # Reject a wrong-script or echoed response so raw source
+                    # never reaches the overlay. Retry with the stronger prompt.
+                    if not result:
+                        logging.warning(f"[OpenRouter] Rejected echo/wrong-script output on attempt {attempt} for '{text[:30]}'")
+                        payload["messages"][0]["content"] = (
+                            f"You MUST translate into {lang_name}. The previous answer was rejected because "
+                            f"it repeated the {src_lang_name} source instead of translating it. "
+                            f"Output ONLY the {lang_name} translation, nothing else. {_script_hint(lang_name)}"
+                        )
+                        continue
                     logging.info(f"[OpenRouter] Translated to: '{result[:40]}'")
                     return result
 
         except asyncio.TimeoutError:
             logging.warning(f"[OpenRouter] Timeout on attempt {attempt}/{max_retries}")
+            backoff_next_retry = True
             continue
         except Exception as e:
             logging.error(f"[OpenRouter] Error on attempt {attempt}/{max_retries}: {e}")
+            backoff_next_retry = True
             continue
 
     logging.error(f"[OpenRouter] FAILED after {max_retries} retries for: '{text[:40]}'")
@@ -1788,14 +3821,25 @@ class HighQualityLama:
         coords = []
         for y in ys:
             for x in xs:
-                y1, y2 = y, y + ps
-                x1, x2 = x, x + ps
+                y1, y2 = y, min(H, y + ps)
+                x1, x2 = x, min(W, x + ps)
                 p_img = crop_img[y1:y2, x1:x2]
                 p_mask = crop_mask[y1:y2, x1:x2]
-                
+
                 if p_mask.sum() == 0:
                     continue
-                    
+
+                patch_h, patch_w = p_img.shape[:2]
+                pad_h = ps - patch_h
+                pad_w = ps - patch_w
+                if pad_h or pad_w:
+                    p_img = np.pad(
+                        p_img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect"
+                    )
+                    p_mask = np.pad(
+                        p_mask, ((0, pad_h), (0, pad_w)), mode="reflect"
+                    )
+
                 patches.append((p_img, p_mask))
                 coords.append((y1, y2, x1, x2))
 
@@ -2017,18 +4061,33 @@ async def inpaint_image_async(img_bgr: np.ndarray, mask: np.ndarray, use_lama: b
 def build_inpaint_mask(img_shape: Tuple[int, int, int],
                        bboxes: List[Tuple[int, int, int, int]],
                        padding: int = 2,
-                       dilate_kernel: int = 3) -> np.ndarray:
-    """Build a strict binary mask tailored tightly to the text bounding boxes."""
+                       dilate_kernel: int = 3,
+                       angles: Optional[List[float]] = None) -> np.ndarray:
+    """Build a strict binary mask tailored tightly to the text bounding boxes.
+
+    When `angles` is supplied (Google Lens tilt), a tilted box is filled as a
+    rotated quad so the mask follows the slanted text instead of covering the
+    larger axis-aligned area around it.
+    """
     h, w = img_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
-    
-    for x1, y1, x2, y2 in bboxes:
+
+    for i, (x1, y1, x2, y2) in enumerate(bboxes):
         px1 = max(0, x1 - padding)
         py1 = max(0, y1 - padding)
         px2 = min(w, x2 + padding)
         py2 = min(h, y2 + padding)
-        mask[py1:py2, px1:px2] = 255
-        
+
+        angle = 0.0
+        if angles and i < len(angles):
+            angle = float(angles[i] or 0.0)
+
+        if angle:
+            pts = _rotated_box_points((px1, py1, px2, py2), angle)
+            cv2.fillPoly(mask, [np.int32([pts])], 255)
+        else:
+            mask[py1:py2, px1:px2] = 255
+
     if dilate_kernel > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel, dilate_kernel))
         mask = cv2.dilate(mask, kernel, iterations=1)
@@ -2168,6 +4227,70 @@ def detect_text_and_bg_colors(img_bgr: np.ndarray, bbox: Tuple[int, int, int, in
     return text_rgb, outline_rgb
 
 
+def measure_source_glyph_height(img_bgr: np.ndarray,
+                                 bbox: Tuple[int, int, int, int]) -> Optional[float]:
+    """Measure the height (px) of the ORIGINAL lettering inside bbox.
+
+    Used by high mode to size the overlay to match how big the source text was
+    actually drawn, instead of sizing purely off the bubble dimensions. Works by
+    binarising the region (Otsu, auto-polarity from the border), keeping
+    connected components that look like glyphs, and returning their median
+    height. Returns None when it can't find a reliable glyph run so the caller
+    falls back to bubble-proportional sizing.
+    """
+    try:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        h, w = img_bgr.shape[:2]
+        x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w))
+        y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h))
+        if (x2 - x1) < 6 or (y2 - y1) < 6:
+            return None
+
+        region = img_bgr[y1:y2, x1:x2]
+        if region.size == 0:
+            return None
+        box_h = y2 - y1
+
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Auto-polarity: glyphs are the pixels that DIFFER from the border,
+        # which is almost always background (bubble fill / art behind text).
+        rh, rw = gray.shape[:2]
+        border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+        border_mean = float(border.mean()) if border.size else float(gray.mean())
+        glyph_mask = (otsu == 0) if border_mean > 127 else (otsu == 255)
+        glyph_u8 = glyph_mask.astype(np.uint8)
+
+        num, _labels, stats, _cent = cv2.connectedComponentsWithStats(glyph_u8, connectivity=8)
+        if num <= 1:
+            return None
+
+        heights = []
+        for i in range(1, num):  # skip background label 0
+            cw = stats[i, cv2.CC_STAT_WIDTH]
+            ch = stats[i, cv2.CC_STAT_HEIGHT]
+            area = stats[i, cv2.CC_STAT_AREA]
+            # Discard noise (tiny specks) and full-region blobs (a component as
+            # tall as the whole box is a frame/inpaint artifact, not a glyph).
+            if ch < max(4, box_h * 0.12):
+                continue
+            if ch > box_h * 0.98:
+                continue
+            if area < 6:
+                continue
+            if cw > 0 and ch / cw > 12:  # thin vertical rule, not a glyph
+                continue
+            heights.append(float(ch))
+
+        if len(heights) < 1:
+            return None
+        return float(np.median(heights))
+    except Exception as e:
+        logging.warning(f"[GlyphSize] measure failed for {bbox}: {e}")
+        return None
+
+
 def detect_text_colors_batch(img_bgr: np.ndarray,
                              bboxes: List[Tuple[int, int, int, int]]
                              ) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
@@ -2250,29 +4373,45 @@ def get_current_font(size: int) -> ImageFont.FreeTypeFont:
         font_path = _current_font_path
     return get_font(font_path, size)
 
+def _add_cutoff_marker(draw, line, font, max_width):
+    marker = "-"
+    if line.endswith(marker) and draw.textlength(line, font=font) <= max_width:
+        return line
+    candidate = line.rstrip()
+    while candidate and draw.textlength(candidate + marker, font=font) > max_width:
+        candidate = candidate[:-1].rstrip()
+    if candidate:
+        return candidate + marker
+    return marker if draw.textlength(marker, font=font) <= max_width else ""
+
+
 def _break_long_word(draw, word, font, max_width):
-    """Break a single word that is wider than max_width into chunks that each
-    fit. Used only as a last resort (allow_break=True) so very long strings
-    stay inside the bubble instead of overflowing horizontally."""
+    """Split an oversized word into width-safe, hyphen-terminated pieces."""
     pieces = []
-    cur = ""
-    for ch in word:
-        test = cur + ch
-        if cur and draw.textlength(test, font=font) > max_width:
-            pieces.append(cur)
-            cur = ch
-        else:
-            cur = test
-    if cur:
-        pieces.append(cur)
+    remaining = word
+    while remaining:
+        if draw.textlength(remaining, font=font) <= max_width:
+            pieces.append(remaining)
+            break
+
+        chunk = ""
+        for ch in remaining:
+            candidate = chunk + ch
+            if draw.textlength(candidate + "-", font=font) > max_width:
+                break
+            chunk = candidate
+
+        if not chunk:
+            pieces.append(_add_cutoff_marker(draw, "", font, max_width))
+            break
+
+        pieces.append(chunk + "-")
+        remaining = remaining[len(chunk):]
+
     return pieces or [word]
 
 def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False):
-    """Wraps text by words. By default a word that is wider than max_width is
-    placed on its own line and allowed to overflow. When allow_break is True
-    (last-resort fallback), such a word is split by characters so nothing
-    spills outside the bubble.
-    """
+    """Wrap text by words, optionally hyphenating oversized words."""
     if is_vertical:
         return [text] if text else [""]
 
@@ -2322,15 +4461,12 @@ def _measure_block(draw, lines, font):
 
 def fit_font_and_wrap(draw, text, box_w, box_h,
                       font_path=None,
-                      max_size=96, min_size=8, is_vertical=False,
-                      inner_padding_ratio=0.10):
-    """Fit text to be as large as possible within an INNER box that is smaller
-    than the inpainting region.
+                      max_size=96, min_size=17, is_vertical=False,
+                      inner_padding_ratio=0.0):
+    """Fit text at the largest size that fits the selected portion of a region.
 
-    The inner box is created by shrinking box_w/box_h by inner_padding_ratio
-    on each side (default 10% per side → 80% usable area). This ensures text
-    stays within the inpainted area with a visual margin while maximizing
-    the font size.
+    With the default zero padding, the complete OCR bbox is available. The
+    returned font size never drops below min_size.
 
     Returns:
         (font_size, lines, heights, inner_w, inner_h)
@@ -2341,9 +4477,9 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
         with _font_config_lock:
             font_path = str(_current_font_path)
 
-    # ── Create inner box (smaller than the inpainting region) ──
-    pad_x = max(2, int(box_w * inner_padding_ratio))
-    pad_y = max(2, int(box_h * inner_padding_ratio))
+    # ── Create inner box ──
+    pad_x = max(0, int(box_w * inner_padding_ratio))
+    pad_y = max(0, int(box_h * inner_padding_ratio))
     inner_w = max(8, box_w - 2 * pad_x)
     inner_h = max(8, box_h - 2 * pad_y)
 
@@ -2387,7 +4523,7 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             max_char_w = max(draw.textlength(ch, font=font) for ch in clean_v_text) if clean_v_text else mid
             col_w = max(max_char_w, mid * 0.8)
             total_w = len(cols) * col_w
-            if total_w <= inner_w - 4:
+            if total_w <= inner_w:
                 best_size = mid
                 best_cols = cols
                 best_col_widths = [col_w] * len(cols)
@@ -2439,16 +4575,19 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
                 cache[key] = ImageFont.load_default()
         font = cache[key]
 
-        lines = wrap_text(draw, text, font, inner_w - 4, allow_break=False, is_vertical=False)
+        lines = wrap_text(draw, text, font, inner_w, allow_break=False, is_vertical=False)
         heights, total_h, max_w = _measure_block(draw, lines, font)
 
-        if max_w <= inner_w - 4 and total_h <= inner_h - 4:
+        if max_w <= inner_w and total_h <= inner_h:
             best_size, best_lines, best_heights = mid, lines, heights
             lo = mid + 1
         else:
             hi = mid - 1
 
     if best_lines is None:
+        # Preserve the readable floor while containing dense translations within
+        # the region. Oversized words are hyphenated, and text beyond the
+        # available line count is marked as cut off on the final visible line.
         key = (font_path, min_size)
         if key not in cache:
             try:
@@ -2456,14 +4595,20 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-
-        # Wrap by whole words only — never split a word across lines. If a word
-        # is wider than the box it overflows horizontally rather than being cut.
-        fallback_lines = wrap_text(draw, text, font, inner_w - 4, allow_break=False, is_vertical=False)
-        best_lines = fallback_lines if fallback_lines else [text]
-        heights, _, _ = _measure_block(draw, best_lines, font)
+        wrapped_lines = wrap_text(
+            draw, text, font, inner_w, allow_break=True, is_vertical=False
+        )
+        wrapped_heights, _, _ = _measure_block(draw, wrapped_lines, font)
+        line_h = wrapped_heights[0] if wrapped_heights else max(1, min_size)
+        visible_line_count = max(1, int(inner_h // line_h))
+        was_cut_off = len(wrapped_lines) > visible_line_count
+        best_lines = wrapped_lines[:visible_line_count]
+        if was_cut_off and best_lines:
+            best_lines[-1] = _add_cutoff_marker(
+                draw, best_lines[-1], font, inner_w
+            )
+        best_heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
-        best_heights = heights
 
     return best_size, best_lines, best_heights, inner_w, inner_h
 
@@ -2476,14 +4621,43 @@ def draw_text_with_config(draw: ImageDraw.ImageDraw,
                           font: ImageFont.FreeTypeFont,
                           fill: Tuple[int, int, int],
                           stroke_fill: Optional[Tuple[int, int, int]] = None,
-                          anchor: Optional[str] = None):
+                          anchor: Optional[str] = None,
+                          embolden: int = 0,
+                          glow_radius: float = 0.0,
+                          target_image: Optional[Image.Image] = None):
+    """
+    Draw text with optional stroke, synthetic bold, and glow.
+    """
     with _font_config_lock:
-        stroke_width = _current_stroke_width
-    if stroke_width > 0 and stroke_fill is not None:
-        draw.text(position, text, font=font, fill=fill,
-                  stroke_width=stroke_width, stroke_fill=stroke_fill, anchor=anchor)
-    else:
-        draw.text(position, text, font=font, fill=fill, anchor=anchor)
+        base_stroke = _current_stroke_width
+
+    total_stroke = base_stroke + embolden
+    
+    # Glow pass: draw text onto a temporary layer, blur it, paste behind
+    if glow_radius > 0 and target_image is not None:
+        try:
+            bbox = draw.textbbox(position, text, font=font, anchor=anchor)
+            pad = int(glow_radius * 3)
+            x1, y1, x2, y2 = bbox
+            layer_w = max(1, int(x2 - x1) + pad * 2)
+            layer_h = max(1, int(y2 - y1) + pad * 2)
+            glow_layer = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
+            glow_draw = ImageDraw.Draw(glow_layer)
+            glow_draw.text((pad, pad), text, font=font, fill=stroke_fill or fill, anchor=anchor)
+            glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=glow_radius))
+            target_image.paste(glow_layer, (int(x1) - pad, int(y1) - pad), glow_layer)
+        except Exception as e:
+            logging.warning(f"[Render] Glow rendering failed (drawing without glow): {e}")
+
+    # Crisp text with optional stroke
+    try:
+        if total_stroke > 0 and stroke_fill is not None:
+            draw.text(position, text, font=font, fill=fill,
+                      stroke_width=int(total_stroke), stroke_fill=stroke_fill, anchor=anchor)
+        else:
+            draw.text(position, text, font=font, fill=fill, anchor=anchor)
+    except Exception as e:
+        logging.warning(f"[Render] Text drawing failed: {e}")
 
 # ===========================================================================
 # Font Management Endpoints (Set, Get, GetFonts)
@@ -2566,6 +4740,7 @@ async def set_font(req: SetFontRequest):
             
         _current_stroke_width = max(0, min(20, req.stroke_width))
         logging.info(f"[Font] Stroke width set to: {_current_stroke_width}")
+    _save_settings()
     return {"status": "ok", "font_path": str(_current_font_path), "stroke_width": _current_stroke_width}
 
 @app.get("/GetFont")
@@ -2661,6 +4836,7 @@ async def set_inpaint_mode(req: SetInpaintModeRequest):
     with _inpaint_mode_lock:
         _inpaint_mode = mode
 
+    _save_settings()
     logging.info(f"[Inpaint] Mode set to: {mode}")
 
     return {
@@ -2684,6 +4860,7 @@ async def set_inpaint_mode(req: SetInpaintModeRequest):
     with _inpaint_mode_lock:
         _inpaint_mode = mode
 
+    _save_settings()
     logging.info(f"[Inpaint] Mode set to: {mode}")
 
     return {
@@ -2719,17 +4896,20 @@ async def get_inpaint_mode():
     }
 
 # ===========================================================================
-# SetOcrMode Endpoint (OCR backend switching: hayai / glm / lens)
+# SetOcrMode Endpoint (OCR backend switching)
 # ===========================================================================
 class SetOcrModeRequest(BaseModel):
-    mode: str  # "hayai", "glm", or "lens"
+    mode: str
 
 @app.post("/SetOcrMode")
 async def set_ocr_mode(req: SetOcrModeRequest):
     global _ocr_mode
     mode = req.mode.lower().strip()
-    if mode not in ("hayai", "glm", "lens"):
-        raise HTTPException(400, "mode must be 'hayai', 'glm', or 'lens'")
+    if mode not in ("hayai", "glm", "lens", "openai_endpoint", "google_ai", "local_vision"):
+        raise HTTPException(400, "mode must be 'hayai', 'glm', 'lens', 'openai_endpoint', 'google_ai', or 'local_vision'")
+
+    if mode == "local_vision" and _selected_vision_model() is None:
+        raise HTTPException(400, "Local GGUF OCR requires a selected GGUF model with a compatible mmproj/projector")
 
     if mode == "lens" and LensAPI is None:
         raise HTTPException(500, "chrome-lens-py not installed. Run: pip install chrome-lens-py")
@@ -2740,8 +4920,21 @@ async def set_ocr_mode(req: SetOcrModeRequest):
         except Exception as e:
             raise HTTPException(500, f"Failed to initialize Google Lens API: {e}")
 
+    if mode == "openai_endpoint":
+        with _openai_ocr_config_lock:
+            endpoint = _openai_ocr_endpoint
+            model = _openai_ocr_model
+        if not endpoint or not model:
+            raise HTTPException(400, "OpenAI Endpoint OCR needs an endpoint URL and model ID")
+
+    if mode == "google_ai":
+        with _google_ai_ocr_config_lock:
+            if not _google_ai_ocr_api_key or not _google_ai_ocr_model:
+                raise HTTPException(400, "Google AI Studio OCR needs an API key and model")
+
     with _ocr_mode_lock:
         _ocr_mode = mode
+    _save_settings()
 
     logging.info(f"[OCR] Mode set to: {mode}")
 
@@ -2757,14 +4950,100 @@ async def get_ocr_mode():
         mode = _ocr_mode
     return {
         "ocr_mode": mode,
-        "available_modes": ["hayai", "glm", "lens"],
+        "available_modes": ["hayai", "glm", "lens", "openai_endpoint", "google_ai", "local_vision"],
         "lens_available": LensAPI is not None,
+        "local_vision_available": _selected_vision_model() is not None,
         "descriptions": {
             "hayai": "Hayai OCR (Japanese, local model + YOLO)",
             "glm": "GLM-OCR (Korean, transformers + YOLO)",
             "lens": "Google Lens OCR (all languages, cloud API)",
+            "openai_endpoint": "OpenAI-compatible vision OCR with configurable endpoint/model and lettering analysis",
+            "google_ai": "Google AI Studio Gemini OCR for every visible manga text region",
+            "local_vision": "Selected local vision GGUF with its compatible mmproj/projector",
         }
     }
+
+
+class SetOpenAiOcrConfigRequest(BaseModel):
+    endpoint: str
+    model: str
+    api_key: Optional[str] = None
+
+
+@app.post("/SetOpenAiOcrConfig")
+async def set_openai_ocr_config(req: SetOpenAiOcrConfigRequest):
+    global _openai_ocr_endpoint, _openai_ocr_model, _openai_ocr_api_key
+    endpoint = _normalize_chat_completions_endpoint(req.endpoint)
+    model = req.model.strip()
+    if not endpoint.startswith(("http://", "https://")):
+        raise HTTPException(400, "endpoint must be an http:// or https:// URL")
+    if not model:
+        raise HTTPException(400, "model is required")
+    with _openai_ocr_config_lock:
+        _openai_ocr_endpoint = endpoint
+        _openai_ocr_model = model
+        if req.api_key is not None:
+            _openai_ocr_api_key = req.api_key.strip() or None
+    _save_settings()
+    return {
+        "status": "ok",
+        "endpoint": endpoint,
+        "model": model,
+        "api_key_set": _openai_ocr_api_key is not None,
+    }
+
+
+@app.get("/GetOpenAiOcrConfig")
+async def get_openai_ocr_config():
+    with _openai_ocr_config_lock:
+        return {
+            "endpoint": _openai_ocr_endpoint,
+            "model": _openai_ocr_model,
+            "api_key_set": _openai_ocr_api_key is not None,
+        }
+
+
+class SetGoogleAiOcrConfigRequest(BaseModel):
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    rpm: Optional[int] = None
+
+
+@app.post("/SetGoogleAiOcrConfig")
+async def set_google_ai_ocr_config(req: SetGoogleAiOcrConfigRequest):
+    global _google_ai_ocr_api_key, _google_ai_ocr_model, _google_ai_ocr_rpm
+    with _google_ai_ocr_config_lock:
+        if req.api_key is not None:
+            _google_ai_ocr_api_key = req.api_key.strip() or None
+        if req.model is not None:
+            model = _normalize_gemini_model(req.model)
+            if not model:
+                raise HTTPException(400, "google AI model cannot be empty")
+            _google_ai_ocr_model = model
+        if req.rpm is not None:
+            if not 1 <= req.rpm <= 15:
+                raise HTTPException(400, "Google AI OCR RPM must be between 1 and 15")
+            _google_ai_ocr_rpm = int(req.rpm)
+        result = {
+            "status": "ok",
+            "model": _google_ai_ocr_model,
+            "rpm": _google_ai_ocr_rpm,
+            "api_key_set": _google_ai_ocr_api_key is not None,
+        }
+    _save_settings()
+    return result
+
+
+@app.get("/GetGoogleAiOcrConfig")
+async def get_google_ai_ocr_config():
+    with _google_ai_ocr_config_lock:
+        return {
+            "model": _google_ai_ocr_model,
+            "rpm": _google_ai_ocr_rpm,
+            "api_key_set": _google_ai_ocr_api_key is not None,
+            "default_model": "gemini-2.5-flash-lite",
+            "free_tier_rpm_default": 5,
+        }
 
 # ===========================================================================
 # SetModelType Endpoint
@@ -2792,6 +5071,7 @@ async def set_model_type(req: SetModelTypeRequest):
             logging.info(f"[ModelType] Set to openrouter, model={_openrouter_model}")
         else:
             logging.info(f"[ModelType] Set to local (GGUF)")
+    _save_settings()
     return {
         "status": "ok",
         "model_type": _current_model_type,
@@ -2831,6 +5111,7 @@ async def set_cloud_mode(req: SetCloudModeRequest):
         # whatever they are currently set to (the client restores its own state).
         with _cloud_mode_lock:
             _cloud_mode = False
+        _save_settings()
         logging.info("[CloudMode] Disabled.")
         return {"status": "ok", "cloud_mode": False}
 
@@ -2863,6 +5144,7 @@ async def set_cloud_mode(req: SetCloudModeRequest):
     with _cloud_mode_lock:
         _cloud_mode = True
 
+    _save_settings()
     logging.info(f"[CloudMode] Enabled — lens OCR + OpenRouter ({active_model}) + no local inpainting.")
     return {
         "status": "ok",
@@ -2901,11 +5183,322 @@ async def set_openrouter_model(req: SetOpenRouterModelRequest):
         if req.api_key:
             _openrouter_api_key = req.api_key
         logging.info(f"[OpenRouter] Model changed to: {_openrouter_model}")
+    _save_settings()
     return {
         "status": "ok",
         "openrouter_model": _openrouter_model,
         "api_key_set": _openrouter_api_key is not None,
         "note": "This only takes effect when model_type is 'openrouter'. Use /SetModelType to switch."
+    }
+
+# ===========================================================================
+# OpenRouter Free-Mode Endpoints
+# ===========================================================================
+class SetOpenRouterFreeModeRequest(BaseModel):
+    enabled: bool
+
+@app.post("/SetOpenRouterFreeMode")
+async def set_openrouter_free_mode(req: SetOpenRouterFreeModeRequest):
+    global _openrouter_free_mode
+    with _openrouter_free_mode_lock:
+        _openrouter_free_mode = bool(req.enabled)
+        logging.info(f"[OpenRouter] Free mode (skip 429 retries) set to: {_openrouter_free_mode}")
+    _save_settings()
+    return {"status": "ok", "free_mode": _openrouter_free_mode}
+
+@app.get("/GetOpenRouterFreeMode")
+async def get_openrouter_free_mode():
+    with _openrouter_free_mode_lock:
+        return {"enabled": _openrouter_free_mode}
+
+# ===========================================================================
+# Context-Aware Mode Endpoints
+# ===========================================================================
+class SetContextAwareRequest(BaseModel):
+    enabled: bool
+
+@app.post("/SetContextAware")
+async def set_context_aware(req: SetContextAwareRequest):
+    global _context_aware_mode
+    with _context_aware_lock:
+        _context_aware_mode = bool(req.enabled)
+        logging.info(f"[ContextAware] Mode set to: {_context_aware_mode}")
+    _save_settings()
+    return {"status": "ok", "context_aware": _context_aware_mode}
+
+@app.get("/GetContextAware")
+async def get_context_aware():
+    with _context_aware_lock:
+        return {"enabled": _context_aware_mode}
+
+# ===========================================================================
+# SetAllSettings / GetAllSettings — unified settings push
+# ===========================================================================
+# The extension calls this on Translate to (re)apply the full settings payload
+# in one shot. This handles the cloud-mode-restart problem: if the backend was
+# restarted (resetting all in-memory globals to defaults) while cloud mode was
+# on in the extension, the next Translate click re-pushes the correct state
+# before the translation request goes out.
+#
+# All fields are optional — only the non-null ones are applied. Each field uses
+# the SAME internal logic (locks, validation, side effects like model download)
+# as the individual /Set* endpoints so behavior is identical.
+class SetAllSettingsRequest(BaseModel):
+    cloud_mode: Optional[bool] = None
+    ocr_mode: Optional[str] = None
+    inpaint_mode: Optional[str] = None
+    model_type: Optional[str] = None
+    openrouter_model: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    openai_ocr_endpoint: Optional[str] = None
+    openai_ocr_model: Optional[str] = None
+    openai_ocr_api_key: Optional[str] = None
+    google_ai_ocr_api_key: Optional[str] = None
+    google_ai_ocr_model: Optional[str] = None
+    google_ai_ocr_rpm: Optional[int] = None
+    font_filename: Optional[str] = None
+    stroke_width: Optional[int] = None
+    free_openrouter: Optional[bool] = None
+    context_aware: Optional[bool] = None
+    # Note: skip_sfx is per-job (passed to /v1/translate), not a global setting,
+    # so it's not included here.
+
+@app.post("/SetAllSettings")
+async def set_all_settings(req: SetAllSettingsRequest):
+    global _cloud_mode, _ocr_mode, _inpaint_mode
+    global _current_model_type, _openrouter_api_key, _openrouter_model
+    global _openai_ocr_endpoint, _openai_ocr_model, _openai_ocr_api_key
+    global _google_ai_ocr_api_key, _google_ai_ocr_model, _google_ai_ocr_rpm
+    global _current_font_path, _current_stroke_width, _openrouter_free_mode
+    applied = {}
+
+    # ── Cloud mode (when forcing on, applies the cloud-forced state) ──
+    if req.cloud_mode is True:
+        if LensAPI is None:
+            raise HTTPException(500, "chrome-lens-py not installed. Run: pip install chrome-lens-py")
+        try:
+            get_lens_api()
+        except Exception as e:
+            raise HTTPException(500, f"Failed to initialize Google Lens API: {e}")
+        with _model_type_lock:
+            if req.openrouter_model:
+                _openrouter_model = req.openrouter_model.strip()
+            if req.openrouter_api_key:
+                _openrouter_api_key = req.openrouter_api_key
+            if not _openrouter_api_key:
+                raise HTTPException(
+                    400,
+                    "Cloud mode needs an OpenRouter API key. Set one once via the model "
+                    "box (or pass api_key here) — it is then reused automatically."
+                )
+            _current_model_type = "openrouter"
+        with _ocr_mode_lock:
+            _ocr_mode = "lens"
+        with _inpaint_mode_lock:
+            _inpaint_mode = "none"
+        with _cloud_mode_lock:
+            _cloud_mode = True
+        applied["cloud_mode"] = True
+        applied["ocr_mode"] = "lens"
+        applied["inpaint_mode"] = "none"
+        applied["model_type"] = "openrouter"
+        applied["openrouter_model"] = _openrouter_model
+    elif req.cloud_mode is False:
+        with _cloud_mode_lock:
+            _cloud_mode = False
+        applied["cloud_mode"] = False
+
+    # ── OpenAI-compatible OCR configuration ──
+    if (req.openai_ocr_endpoint is not None or req.openai_ocr_model is not None
+            or req.openai_ocr_api_key is not None):
+        with _openai_ocr_config_lock:
+            if req.openai_ocr_endpoint is not None:
+                endpoint = _normalize_chat_completions_endpoint(req.openai_ocr_endpoint)
+                if not endpoint.startswith(("http://", "https://")):
+                    raise HTTPException(400, "openai_ocr_endpoint must be an http:// or https:// URL")
+                _openai_ocr_endpoint = endpoint
+            if req.openai_ocr_model is not None:
+                model = req.openai_ocr_model.strip()
+                if not model:
+                    raise HTTPException(400, "openai_ocr_model cannot be empty")
+                _openai_ocr_model = model
+            if req.openai_ocr_api_key is not None:
+                _openai_ocr_api_key = req.openai_ocr_api_key.strip() or None
+            applied["openai_ocr_endpoint"] = _openai_ocr_endpoint
+            applied["openai_ocr_model"] = _openai_ocr_model
+            applied["openai_ocr_api_key_set"] = _openai_ocr_api_key is not None
+
+    # ── Google AI Studio OCR configuration ──
+    if (req.google_ai_ocr_api_key is not None or req.google_ai_ocr_model is not None
+            or req.google_ai_ocr_rpm is not None):
+        with _google_ai_ocr_config_lock:
+            if req.google_ai_ocr_api_key is not None:
+                _google_ai_ocr_api_key = req.google_ai_ocr_api_key.strip() or None
+            if req.google_ai_ocr_model is not None:
+                model = _normalize_gemini_model(req.google_ai_ocr_model)
+                if not model:
+                    raise HTTPException(400, "google_ai_ocr_model cannot be empty")
+                _google_ai_ocr_model = model
+            if req.google_ai_ocr_rpm is not None:
+                if not 1 <= req.google_ai_ocr_rpm <= 15:
+                    raise HTTPException(400, "google_ai_ocr_rpm must be between 1 and 15")
+                _google_ai_ocr_rpm = int(req.google_ai_ocr_rpm)
+            applied["google_ai_ocr_model"] = _google_ai_ocr_model
+            applied["google_ai_ocr_rpm"] = _google_ai_ocr_rpm
+            applied["google_ai_ocr_api_key_set"] = _google_ai_ocr_api_key is not None
+
+    # ── OCR mode (skip if cloud mode just forced it) ──
+    if req.ocr_mode is not None and req.cloud_mode is not True:
+        mode = req.ocr_mode.lower().strip()
+        if mode not in ("hayai", "glm", "lens", "openai_endpoint", "google_ai", "local_vision"):
+            raise HTTPException(400, "ocr_mode must be 'hayai', 'glm', 'lens', 'openai_endpoint', 'google_ai', or 'local_vision'")
+        if mode == "local_vision" and _selected_vision_model() is None:
+            raise HTTPException(400, "Local GGUF OCR requires a selected GGUF model with a compatible mmproj/projector")
+        if mode == "lens" and LensAPI is None:
+            raise HTTPException(500, "chrome-lens-py not installed for lens OCR")
+        if mode == "lens":
+            try:
+                get_lens_api()
+            except Exception as e:
+                raise HTTPException(500, f"Failed to initialize Google Lens API: {e}")
+        if mode == "openai_endpoint":
+            with _openai_ocr_config_lock:
+                if not _openai_ocr_endpoint or not _openai_ocr_model:
+                    raise HTTPException(400, "OpenAI Endpoint OCR needs an endpoint URL and model ID")
+        if mode == "google_ai":
+            with _google_ai_ocr_config_lock:
+                if not _google_ai_ocr_api_key or not _google_ai_ocr_model:
+                    raise HTTPException(400, "Google AI Studio OCR needs an API key and model")
+        with _ocr_mode_lock:
+            _ocr_mode = mode
+        applied["ocr_mode"] = mode
+
+    # ── Inpaint mode (skip if cloud mode just forced it) ──
+    if req.inpaint_mode is not None and req.cloud_mode is not True:
+        mode = req.inpaint_mode.lower().strip()
+        if mode not in ("low", "high", "none"):
+            raise HTTPException(400, "inpaint_mode must be 'low', 'high', or 'none'")
+        if mode == "high":
+            try:
+                ensure_lama_large()
+            except Exception as e:
+                raise HTTPException(500, f"Failed to download high-quality inpainting model: {e}")
+        with _inpaint_mode_lock:
+            _inpaint_mode = mode
+        applied["inpaint_mode"] = mode
+
+    # ── Model type + openrouter config (skip if cloud mode just forced it) ──
+    if req.model_type is not None and req.cloud_mode is not True:
+        mt = req.model_type.lower().strip()
+        if mt not in ("local", "openrouter"):
+            raise HTTPException(400, "model_type must be 'local' or 'openrouter'")
+        with _model_type_lock:
+            _current_model_type = mt
+            if mt == "openrouter":
+                if req.openrouter_api_key is not None:
+                    _openrouter_api_key = req.openrouter_api_key
+                if not _openrouter_api_key:
+                    raise HTTPException(400, "OpenRouter API key is required for openrouter model_type.")
+                if req.openrouter_model is not None:
+                    _openrouter_model = req.openrouter_model.strip()
+        applied["model_type"] = mt
+    else:
+        # Even in cloud mode or when not switching model_type, allow the
+        # openrouter model/key to be updated if provided.
+        if req.openrouter_model is not None or req.openrouter_api_key is not None:
+            with _model_type_lock:
+                if req.openrouter_model is not None:
+                    _openrouter_model = req.openrouter_model.strip()
+                if req.openrouter_api_key is not None:
+                    _openrouter_api_key = req.openrouter_api_key
+            applied["openrouter_model"] = _openrouter_model
+
+    # ── Font (filename) ──
+    if req.font_filename is not None:
+        req_font_name = req.font_filename.strip().lower()
+        available_fonts = list_available_fonts()
+        matched_font = None
+        for f in available_fonts:
+            if f["filename"].lower() == req_font_name or f["name"].lower() == req_font_name:
+                matched_font = f
+                break
+        if not matched_font:
+            # Not fatal — keep the current font, just warn.
+            logging.warning(f"[SetAllSettings] Font '{req.font_filename}' not found; keeping current font.")
+        else:
+            with _font_config_lock:
+                _current_font_path = pathlib.Path(matched_font["path"])
+                clear_font_cache()
+            applied["font_filename"] = matched_font["filename"]
+
+    # ── Stroke width ──
+    if req.stroke_width is not None:
+        sw = max(0, min(20, int(req.stroke_width)))
+        with _font_config_lock:
+            _current_stroke_width = sw
+        applied["stroke_width"] = sw
+
+    # ── OpenRouter free mode ──
+    if req.free_openrouter is not None:
+        with _openrouter_free_mode_lock:
+            _openrouter_free_mode = bool(req.free_openrouter)
+        applied["free_openrouter"] = _openrouter_free_mode
+
+    # ── Context-aware mode ──
+    if req.context_aware is not None:
+        with _context_aware_lock:
+            _context_aware_mode = bool(req.context_aware)
+        applied["context_aware"] = _context_aware_mode
+
+    logging.info(f"[SetAllSettings] Applied: {applied}")
+    _save_settings()
+    return {"status": "ok", "applied": applied}
+
+@app.get("/GetAllSettings")
+async def get_all_settings():
+    with _ocr_mode_lock:
+        ocr_mode = _ocr_mode
+    with _inpaint_mode_lock:
+        inpaint_mode = _inpaint_mode
+    with _cloud_mode_lock:
+        cloud_mode = _cloud_mode
+    with _model_type_lock:
+        model_type = _current_model_type
+        openrouter_model = _openrouter_model
+        openrouter_configured = _openrouter_api_key is not None
+    with _font_config_lock:
+        font_path = str(_current_font_path)
+        stroke_width = _current_stroke_width
+    with _openrouter_free_mode_lock:
+        free_mode = _openrouter_free_mode
+    with _openai_ocr_config_lock:
+        openai_ocr_endpoint = _openai_ocr_endpoint
+        openai_ocr_model = _openai_ocr_model
+        openai_ocr_api_key_set = _openai_ocr_api_key is not None
+    with _google_ai_ocr_config_lock:
+        google_ai_ocr_model = _google_ai_ocr_model
+        google_ai_ocr_rpm = _google_ai_ocr_rpm
+        google_ai_ocr_api_key_set = _google_ai_ocr_api_key is not None
+    with _context_aware_lock:
+        context_aware = _context_aware_mode
+    return {
+        "cloud_mode": cloud_mode,
+        "ocr_mode": ocr_mode,
+        "openai_ocr_endpoint": openai_ocr_endpoint,
+        "openai_ocr_model": openai_ocr_model,
+        "openai_ocr_api_key_set": openai_ocr_api_key_set,
+        "google_ai_ocr_model": google_ai_ocr_model,
+        "google_ai_ocr_rpm": google_ai_ocr_rpm,
+        "google_ai_ocr_api_key_set": google_ai_ocr_api_key_set,
+        "inpaint_mode": inpaint_mode,
+        "model_type": model_type,
+        "openrouter_model": openrouter_model,
+        "openrouter_configured": openrouter_configured,
+        "font_path": font_path,
+        "stroke_width": stroke_width,
+        "free_openrouter": free_mode,
+        "context_aware": context_aware,
+        "lens_available": LensAPI is not None,
     }
 
 # ===========================================================================
@@ -2925,6 +5518,10 @@ async def meta():
         inpaint_mode = _inpaint_mode
     with _ocr_mode_lock:
         ocr_mode = _ocr_mode
+    with _openrouter_free_mode_lock:
+        free_mode = _openrouter_free_mode
+    with _context_aware_lock:
+        context_aware = _context_aware_mode
     return {
         "version": BUILD_ID,
         "cuda": has_cuda(),
@@ -2941,6 +5538,8 @@ async def meta():
         "inpaint_mode": inpaint_mode,
         "inpaint_high_model_downloaded": LAMA_LARGE_PATH.exists(),
         "inpaint_high_model_path": str(LAMA_LARGE_PATH),
+        "openrouter_free_mode": free_mode,
+        "context_aware": context_aware,
     }
 
 @app.post("/warmup")
@@ -3198,11 +5797,34 @@ async def getmodel():
             }
         return result
 
+class ChangeModelRequest(BaseModel):
+    repo_id: str
+    filename: Optional[str] = None
+
+
 @app.post("/v1/changemodel")
-async def change_model(repo_id: str = Form(...), filename: Optional[str] = Form(None)):
+async def change_model(req: ChangeModelRequest):
+    global _current_model_type, _inpaint_mode
+    repo_id = req.repo_id.strip()
+    filename = req.filename.strip() if req.filename else None
+    if not repo_id:
+        raise HTTPException(400, "repo_id is required")
     try:
         switch_qwen_model(repo_id, filename)
-        return {"status": "ok", "repo_id": repo_id, "filename": filename}
+        with _model_type_lock:
+            _current_model_type = "local"
+        with _inpaint_mode_lock:
+            _inpaint_mode = "low"
+        _save_settings()
+        selected = _selected_vision_model()
+        return {
+            "status": "ok",
+            "repo_id": _current_qwen_repo_id,
+            "filename": _current_qwen_filename,
+            "model_type": "local",
+            "vision_capable": selected is not None,
+            "projector_filename": selected.get("projector_filename") if selected else None,
+        }
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -3251,16 +5873,57 @@ async def create_translate_job(
     image: UploadFile = File(...),
     target_lang: str = Form(DEFAULT_LANG),
     ocr_lang: str = Form("ja"),
+    source_lang: Optional[str] = Form(None),
+    src_lang: Optional[str] = Form(None),
+    sl: Optional[str] = Form(None),
     inpaint: bool = Form(True),
+    skip_sfx: bool = Form(False),
+    context_aware: bool = Form(False),
+    context_level: str = Form("low"),
+    style_aware: bool = Form(False),
+    style_fonts: str = Form(""),
 ):
-    """Create a new translation job.
-    
-    - inpaint: If true, erase original text via inpainting before overlaying translations.
-               If false, overlay translations directly on top of the original text.
-    """
+    # ── Source-language priority: accept the source language from any
+    # common field name the extension might use. If none are provided,
+    # default to "auto" instead of "ja" so OpenRouter and the OCR engine
+    # auto-detect the language rather than forcing Japanese.
+    effective_ocr_lang = _effective_ocr_language(
+        target_lang, source_lang, src_lang, sl, ocr_lang
+    )
+    if _norm_lang(effective_ocr_lang) == "auto" and any(
+        _norm_lang(value) == _norm_lang(target_lang)
+        for value in (source_lang, src_lang, sl, ocr_lang)
+        if value
+    ):
+        logging.warning(
+            f"[Translate] Source and target are both {target_lang!r}; "
+            "using automatic OCR language detection."
+        )
+    logging.info(
+        f"[Translate] target_lang={target_lang!r} "
+        f"ocr_lang(raw)={ocr_lang!r} effective={effective_ocr_lang!r}"
+    )
+    ocr_lang = effective_ocr_lang
+
     job_id = str(uuid.uuid4())[:8]
     contents = await image.read()
     pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+
+    level = "high" if str(context_level).lower() == "high" else "low"
+    # High mode rides on a vision request, which only the OpenRouter backend
+    # can make. On the local GGUF backend it silently degrades to low.
+    with _model_type_lock:
+        backend_is_openrouter = _current_model_type == "openrouter"
+    if level == "high" and not backend_is_openrouter:
+        logging.info(f"[Job {job_id}] Context level 'high' requires the OpenRouter "
+                     f"backend; falling back to 'low'.")
+        level = "low"
+    style_font_map = _parse_style_fonts(style_fonts)
+    style_on = bool(style_aware) and level == "high"
+    with _ocr_mode_lock:
+        job_ocr_mode = _ocr_mode
+    with _model_type_lock:
+        job_model_type = _current_model_type
 
     async with _job_lock:
         _jobs[job_id] = {
@@ -3269,14 +5932,22 @@ async def create_translate_job(
             "image": pil_img,
             "target_lang": target_lang,
             "ocr_lang": ocr_lang,
+            "ocr_mode": job_ocr_mode,
+            "model_type": job_model_type,
             "inpaint": inpaint,
+            "skip_sfx": skip_sfx,
+            "context_aware": context_aware,
+            "context_level": level,
+            "style_aware": style_on,
+            "style_fonts": style_font_map,
             "result": None,
             "error": None,
             "created": time.time(),
         }
 
     asyncio.create_task(_process_job(job_id))
-    return {"job_id": job_id, "status": "pending", "inpaint": inpaint}
+    return {"job_id": job_id, "status": "pending", "inpaint": inpaint, "skip_sfx": skip_sfx,
+            "context_aware": context_aware, "context_level": level, "style_aware": style_on}
 
 
 async def _process_job(job_id: str):
@@ -3291,17 +5962,22 @@ async def _process_job(job_id: str):
         if not job:
             return
         job["status"] = "processing"
-        with _ocr_mode_lock:
-            job["ocr_mode"] = _ocr_mode
 
     try:
         pil_img = job["image"]
         target_lang = job["target_lang"]
         ocr_lang = job["ocr_lang"]
 
-        ocr_results = await get_ocr_results(pil_img, ocr_lang)
+        ocr_results = await get_ocr_results(pil_img, ocr_lang, job.get("ocr_mode"))
+        logging.info(
+            f"[Job {job_id}] OCR mode={job.get('ocr_mode')} produced "
+            f"{len(ocr_results)} renderable region(s)."
+        )
 
         if not ocr_results:
+            logging.warning(
+                f"[Job {job_id}] OCR produced no regions; returning the original image unchanged."
+            )
             async with _job_lock:
                 job["status"] = "completed"
                 job["result"] = {"boxes": [], "translations": []}
@@ -3310,12 +5986,99 @@ async def _process_job(job_id: str):
         texts_to_translate = [item["text"] for item in ocr_results]
         translations = []
 
-        with _model_type_lock:
-            model_type = _current_model_type
+        # Classify each OCR region as SFX once, up front. The result is attached
+        # to every translation entry so the renderer can skip SFX overlay when
+        # the job's skip_sfx flag is set. Classification is cheap (pure
+        # arithmetic + regex on the bbox/text) so it's fine to always compute
+        # it, even when skip_sfx is False.
+        sfx_flags: List[Dict[str, Any]] = []
+        skip_sfx = job.get("skip_sfx", False)
+        for item in ocr_results:
+            is_sfx, score, reasons = detect_sfx(pil_img, item["bbox"], item["text"])
+            sfx_flags.append({"is_sfx": is_sfx, "score": score, "reasons": reasons})
+            if is_sfx:
+                logging.info(f"[Job {job_id}] SFX detected (score={score}): "
+                             f"'{item['text'][:40]}' bbox={item['bbox']} reasons={reasons}")
+
+        # ── Context-aware two-pass: build a name dictionary ONCE per job ──
+        # Adds ~1 extra LLM/OpenRouter call + ~200-600 tokens when enabled.
+        # Per-job context_aware (from FormData) takes precedence; fall back to
+        # the global toggle so /SetContextAware still works as a default.
+        with _context_aware_lock:
+            global_ca = _context_aware_mode
+        context_aware = job.get("context_aware", False) or global_ca
+        name_map: Dict[str, str] = {}
+        if context_aware and texts_to_translate:
+            src_lang_name = _translation_source_name(ocr_lang, target_lang)
+            lang_name = get_lang_name(target_lang)
+            with _model_type_lock:
+                model_type_for_names = _current_model_type
+                or_model_for_names = _openrouter_model
+                or_key_for_names = _openrouter_api_key
+            try:
+                if model_type_for_names == "openrouter" and or_key_for_names:
+                    name_map = await _build_name_map_openrouter(
+                        texts_to_translate, src_lang_name, lang_name,
+                        or_key_for_names, or_model_for_names,
+                    )
+                else:
+                    llm_for_names = get_qwen()
+                    if llm_for_names:
+                        loop = asyncio.get_event_loop()
+                        name_map = await loop.run_in_executor(
+                            _llm_executor,
+                            _build_name_map_llm,
+                            texts_to_translate, src_lang_name, lang_name, llm_for_names,
+                        )
+            except Exception as e:
+                logging.warning(f"[Job {job_id}] Context-aware name-map build failed: {e}")
+
+        # ── Style-aware: the batch translator writes a per-line lettering-style
+        # tag into this parallel list. It stays index-aligned with
+        # texts_to_translate; entries the model didn't tag (or that failed
+        # validation) stay None.
+        style_aware = bool(job.get("style_aware", False))
+        style_fonts = job.get("style_fonts", {}) or {}
+        styles: List[Optional[Dict[str, Any]]] = [None] * len(texts_to_translate)
+
+        def _style_fields(idx: int) -> Dict[str, Any]:
+            entry = styles[idx] if (style_aware and idx < len(styles)) else None
+            if not entry:
+                return {"style": None, "weight": 0, "glow": False}
+            return {
+                "style": entry.get("style"),
+                "weight": entry.get("weight", 0),
+                "glow": bool(entry.get("glow", False)),
+            }
+
+        def _tilt_fields(idx: int) -> Dict[str, Any]:
+            """Carry the OCR tilt through to the renderer. Non-Lens paths have none."""
+            box = ocr_results[idx] if idx < len(ocr_results) else {}
+            angle = float(box.get("angle", 0.0) or 0.0)
+            angles = box.get("angles")
+            if not angles:
+                angles = [angle] * len(box.get("bboxes", [box.get("bbox")]))
+            return {"angle": angle, "angles": angles}
+
+        def _ocr_attr_fields(idx: int) -> Dict[str, Any]:
+            """Carry vision-OCR overlay attributes through to the renderer."""
+            box = ocr_results[idx] if idx < len(ocr_results) else {}
+            out: Dict[str, Any] = {}
+            for k in ("or_color", "or_glow", "or_style", "or_bold", "or_font_px"):
+                if k in box:
+                    out[k] = box[k]
+            return out
+
+        model_type = job.get("model_type", "local")
 
         if model_type == "openrouter":
             logging.info(f"[Job {job_id}] Using OpenRouter BATCH strategy for {len(texts_to_translate)} boxes.")
-            batch_results = await openrouter_translate_batch(texts_to_translate, target_lang, ocr_lang)
+            batch_results = await openrouter_translate_batch(
+                texts_to_translate, target_lang, ocr_lang,
+                context_aware=context_aware, name_map=name_map,
+                style_aware=style_aware, styles_out=styles,
+                page_image=pil_img if style_aware else None,
+            )
 
             needs_sequential_fallback = not any(batch_results)
 
@@ -3328,6 +6091,10 @@ async def _process_job(job_id: str):
                         translations.append({
                             "text": text, "translation": "",
                             "bbox": ocr_bbox, "bboxes": ocr_bboxes,
+                            "is_sfx": sfx_flags[idx]["is_sfx"],
+                            **_style_fields(idx),
+                            **_tilt_fields(idx),
+                            **_ocr_attr_fields(idx),
                         })
                         continue
                     translated = await openrouter_translate(text, target_lang, ocr_lang)
@@ -3337,6 +6104,10 @@ async def _process_job(job_id: str):
                         "translation": translated,
                         "bbox": ocr_bbox,
                         "bboxes": ocr_bboxes,
+                        "is_sfx": sfx_flags[idx]["is_sfx"],
+                        **_style_fields(idx),
+                        **_tilt_fields(idx),
+                        **_ocr_attr_fields(idx),
                     })
             else:
                 for idx, text in enumerate(texts_to_translate):
@@ -3353,12 +6124,21 @@ async def _process_job(job_id: str):
                         "translation": translated,
                         "bbox": ocr_bbox,
                         "bboxes": ocr_bboxes,
+                        "is_sfx": sfx_flags[idx]["is_sfx"],
+                        **_style_fields(idx),
+                        **_tilt_fields(idx),
+                        **_ocr_attr_fields(idx),
                     })
         else:
             # --- BATCH STRATEGY FOR LOCAL GGUF ---
-            logging.info(f"[Job {job_id}] Using Local BATCH strategy for {len(texts_to_translate)} boxes.")
-            loop = asyncio.get_event_loop()
-            batch_results = await loop.run_in_executor(_llm_executor, qwen_translate_batch, texts_to_translate, target_lang, ocr_lang)
+            logging.info(f"[Job {job_id}] Using Local GGUF BATCH strategy for {len(texts_to_translate)} boxes.")
+            await asyncio.get_running_loop().run_in_executor(_llm_executor, get_qwen)
+            logging.info(f"[Job {job_id}] Local GGUF ready: {_current_qwen_repo_id}/{_current_qwen_filename}")
+            batch_results = await asyncio.get_running_loop().run_in_executor(
+                _llm_executor, qwen_translate_batch,
+                texts_to_translate, target_lang, ocr_lang, context_aware, name_map,
+                None,
+            )
 
             for idx, text in enumerate(texts_to_translate):
                 ocr_bbox = ocr_results[idx]["bbox"]
@@ -3368,13 +6148,61 @@ async def _process_job(job_id: str):
                     "translation": batch_results[idx] if batch_results[idx] else "",
                     "bbox": ocr_bbox,
                     "bboxes": ocr_bboxes,
+                    "is_sfx": sfx_flags[idx]["is_sfx"],
+                    **_style_fields(idx),
+                    **_tilt_fields(idx),
+                    **_ocr_attr_fields(idx),
                 })
+
+        # Fail closed at the job boundary. Provider parsing success does not
+        # guarantee that a candidate was translated rather than echoed.
+        rejected_count = 0
+        for entry in translations:
+            source = entry.get("text", "")
+            candidate = entry.get("translation", "")
+            validated = _validated_translation(source, candidate, target_lang)
+            if candidate and not validated:
+                rejected_count += 1
+                logging.warning(
+                    f"[Job {job_id}] Rejected untranslated/source-like output: "
+                    f"source={source[:40]!r}, output={candidate[:40]!r}"
+                )
+            entry["translation"] = validated
+            entry["render_text"] = validated
+        if rejected_count:
+            logging.warning(
+                f"[Job {job_id}] Rejected {rejected_count}/{len(translations)} "
+                f"parsed outputs before rendering."
+            )
+        renderable_count = sum(
+            1 for entry in translations
+            if _render_translation_text(entry, target_lang)
+        )
+        logging.info(
+            f"[Job {job_id}] Translation pipeline produced {renderable_count}/"
+            f"{len(translations)} renderable overlay(s)."
+        )
+        if translations and not renderable_count:
+            logging.error(
+                f"[Job {job_id}] All translations were rejected or empty; "
+                f"the rendered image will be unchanged."
+            )
+
+        # Honorifics are handled inline by the always-on HONORIFIC_CLAUSE in the
+        # translation prompt (romanized straight from the OCR source text). No
+        # mechanical post-process reinsertion.
 
         async with _job_lock:
             job["status"] = "completed"
             job["result"] = {
                 "boxes": ocr_results,
                 "translations": translations,
+                "sfx_flags": sfx_flags,
+                "skip_sfx": skip_sfx,
+                "name_map": name_map if context_aware else {},
+                "context_aware": context_aware,
+                "style_aware": style_aware,
+                "style_fonts": style_fonts,
             }
 
     except Exception as e:
@@ -3403,6 +6231,15 @@ async def get_translate_job(job_id: str):
         return result
 
 
+def _render_translation_text(item: Dict[str, Any], target_lang: str) -> str:
+    render_text = clean_text_for_font(item.get("render_text", ""))
+    if not render_text:
+        return ""
+    if not _looks_like_target(render_text, target_lang):
+        return ""
+    return render_text
+
+
 @app.post("/v1/translate/{job_id}/image")
 async def get_translated_image(job_id: str):
     """Generate the final translated image.
@@ -3425,6 +6262,9 @@ async def get_translated_image(job_id: str):
         translations = job["result"].get("translations", [])
         do_inpaint = job.get("inpaint", True)
         ocr_mode = job.get("ocr_mode", _ocr_mode)
+        skip_sfx = job.get("skip_sfx", False)
+        style_aware = bool(job["result"].get("style_aware", False))
+        style_fonts = job["result"].get("style_fonts", {}) or {}
 
     if not translations:
         buf = io.BytesIO()
@@ -3435,31 +6275,98 @@ async def get_translated_image(job_id: str):
     h, w = img_bgr.shape[:2]
 
     boxes_to_inpaint = []
+    inpaint_angles = []
     items_to_draw = []
 
     # ── Collect inpaint boxes (all original sub-boxes) and draw items (union bbox) ──
-    for item in translations:
-        text = item.get("translation", "")
-        if not text or not text.strip():
+    for t_idx, item in enumerate(translations):
+        source_text = item.get("text", "")
+        translated_text = _render_translation_text(item, job["target_lang"])
+        if not translated_text:
+            logging.warning(
+                f"[Render] Box {t_idx + 1}/{len(translations)} has no valid translation text "
+                f"(source='{source_text[:40]}') — nothing to overlay."
+            )
             continue
         bbox = item.get("bbox")
         if not bbox:
+            logging.warning(
+                f"[Render] Box {t_idx + 1}/{len(translations)} has no bbox — skipping overlay."
+            )
+            continue
+
+        # ── SFX skip: when the job requests skip_sfx and this region was
+        # classified as SFX, leave the original art completely untouched —
+        # no inpainting, no overlay. This is the fix for Google Lens merging
+        # SFX + dialogue into one giant region that then gets wiped by the
+        # 'none'-mode bg-color fill.
+        if skip_sfx and item.get("is_sfx"):
+            logging.info(f"[Render] Skipping SFX overlay for '{translated_text[:40]}' at {bbox}")
             continue
 
         bboxes = item.get("bboxes", [bbox])
-        for bx in bboxes:
+        item_angle = float(item.get("angle", 0.0) or 0.0)
+        sub_angles = item.get("angles") or []
+        for bx_idx, bx in enumerate(bboxes):
             bx1, by1, bx2, by2 = bx
             if (bx2 - bx1) < 10 or (by2 - by1) < 10:
                 continue
             boxes_to_inpaint.append(bx)
+            sub_angle = sub_angles[bx_idx] if bx_idx < len(sub_angles) else item_angle
+            inpaint_angles.append(float(sub_angle or 0.0))
 
         x1, y1, x2, y2 = bbox
         if (x2 - x1) < 10 or (y2 - y1) < 10:
+            logging.warning(
+                f"[Render] Box {t_idx + 1}/{len(translations)} too small to overlay "
+                f"({x2 - x1}x{y2 - y1}px at {bbox}) — translation '{translated_text[:40]}' dropped."
+            )
             continue
+
+        # ── Duplicate-overlay guard ──
+        # OCR can hand us several near-identical regions carrying the same
+        # string (YOLO detections without NMS, or Lens returning overlapping
+        # paragraphs). Nothing downstream deduplicates, so the renderer would
+        # stack N copies of the same overlay on the same spot. Drop a candidate
+        # only when the text matches AND the box substantially coincides with
+        # one already collected — a legitimately repeated line elsewhere on the
+        # page has a low IoU and still gets drawn.
+        # This applies to items_to_draw only: the boxes_to_inpaint fan-out above
+        # is intentional, since inpainting must erase every original glyph run.
+        norm_translation = translated_text.strip()
+        is_duplicate = False
+        for prev in items_to_draw:
+            if prev["translated_text"].strip() != norm_translation:
+                continue
+            if _bbox_iou(prev["bbox"], bbox) >= DUPLICATE_OVERLAY_IOU:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            logging.info(f"[Render] Skipping duplicate overlay for '{norm_translation[:40]}' at {bbox}")
+            continue
+
         items_to_draw.append({
-            "translation": text,
+            "translated_text": translated_text,
             "bbox": bbox,
+            "style": item.get("style"),
+            "weight": item.get("weight", 0),
+            "glow": bool(item.get("glow", False)),
+            "angle": item_angle,
+            "or_color": item.get("or_color"),
+            "or_glow": item.get("or_glow"),
+            "or_style": item.get("or_style"),
+            "or_bold": item.get("or_bold"),
+            "or_font_px": item.get("or_font_px"),
         })
+
+    if len(items_to_draw) != len(translations):
+        logging.warning(
+            f"[Render] Overlaying {len(items_to_draw)}/{len(translations)} boxes — "
+            f"{len(translations) - len(items_to_draw)} dropped (see [Render] lines above). "
+            f"skip_sfx={skip_sfx}"
+        )
+    else:
+        logging.info(f"[Render] Overlaying all {len(items_to_draw)} boxes.")
 
     # ── Detect text/background colors FIRST (from original image) ──
     # This must happen before any inpainting/filling so the colors are
@@ -3469,6 +6376,23 @@ async def get_translated_image(job_id: str):
     all_bboxes_for_color = [item["bbox"] for item in items_to_draw]
     all_box_colors = detect_text_colors_batch(orig_bgr, all_bboxes_for_color)
     color_by_idx = {i: all_box_colors[i] for i in range(len(items_to_draw))}
+    # Vision-OCR text-color override: replace only the detected text color
+    # with the model-provided hex; keep the auto-detected bg for the outline.
+    for _ci, _it in enumerate(items_to_draw):
+        _or_rgb = _hex_to_rgb(_it.get("or_color"))
+        if _or_rgb is not None:
+            _det_text, _det_bg = color_by_idx[_ci]
+            color_by_idx[_ci] = (_or_rgb, _det_bg)
+
+    # ── High mode: measure the ORIGINAL lettering height per region ──
+    # style_aware ("high" context) means we already have the page image, so we
+    # measure how tall the source text was actually drawn and size the overlay
+    # to match instead of guessing from the bubble. Only computed in high mode
+    # to avoid the extra per-box work on the standard path.
+    glyph_h_by_idx: Dict[int, Optional[float]] = {}
+    if style_aware or ocr_mode == "local_vision":
+        for i, item in enumerate(items_to_draw):
+            glyph_h_by_idx[i] = measure_source_glyph_height(orig_bgr, item["bbox"])
 
     # ── Get inpaint mode ──
     with _inpaint_mode_lock:
@@ -3487,8 +6411,15 @@ async def get_translated_image(job_id: str):
             for item_idx, item in enumerate(items_to_draw):
                 _, bg_color = color_by_idx[item_idx]
                 bx1, by1, bx2, by2 = item["bbox"]
-                # Fill the union bbox with the detected background color
-                draw_fill.rectangle([bx1, by1, bx2, by2], fill=bg_color)
+                fill_angle = float(item.get("angle", 0.0) or 0.0)
+                if fill_angle:
+                    draw_fill.polygon(
+                        _rotated_box_points((bx1, by1, bx2, by2), fill_angle),
+                        fill=bg_color,
+                    )
+                else:
+                    # Fill the union bbox with the detected background color
+                    draw_fill.rectangle([bx1, by1, bx2, by2], fill=bg_color)
             img_bgr = pil_to_cv2(out_pil_temp)
             logging.info(f"[Inpaint] None-mode background fill complete for {len(items_to_draw)} regions.")
         else:
@@ -3500,6 +6431,7 @@ async def get_translated_image(job_id: str):
                 boxes_to_inpaint,
                 padding=2,
                 dilate_kernel=3,
+                angles=inpaint_angles,
             )
             use_lama = inpaint_mode == "high" or SimpleLama is not None
             img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
@@ -3511,20 +6443,38 @@ async def get_translated_image(job_id: str):
     with _font_config_lock:
         fp = str(_current_font_path)
 
+    # ── Per-style font resolution ──
+    # High-mode style awareness lets the user pick a font per lettering bucket.
+    # An unset bucket, an unknown style, or a filename that is no longer on disk
+    # all fall back to the globally configured font.
+    _style_font_cache: Dict[str, str] = {}
+
+    def _font_for_style(style: Optional[str]) -> str:
+        if not style:
+            return fp
+        if style in _style_font_cache:
+            return _style_font_cache[style]
+        resolved = fp
+        name = (style_fonts.get(style) or "").strip()
+        if name:
+            candidate = FONT_DIR / os.path.basename(name)
+            if candidate.is_file():
+                resolved = str(candidate)
+            else:
+                logging.warning(f"[Style] Font for '{style}' not found on disk: {name!r} — using main font.")
+        _style_font_cache[style] = resolved
+        return resolved
+
     # ── Font size limits ──
-    # Sizing is proportional to each bubble instead of a fixed clamp: large
-    # bubbles host large text, tight bubbles shrink to fit. But there is a hard
-    # readability floor — text is never rendered below ABS_MIN_SIZE even if that
-    # means it slightly overflows a very small bubble. Unreadably tiny text is
-    # worse than a little overflow (the character-break pass below keeps the
-    # overflow contained to width).
-    ABS_MIN_SIZE = 17   # readability floor — never render text smaller than this
-    ABS_MAX_SIZE = 40   # ceiling — keep text from ballooning in large bubbles
+    # The region geometry, not a fixed policy cap, determines the largest font.
+    # The fitter searches upward and keeps the largest complete wrapped block
+    # that fits, while preserving a readable minimum for dense regions.
+    ABS_MIN_SIZE = 17
 
     is_lens = (ocr_mode == "lens")
 
     for item_idx, item in enumerate(items_to_draw):
-        text = item["translation"]
+        translated_text = item["translated_text"]
         bbox = item["bbox"]
         x1, y1, x2, y2 = bbox
         box_w = x2 - x1
@@ -3532,29 +6482,33 @@ async def get_translated_image(job_id: str):
 
         text_color, bg_color = color_by_idx[item_idx]
 
-        # ── Inner box padding ratio ──
-        # 0.10 (10% per side) for standard OCR to keep text away from edges.
-        # 0.0 (no padding) for Google Lens so text fills the ENTIRE region.
-        if is_lens:
-            INNER_PADDING_RATIO = 0.0
-        else:
-            INNER_PADDING_RATIO = 0.10
+        # Use the complete OCR bbox for wrapping and sizing.
+        INNER_PADDING_RATIO = 0.0
 
         # ── Per-bubble dynamic size range ──
-        # The upper bound scales with the box so a big bubble can host big
-        # text. The binary search inside fit_font_and_wrap still guarantees
-        # the wrapped block fits both the inner width and height.
-        dyn_max = int(box_h * (0.6 if is_lens else 0.55))
-        dyn_max = max(ABS_MIN_SIZE + 1, min(ABS_MAX_SIZE, dyn_max))
+        # A translated line can be much larger than the source lettering. Search
+        # up to twice the largest region dimension; fit_font_and_wrap verifies
+        # the complete wrapped block against both region dimensions.
+        dyn_max = max(ABS_MIN_SIZE + 1, max(box_w, box_h) * 2)
         dyn_min = ABS_MIN_SIZE
+        if ocr_mode == "local_vision":
+            measured_glyph_h = glyph_h_by_idx.get(item_idx)
+            if measured_glyph_h:
+                dyn_max = max(dyn_min, min(dyn_max, int(round(measured_glyph_h * 1.35))))
 
-        # ── Fit text to INNER box (or full box for Lens) ──
+        # OCR/source font measurements remain available as metadata, but they do
+        # not limit the translated overlay. The geometry fit is authoritative.
+
+        # ── Fit text to the complete bbox ──
+        effective_style = item.get("or_style") or item.get("style")
+        item_fp = _font_for_style(effective_style)
+
         font_size, lines, heights, inner_w, inner_h = fit_font_and_wrap(
-            draw, text, box_w, box_h, font_path=fp,
+            draw, translated_text, box_w, box_h, font_path=item_fp,
             max_size=dyn_max, min_size=dyn_min,
             inner_padding_ratio=INNER_PADDING_RATIO,
         )
-        font = get_font(fp, font_size)
+        font = get_font(item_fp, font_size)
 
         # Never split words: text is always wrapped by whole words only. If the
         # block is taller than the bubble it overflows (the whole translation
@@ -3573,30 +6527,115 @@ async def get_translated_image(job_id: str):
 
         start_y = inner_y + (inner_h - total_text_h) // 2
 
-        # ── Draw each line centered horizontally within inner box ──
-        current_y = start_y
-        for i, line in enumerate(lines):
-            if not line:
-                current_y += heights[i] if i < len(heights) else font_size
-                continue
+        # ── Style effects from the original lettering ──
+        # Bold and glow are only applied when the model reported them off the
+        # source artwork. Both scale with the rendered font size so a small
+        # bubble doesn't get a stroke wider than its own glyphs.
+        item_style = item.get("style")
+        item_weight = int(item.get("weight", 0) or 0)
+        item_glow = bool(item.get("glow", False))
 
-            line_w = draw.textlength(line, font=font)
-            line_x = inner_x + (inner_w - line_w) / 2
+        embolden = 0
+        if style_aware and item_style == "bold" and item_weight > 0:
+            # weight 1..3 → roughly 1.5%..4.5% of the font size, min 1px.
+            embolden = max(1, int(round(font_size * 0.015 * item_weight)))
+        # Vision-OCR boldness override (1..3), independent of style_aware.
+        or_bold = item.get("or_bold")
+        if isinstance(or_bold, (int, float)) and or_bold > 0:
+            embolden = max(1, int(round(font_size * 0.015 * min(3, or_bold))))
 
-            draw_text_with_config(
-                draw,
-                (line_x, current_y),
-                line,
-                font=font,
-                fill=text_color,
-                stroke_fill=bg_color,
+        glow_radius = 0.0
+        or_glow = item.get("or_glow")
+        if (style_aware and item_glow) or bool(or_glow):
+            glow_radius = max(2.0, font_size * 0.12)
+
+        def _draw_lines(target_draw, block_x, block_y, block_w, target_image=None):
+            """Draw the wrapped lines centered horizontally in block_w."""
+            cur_y = block_y
+            for i, line in enumerate(lines):
+                line_h = heights[i] if i < len(heights) else font_size
+                if line:
+                    line_w = target_draw.textlength(line, font=font)
+                    draw_text_with_config(
+                        target_draw,
+                        (block_x + (block_w - line_w) / 2, cur_y),
+                        line,
+                        font=font,
+                        fill=text_color,
+                        stroke_fill=bg_color,
+                        embolden=embolden,
+                        glow_radius=glow_radius,
+                        target_image=target_image,
+                    )
+                cur_y += line_h
+
+        # ── Draw the block ──
+        # Upright text goes straight onto the page. Tilted text (Google Lens
+        # angle) is drawn on a transparent layer, rotated, then composited so
+        # the glyphs follow the slant of the original line.
+        item_angle = float(item.get("angle", 0.0) or 0.0)
+
+        if not item_angle:
+            _draw_lines(draw, inner_x, start_y, inner_w, out_pil)
+        else:
+            # Margin absorbs glyph overshoot (ascenders/descenders) plus the
+            # glow halo, so nothing is clipped before the rotation widens the
+            # layer.
+            margin = max(8, int(font_size) + int(glow_radius * 3))
+            layer = Image.new(
+                "RGBA",
+                (max(1, int(inner_w) + margin * 2),
+                 max(1, int(total_text_h) + margin * 2)),
+                (0, 0, 0, 0),
             )
-
-            current_y += heights[i] if i < len(heights) else font_size
+            _draw_lines(ImageDraw.Draw(layer), margin, margin, inner_w, layer)
+            # _rotated_box_points treats positive as clockwise in image coords;
+            # PIL rotates counter-clockwise, hence the negated angle.
+            layer = layer.rotate(-item_angle, expand=True, resample=Image.BICUBIC)
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            out_pil.paste(
+                layer,
+                (int(round(cx - layer.width / 2.0)),
+                 int(round(cy - layer.height / 2.0))),
+                layer,
+            )
 
     buf = io.BytesIO()
     out_pil.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
+
+# ===========================================================================
+# SFX Detection Endpoint
+# ===========================================================================
+@app.post("/v1/detect_sfx")
+async def detect_sfx_endpoint(
+    image: UploadFile = File(...),
+    text: str = Form(...),
+    bbox: str = Form(...),
+):
+    """Classify a single text region as SFX or dialogue.
+
+    Form fields:
+      image: the source manga page image.
+      text:  the OCR text for the region.
+      bbox:  "x1,y1,x2,y2" (comma-separated pixel coords).
+
+    Returns {is_sfx, score, reasons}.
+    """
+    contents = await image.read()
+    pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+
+    try:
+        parts = [int(p.strip()) for p in bbox.split(",")]
+        if len(parts) != 4:
+            raise ValueError("bbox must have 4 ints")
+        bbox_tuple = (parts[0], parts[1], parts[2], parts[3])
+    except Exception as e:
+        raise HTTPException(400, f"Invalid bbox '{bbox}': {e}")
+
+    is_sfx, score, reasons = detect_sfx(pil_img, bbox_tuple, text)
+    return {"is_sfx": is_sfx, "score": score, "reasons": reasons}
 
 # ===========================================================================
 # Main entry point

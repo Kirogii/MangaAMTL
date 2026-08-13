@@ -42,6 +42,8 @@
     .font-chip.active { border-color: #28a745; color: #fff; }
     .font-loading { font-size: 11px; color: #888; padding: 4px 0; }
     .font-loading.error { color: #ff4d4d; }
+    .vision-pill { display:inline-block; padding:2px 7px; border-radius:10px; font-size:11px; font-weight:bold; margin-left:6px; background:#164d2b; color:#7dffad; border:1px solid #287a47; }
+    .vision-pill.text-only { background:#30303d; color:#aaa; border-color:#555; }
     .save-all-bar {
       position: sticky; top: 0; z-index: 100;
       background: #14141f; padding: 10px 0; margin-bottom: 15px;
@@ -67,13 +69,84 @@
   </div>
 
   <div class="card">
+    <h3>Pages</h3>
+    <label for="optCombineAmount">Combine Pages (vertical stitch):</label>
+    <div style="display:flex; align-items:center; gap:10px; margin: 8px 0;">
+      <input type="range" id="optCombineAmount" min="1" max="20" step="1" value="1" style="flex:1;">
+      <span id="optCombineAmountVal" style="min-width:24px; text-align:center; font-weight:bold; color:#28a745; font-size:15px;">1</span>
+    </div>
+    <div class="hint">Stitches X pages into one image before sending, Processes X pages at once then uncombines after the pipeline is done and replaces each image</div>
+    <hr>
+    <label for="optContextMode">Context Aware:</label>
+    <select id="optContextMode">
+      <option value="off">Off</option>
+      <option value="on">On</option>
+    </select>
+    <div class="hint" style="color:#d4881e;">
+      ⚠ +1 API request per chapter (~200–600 extra tokens). On preserves names/honorifics (-kun, -chan) and skips SFX overlay, leaving sound-effect art untouched.
+    </div>
+
+    <div id="optContextLevelRow" style="display:none;">
+      <label for="optContextLevel">Context Level:</label>
+      <select id="optContextLevel">
+        <option value="low">Low — context + skip SFX only</option>
+        <option value="high">High — lettering style from the page image (OpenRouter only)</option>
+      </select>
+      <div class="hint" style="color:#d4881e;">
+        ⚠ <strong>High works on OpenRouter only</strong> — it sends the manga page image along with the text, so the model can see how the <em>original</em> lettering was drawn instead of guessing from wording alone. Each line is tagged Bold / Italic / Regular with a stroke weight, and gets its style font. If the source lettering was heavy or had a glow behind it, the overlay is thickened and given a matching blurred halo.<br>
+        <strong>High uses a lot more tokens than Low</strong> — a page image costs roughly 1,000–2,000+ extra input tokens <em>per page</em> on top of the text. On the Local (GGUF) backend High is ignored and falls back to Low.
+      </div>
+      <div id="optContextHighNote" class="hint" style="display:none; color:#ff6b6b;">
+        High needs the OpenRouter translation model. Switch "Translation Model" to OpenRouter to enable it.
+      </div>
+      <button id="optStyleFontsBtn" class="secondary" style="display:none;">Font Settings</button>
+      <div id="optStyleFontsBox" class="subbox" style="display:none; margin-top:10px;">
+        <div class="hint" style="margin:0 0 8px 0;">Pick a font per lettering style. "Main font" uses the Font Family selection below.</div>
+        <label for="optStyleFontBold"><strong>Bold</strong></label>
+        <select id="optStyleFontBold"><option value="">Main font</option></select>
+        <label for="optStyleFontItalic"><em>Italic</em></label>
+        <select id="optStyleFontItalic"><option value="">Main font</option></select>
+        <label for="optStyleFontRegular">Regular</label>
+        <select id="optStyleFontRegular"><option value="">Main font</option></select>
+        <div id="optStyleFontStatus" class="status"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
     <h3>OCR Engine</h3>
     <select id="optOcrMode">
       <option value="hayai">Hayai (Local, Japanese)</option>
       <option value="glm">GLM (Local, Korean)</option>
       <option value="lens">Google Lens (Cloud, All)</option>
+      <option value="openai_endpoint">OpenAI Endpoint OCR (Vision)</option>
+      <option value="google_ai">Google AI Studio OCR (All Text)</option>
+      <option value="local_vision">Local (GGUF Vision)</option>
     </select>
-    <div class="hint">Google Lens supports all languages and requires chrome-lens-py installed on the server.</div>
+    <div id="optOpenaiOcrRow" class="subbox" style="display:none;">
+      <label for="optOpenaiOcrEndpoint">OpenAI Endpoint:</label>
+      <input type="text" id="optOpenaiOcrEndpoint" placeholder="https://api.openai.com/v1">
+      <label for="optOpenaiOcrModel">Vision Model ID:</label>
+      <input type="text" id="optOpenaiOcrModel" placeholder="e.g. gpt-4o-mini">
+      <label for="optOpenaiOcrKey">API Key (optional for local endpoints):</label>
+      <input type="password" id="optOpenaiOcrKey" placeholder="sk-...">
+    </div>
+    <div id="optGoogleAiOcrRow" class="subbox" style="display:none;">
+      <label for="optGoogleAiOcrKey">Google AI Studio API Key:</label>
+      <input type="password" id="optGoogleAiOcrKey" placeholder="AIza...">
+      <label for="optGoogleAiOcrModel">Gemini Model:</label>
+      <select id="optGoogleAiOcrModel">
+        <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash-Lite (Default)</option>
+        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+        <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash-Lite</option>
+        <option value="custom">Custom model ID</option>
+      </select>
+      <input type="text" id="optGoogleAiOcrCustomModel" placeholder="e.g. gemini-2.5-flash" style="display:none;">
+      <label for="optGoogleAiOcrRpm">Maximum Requests Per Minute:</label>
+      <input type="number" id="optGoogleAiOcrRpm" min="1" max="15" value="5">
+      <div class="hint">Default 5 RPM spaces calls 12 seconds apart. This is conservative but Google quotas can vary by account, model, region, and daily usage.</div>
+    </div>
+    <div class="hint">Google Lens supports all languages and requires chrome-lens-py. OpenAI Endpoint OCR performs lettering analysis. Google AI Studio OCR detects every visible manga text region, including dialogue, narration, titles, signs, credits, and SFX.</div>
     <div id="optOcrStatus" class="status"></div>
   </div>
 
@@ -90,6 +163,10 @@
       <input type="password" id="optOpenrouterKey" placeholder="sk-or-...">
       <button id="optSetModelBtn" class="secondary">Set Model</button>
       <div id="optModelTypeStatus" class="status"></div>
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:10px;">
+        <input type="checkbox" id="optFreeOpenRouter" style="width:auto;">
+        <span>Paid model — skip rate-limit retries (no 429 backoff)</span>
+      </label>
     </div>
   </div>
 
@@ -99,15 +176,6 @@
       <div class="font-loading">Loading fonts…</div>
     </div>
     <div id="optFontFamilyStatus" class="status"></div>
-  </div>
-
-  <div class="card">
-    <h3>Font Boldness</h3>
-    <div id="optFontWeightPicker" style="display:flex; gap:8px; margin-bottom: 6px;">
-      <div style="font-size:11px; color:#888;">Loading preview…</div>
-    </div>
-    <input type="hidden" id="optFontWeightHidden" value="2">
-    <div id="optFontStatus" class="status"></div>
   </div>
 
   <div class="card">
@@ -131,12 +199,13 @@
         <tr>
           <th>Repo ID</th>
           <th>Filename</th>
+          <th>Capability</th>
           <th>Size (MB)</th>
           <th>Action</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td colspan="4" style="text-align:center;">Click "Refresh List" to load models...</td></tr>
+        <tr><td colspan="5" style="text-align:center;">Click "Refresh List" to load models...</td></tr>
       </tbody>
     </table>
 

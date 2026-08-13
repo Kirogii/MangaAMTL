@@ -21,113 +21,6 @@
     return face;
   }
 
-  function drawFontWeightSwatch(canvas, level, fontFamily) {
-    const ctx = canvas.getContext('2d');
-    const w = canvas.width, h = canvas.height;
-    const dpr = window.devicePixelRatio || 1;
-
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = '#8a8a8a';
-    ctx.fillRect(0, 0, w, h);
-
-    const fontSize = (16 + level * 2) * dpr;
-    ctx.font = `${fontSize}px "${fontFamily}"`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.lineJoin = 'round';
-    const text = 'Aあ';
-    const cx = (w * dpr) / 2, cy = (h * dpr) / 2;
-
-    if (level > 0) {
-      ctx.lineWidth = level * 2.2 * dpr;
-      ctx.strokeStyle = '#ffffff';
-      ctx.strokeText(text, cx, cy);
-    }
-    ctx.fillStyle = '#111111';
-    ctx.fillText(text, cx, cy);
-  }
-
-  async function initFontWeightPicker() {
-    const container = document.getElementById('mtFontWeightPicker');
-    if (!container || container.dataset.built === '1') return;
-    container.dataset.built = '1';
-    container.innerHTML = '';
-
-    const { serverUrl, fontWeight } = await chrome.storage.local.get(['serverUrl', 'fontWeight']);
-    const selected = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
-    document.getElementById('mtFontWeightHidden').value = selected;
-
-    let fontFamily = 'sans-serif';
-    if (serverUrl) {
-      try {
-        const face = await loadServerFontFace(serverUrl);
-        fontFamily = face.family;
-      } catch (e) {
-        console.warn('[MangaTranslator] Could not load server font for preview, using fallback:', e);
-      }
-    }
-
-    const labels = ['Thin', 'Light', 'Regular', 'Bold', 'Heavy'];
-    for (let level = 0; level <= 4; level++) {
-      const wrap = document.createElement('div');
-      wrap.style.cssText = 'display:flex; flex-direction:column; align-items:center; cursor:pointer;';
-      wrap.title = `${level + 1} - ${labels[level]}`;
-
-      const dpr = window.devicePixelRatio || 1;
-      const canvas = document.createElement('canvas');
-      const cssW = 40, cssH = 32;
-      canvas.style.width = cssW + 'px';
-      canvas.style.height = cssH + 'px';
-      canvas.width = cssW * dpr;
-      canvas.height = cssH * dpr;
-      canvas.dataset.level = level;
-      canvas.style.cssText += `border-radius:4px; border:2px solid ${level === selected ? '#28a745' : '#444'}; display:block;`;
-      drawFontWeightSwatch(canvas, level, fontFamily);
-
-      const lbl = document.createElement('div');
-      lbl.innerText = level + 1;
-      lbl.style.cssText = 'font-size:10px; color:#aaa; margin-top:2px;';
-
-      wrap.appendChild(canvas);
-      wrap.appendChild(lbl);
-      wrap.onclick = async () => {
-        document.getElementById('mtFontWeightHidden').value = level;
-        chrome.storage.local.set({ fontWeight: String(level) });
-        container.querySelectorAll('canvas').forEach(c => {
-          c.style.border = `2px solid ${parseInt(c.dataset.level, 10) === level ? '#28a745' : '#444'}`;
-        });
-        // ★ 1:1 with popup.js — push font weight to server immediately on click
-        const { serverUrl: url } = await chrome.storage.local.get(['serverUrl']);
-        if (url) {
-          try {
-            await fetch(`${url}/SetFont`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ stroke_width: level })
-            });
-          } catch (e) {
-            console.warn('[MangaTranslator] Failed to push font weight to server:', e);
-          }
-        }
-      };
-      container.appendChild(wrap);
-    }
-  }
-
-  function refreshFontWeightSelection() {
-    chrome.storage.local.get(['fontWeight'], (data) => {
-      const selected = data.fontWeight !== undefined ? parseInt(data.fontWeight, 10) : 2;
-      const hidden = document.getElementById('mtFontWeightHidden');
-      if (hidden) hidden.value = selected;
-      const container = document.getElementById('mtFontWeightPicker');
-      if (container) {
-        container.querySelectorAll('canvas').forEach(c => {
-          c.style.border = `2px solid ${parseInt(c.dataset.level, 10) === selected ? '#28a745' : '#444'}`;
-        });
-      }
-    });
-  }
-
   // ========================================================================
   // FONT FAMILY PICKER (in-page popup)
   // ========================================================================
@@ -212,12 +105,10 @@
     const statusEl = document.getElementById('mtFontFamilyStatus');
     if (statusEl) statusEl.innerText = `Switching to ${filename}...`;
     try {
-      const { fontWeight } = await chrome.storage.local.get(['fontWeight']);
-      const strokeWidth = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
       const res = await fetch(`${serverUrl}/SetFont`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ font_name: filename, stroke_width: strokeWidth })
+        body: JSON.stringify({ font_name: filename })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -239,7 +130,28 @@
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "translateAllImages") {
-      startTranslationProcess(message.ocrLang, message.targetLang);
+      if (isTranslating) {
+        sendResponse({ ok: false, error: 'Translation is already running on this page.' });
+        return;
+      }
+      const imageCount = findAllTranslatableImages().length;
+      if (imageCount === 0) {
+        sendResponse({
+          ok: false,
+          error: 'No eligible manga images found. Images must be visible, at least 200x200 on the page, and at least 700,000 source pixels.',
+        });
+        return;
+      }
+      // Popup forwards combineAmount + contextMode/contextLevel/styleFonts; fall back to cached.
+      const opts = {
+        combineAmount: parseInt(message.combineAmount, 10) || 1,
+        contextMode: message.contextMode,
+        contextLevel: message.contextLevel,
+        styleFonts: message.styleFonts || null,
+      };
+      startTranslationProcess(message.ocrLang, message.targetLang, opts)
+        .catch((error) => console.error('[MangaTranslator] Translation failed to start:', error));
+      sendResponse({ ok: true, started: true, imageCount });
     }
   });
 
@@ -313,6 +225,17 @@
     }
   }
 
+  function ocrModeLabel(mode) {
+    switch (mode) {
+      case 'lens': return 'Google Lens active';
+      case 'glm': return 'GLM active';
+      case 'openai_endpoint': return 'OpenAI Endpoint OCR active';
+      case 'google_ai': return 'Google AI Studio OCR active (all text)';
+      case 'local_vision': return 'Local GGUF Vision OCR active';
+      default: return 'Hayai active';
+    }
+  }
+
   async function syncOcrModeFromServer(serverUrl) {
     const statusEl = document.getElementById('mtOcrModeStatus');
     if (!serverUrl) return;
@@ -323,7 +246,7 @@
       if (el) el.value = data.ocr_mode || 'hayai';
       chrome.storage.local.set({ ocrMode: data.ocr_mode || 'hayai' });
       if (statusEl) {
-        statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+        statusEl.innerText = ocrModeLabel(data.ocr_mode);
       }
     } catch (e) {
       console.warn('[MangaTranslator] Could not fetch OCR mode from server:', e);
@@ -345,7 +268,7 @@
       });
       const data = await res.json();
       if (res.ok) {
-        if (statusEl) statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+        if (statusEl) statusEl.innerText = ocrModeLabel(data.ocr_mode);
         chrome.storage.local.set({ ocrMode: data.ocr_mode });
       } else {
         if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
@@ -419,6 +342,76 @@
   }
 
   // ========================================================================
+  // Unified settings push — single POST to /SetAllSettings before Translate.
+  // Mirrors popup.js. Handles the cloud-mode-restart problem: if the backend
+  // was restarted (in-memory settings reset) while cloud mode was on in the
+  // extension, this re-applies the correct state in one call.
+  // ========================================================================
+  async function pushAllSettings(serverUrl, settings) {
+    if (!serverUrl) return;
+    try {
+      const res = await fetch(`${serverUrl}/SetAllSettings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settings),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.warn('[MangaTranslator] /SetAllSettings failed:', data.detail || res.status);
+      } else {
+        console.log('[MangaTranslator] Settings applied:', data.applied);
+      }
+    } catch (e) {
+      console.warn('[MangaTranslator] /SetAllSettings error:', e);
+    }
+  }
+
+  // Build the full settings payload from the floating popup's current values.
+  // In cloud mode this forces ocr=lens / model_type=openrouter / inpaint=none.
+  function buildSettingsPayload() {
+    const cloudMode = document.getElementById('mtCloudMode').checked;
+    const ctxOn = document.getElementById('mtContextMode')?.value === 'on';
+    const ctxLevel = document.getElementById('mtContextLevel')?.value === 'high' ? 'high' : 'low';
+    const payload = {
+      cloud_mode: cloudMode,
+      free_openrouter: document.getElementById('mtFreeOpenRouter')?.checked || false,
+      context_aware: ctxOn,
+      context_level: ctxLevel,
+      style_aware: ctxOn && ctxLevel === 'high',
+      style_fonts: {
+        bold: document.getElementById('mtStyleFontBold')?.value || '',
+        italic: document.getElementById('mtStyleFontItalic')?.value || '',
+        regular: document.getElementById('mtStyleFontRegular')?.value || '',
+      },
+    };
+
+    if (cloudMode) {
+      payload.model_type = 'openrouter';
+      payload.ocr_mode = 'lens';
+      payload.inpaint_mode = 'none';
+      const model = document.getElementById('mtOpenrouterModel').value.trim();
+      const apiKey = document.getElementById('mtOpenrouterKey').value.trim();
+      if (model) payload.openrouter_model = model;
+      if (apiKey) payload.openrouter_api_key = apiKey;
+    } else {
+      payload.ocr_mode = document.getElementById('mtOcrModeSelect').value;
+      payload.inpaint_mode = document.getElementById('mtInpaintMode').value;
+      payload.model_type = document.getElementById('mtModelTypeSelect').value;
+      const model = document.getElementById('mtOpenrouterModel').value.trim();
+      const apiKey = document.getElementById('mtOpenrouterKey').value.trim();
+      if (model) payload.openrouter_model = model;
+      if (apiKey) payload.openrouter_api_key = apiKey;
+      // Active font filename, if known (chip with green border)
+      const activeChip = Array.from(document.querySelectorAll('#mtFontFamilyScroll button[data-filename]'))
+        .find(c => c.style.borderColor === 'rgb(40, 167, 69)' || c.style.borderColor === '#28a745');
+      if (activeChip && activeChip.dataset.filename) {
+        payload.font_filename = activeChip.dataset.filename;
+      }
+    }
+    return payload;
+  }
+
+  // ========================================================================
   // Helper: load all cached settings into the floating popup — 1:1 with popup.js
   // ========================================================================
   async function loadCachedSettingsIntoPopup() {
@@ -426,8 +419,10 @@
     const ocrLangSel = document.getElementById('mtOcrLangSelect');
 
     const data = await chrome.storage.local.get(
-      ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType',
-       'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'cloudMode']
+      ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'modelType',
+       'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'cloudMode',
+       'combineAmount', 'freeOpenRouter', 'contextMode', 'contextLevel',
+       'styleFontBold', 'styleFontItalic', 'styleFontRegular', 'skipSfx', 'contextAware']
     );
 
     // Populate language dropdowns from built-in list, then refresh from server
@@ -478,6 +473,54 @@
       cloudEl.checked = cloudOn;
       applyCloudModeToPopup(cloudOn);
     }
+
+    // ★ Combine slider — restore value + live label — 1:1 with popup.js
+    const combineAmount = parseInt(data.combineAmount || '1', 10);
+    const combineSlider = document.getElementById('mtCombineAmount');
+    const combineLabel = document.getElementById('mtCombineAmountVal');
+    if (combineSlider && combineLabel) {
+      combineSlider.value = combineAmount;
+      combineLabel.textContent = combineAmount;
+    }
+
+    // ★ Context (merged Skip SFX + Context Aware) — restore + level/style-font gating
+    const ctxModeEl = document.getElementById('mtContextMode');
+    const ctxLevelEl = document.getElementById('mtContextLevel');
+    const ctxLevelRow = document.getElementById('mtContextLevelRow');
+    const styleFontsBtn = document.getElementById('mtStyleFontsBtn');
+    const styleFontsBox = document.getElementById('mtStyleFontsBox');
+    if (ctxModeEl && ctxLevelEl) {
+      const ctxMode = data.contextMode
+        || ((data.skipSfx === true || data.contextAware === true) ? 'on' : 'off');
+      const ctxLevel = data.contextLevel === 'high' ? 'high' : 'low';
+      ctxModeEl.value = ctxMode;
+      ctxLevelEl.value = ctxLevel;
+      const applyCtxVisibility = () => {
+        const on = ctxModeEl.value === 'on';
+        const high = on && ctxLevelEl.value === 'high';
+        if (ctxLevelRow) ctxLevelRow.style.display = on ? 'block' : 'none';
+        if (styleFontsBtn) styleFontsBtn.style.display = high ? 'block' : 'none';
+        if (styleFontsBox && !high) styleFontsBox.style.display = 'none';
+      };
+      applyCtxVisibility();
+      ctxModeEl.onchange = () => {
+        chrome.storage.local.set({ contextMode: ctxModeEl.value });
+        applyCtxVisibility();
+      };
+      ctxLevelEl.onchange = () => {
+        chrome.storage.local.set({ contextLevel: ctxLevelEl.value });
+        applyCtxVisibility();
+      };
+      if (styleFontsBtn && styleFontsBox) {
+        styleFontsBtn.onclick = () => {
+          styleFontsBox.style.display = styleFontsBox.style.display === 'block' ? 'none' : 'block';
+        };
+      }
+    }
+
+    // ★ Free OpenRouter — restore (default off) — 1:1 with popup.js
+    const freeOrEl = document.getElementById('mtFreeOpenRouter');
+    if (freeOrEl) freeOrEl.checked = data.freeOpenRouter === true;
 
     // ★ Sync from server (best-effort) — 1:1 with popup.js
     if (data.serverUrl) {
@@ -552,8 +595,8 @@
       <div style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#22a552" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>
         <div style="flex:1; font-weight:700; color:#fff; font-size:16px;">Manga Translator</div>
-        <button id="mtSettingsBtn" title="Settings" aria-label="Settings" style="width:34px; height:34px; padding:0; flex:0 0 auto; background:#2a2a3c; border:1px solid #444; border-radius:8px; color:#fff; cursor:pointer; display:flex; align-items:center; justify-content:center;">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <button id="mtReaderBtn" title="Open Reader" aria-label="Open Reader" style="width:34px; height:34px; padding:0; flex:0 0 auto; background:#2a2a3c; border:1px solid #444; border-radius:8px; color:#fff; cursor:pointer; display:flex; align-items:center; justify-content:center;">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
         </button>
       </div>
 
@@ -563,291 +606,109 @@
         box-shadow:0 3px 10px rgba(34,165,82,0.35); display:flex; align-items:center; justify-content:center;
       ">${ICON.arrow}<span>Translate All</span></button>
 
-      <label style="${labCss}">${ICON.globe}Translate to</label>
-      <select id="mtTargetLangSelect" style="${selCss}"><!-- populated by JS --></select>
-
-      <div style="margin:0 0 12px 0; padding:10px; background:#1b2430; border-radius:8px; border:1px solid #3a6ea5; display:flex; align-items:center;">
-        <input type="checkbox" id="mtCloudMode" style="width:auto; margin:0;">
-        <label for="mtCloudMode" style="display:flex; align-items:center; font-weight:500; margin:0 0 0 8px; cursor:pointer; color:#d5d5e2;">${ICON.cloud}Cloud Mode — minimal PC load</label>
-      </div>
-
       <div id="mtStatus" style="font-size:12px; color:#46c877; text-align:center; min-height:15px; margin-bottom:4px;"></div>
-
-      <div id="mtSettingsPanel" style="display:none; border-top:1px solid #2c2c3a; margin-top:4px; padding-top:14px;">
-        <div style="${secCss}">${ICON.scan}OCR</div>
-        <label style="${labCss}">OCR Engine</label>
-        <select id="mtOcrModeSelect" style="${selCss}">
-          <option value="hayai">Hayai (Local, Japanese)</option>
-          <option value="glm">GLM (Local, Korean)</option>
-          <option value="lens">Google Lens (Cloud, All)</option>
-        </select>
-        <div id="mtOcrModeStatus" style="font-size:12px; color:#46c877; text-align:center; min-height:15px; margin-bottom:8px;"></div>
-        <label style="${labCss}">Source Language</label>
-        <select id="mtOcrLangSelect" style="${selCss}"><!-- populated by JS --></select>
-
-        <div style="${secCss}">${ICON.type}Typesetting</div>
-        <label style="${labCss}">Font Family</label>
-        <div id="mtFontFamilyScroll" style="display:flex; gap:6px; overflow-x:auto; overflow-y:hidden; white-space:nowrap; padding-bottom:4px;">
-          <div style="font-size:11px; color:#888;">Loading fonts…</div>
-        </div>
-        <div id="mtFontFamilyStatus" style="font-size:11px; color:#46c877; margin:4px 0 12px; min-height:14px;"></div>
-
-        <label style="${labCss}">Font Boldness</label>
-        <div id="mtFontWeightPicker" style="display:flex; gap:6px; margin-bottom:12px;">
-          <div style="font-size:11px; color:#888;">Loading preview…</div>
-        </div>
-        <input type="hidden" id="mtFontWeightHidden" value="2">
-
-        <div style="${secCss}">${ICON.inpaint}Inpainting</div>
-        <label style="${labCss}">Inpainting Mode</label>
-        <select id="mtInpaintMode" style="${selCss}">
-          <option value="low">Low (faster, default)</option>
-          <option value="high">High (better quality, bigger model)</option>
-          <option value="none">None (fill with bg color, no model)</option>
-        </select>
-        <div style="${hintCss}">High mode auto-downloads a larger LaMa model. 'None' fills text regions with the detected background color instead of inpainting.</div>
-        <div id="mtInpaintModeStatus" style="font-size:12px; color:#46c877; text-align:center; min-height:15px; margin-bottom:8px;"></div>
-
-        <div style="${secCss}">${ICON.brain}Translation Model</div>
-        <select id="mtModelTypeSelect" style="${selCss}">
-          <option value="local">Local (GGUF)</option>
-          <option value="openrouter">OpenRouter</option>
-        </select>
-        <div id="mtOpenrouterRow" style="display:none; padding:10px; background:#1c1c26; border-radius:8px; border:1px solid #3a3a4c; margin-bottom:12px;">
-          <input type="text" id="mtOpenrouterModel" placeholder="e.g. openai/gpt-4o-mini" style="${inCss}">
-          <input type="password" id="mtOpenrouterKey" placeholder="OpenRouter API Key" style="${inCss}">
-          <button id="mtSetModelBtn" style="width:100%; box-sizing:border-box; padding:9px; background:#2a2a3c; color:#fff; border:1px solid #4a4a5e; border-radius:8px; cursor:pointer; font-weight:600; font-size:13px;">Set Model</button>
-          <div id="mtModelStatus" style="margin-top:6px; font-size:11px; color:#46c877;"></div>
-        </div>
-
-        <div style="margin:0 0 12px 0; padding:10px; background:#22222e; border-radius:8px; border:1px solid #3a3a4c; display:flex; align-items:center;">
-          <input type="checkbox" id="mtColorize" style="width:auto; margin:0;">
-          <label for="mtColorize" style="display:flex; align-items:center; font-weight:500; margin:0 0 0 8px; cursor:pointer; color:#d5d5e2;">${ICON.palette}Enable Colorization</label>
-        </div>
-
-        <button id="mtAdvancedBtn" style="width:100%; box-sizing:border-box; padding:11px; background:transparent; color:#b9b9cc; border:1px solid #3a3a4c; border-radius:8px; cursor:pointer; font-weight:500; font-size:14px; display:flex; align-items:center; justify-content:center;">${ICON.wrench}Advanced Settings</button>
-      </div>
     `;
     document.body.appendChild(floatPopup);
 
-    // ── Wire the focal Translate button FIRST ──
+    // ── Wire the Translate All button (reads everything from cache) ──
     wireTranslateButton();
 
-    try {
-      loadCachedSettingsIntoPopup();
-      initFontWeightPicker();
-      chrome.storage.local.get(['serverUrl'], (d) => initFontFamilyPicker(d.serverUrl || ''));
-    } catch (e) {
-      console.warn('[MangaTranslator] Popup init (pickers/cache) failed:', e);
-    }
-
-    // ★ Model type change — 1:1 with popup.js
-    document.getElementById('mtModelTypeSelect').onchange = (e) => {
-      const isOpenRouter = e.target.value === 'openrouter';
-      document.getElementById('mtOpenrouterRow').style.display = isOpenRouter ? 'block' : 'none';
-      chrome.storage.local.set({ modelType: e.target.value });
-
-      if (!isOpenRouter) {
-        chrome.storage.local.get(['serverUrl'], async (d) => {
-          if (d.serverUrl) {
-            try {
-              await fetch(`${d.serverUrl}/SetModelType`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model_type: 'local' })
-              });
-            } catch (e) {
-              console.warn('[MangaTranslator] Failed to switch to local model:', e);
-            }
-          }
-        });
-      }
-    };
-
-    // ★ Inpaint mode change — 1:1 with popup.js (real-time push to server)
-    document.getElementById('mtInpaintMode').onchange = (e) => {
-      chrome.storage.local.set({ inpaintMode: e.target.value });
-      chrome.storage.local.get(['serverUrl'], (d) => {
-        pushInpaintMode(d.serverUrl, e.target.value);
-      });
-    };
-
-    // ★ OCR mode change — 1:1 with popup.js (real-time push to server)
-    document.getElementById('mtOcrModeSelect').onchange = (e) => {
-      chrome.storage.local.set({ ocrMode: e.target.value });
-      chrome.storage.local.get(['serverUrl'], (d) => {
-        pushOcrMode(d.serverUrl, e.target.value);
-      });
-    };
-
-    // ★ Colorize change — cache immediately — 1:1 with popup.js
-    document.getElementById('mtColorize').onchange = (e) => {
-      chrome.storage.local.set({ colorize: e.target.checked });
-    };
-
-    // ★ Set OpenRouter model — 1:1 with popup.js
-    document.getElementById('mtSetModelBtn').onclick = async () => {
-      const statusEl = document.getElementById('mtModelStatus');
-      const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
-      const model = document.getElementById('mtOpenrouterModel').value.trim();
-      const apiKey = document.getElementById('mtOpenrouterKey').value.trim();
-
-      if (!serverUrl) { alert("Please set your FastAPI Server URL in Advanced Settings first!"); return; }
-      if (!model) { alert("Please enter an OpenRouter model ID."); return; }
-
-      statusEl.innerText = 'Setting model...';
-      try {
-        const body = { model_type: 'openrouter', model: model };
-        if (apiKey) body.api_key = apiKey;
-
-        const res = await fetch(`${serverUrl}/SetModelType`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const data = await res.json();
-        if (res.ok) {
-          chrome.storage.local.set({ modelType: 'openrouter', openrouterModel: model, openrouterApiKey: apiKey });
-          statusEl.innerText = `Active: ${data.openrouter_model}`;
+    // ── Wire the Reader button (book icon) ──
+    const readerBtn = document.getElementById('mtReaderBtn');
+    if (readerBtn) {
+      readerBtn.onclick = () => {
+        if (typeof window.__mtOpenReader === 'function') {
+          window.__mtOpenReader();
         } else {
-          statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
+          console.warn('[MangaTranslator] Reader not loaded; reloading page may help.');
         }
-      } catch (e) {
-        statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
+      };
+    }
+  }
+
+  // ========================================================================
+  // Translate button — reads ALL settings from chrome.storage.local
+  // (the floating popup no longer has settings controls; popup.html is the
+  // only settings UI. This button just triggers translation using cached
+  // values, and pushes them to the backend via /SetAllSettings first.)
+  // ========================================================================
+  function wireTranslateButton() {
+    const btn = document.getElementById('mtStartBtn');
+    if (!btn) return;
+    btn.onclick = async () => {
+      const stored = await chrome.storage.local.get([
+        'serverUrl', 'ocrMode', 'ocrLang', 'targetLang', 'inpaintMode',
+        'modelType', 'cloudMode', 'colorize',
+        'combineAmount', 'freeOpenRouter', 'contextMode', 'contextLevel',
+        'styleFontBold', 'styleFontItalic', 'styleFontRegular', 'skipSfx', 'contextAware',
+        'openrouterModel', 'openrouterApiKey',
+        'openaiOcrEndpoint', 'openaiOcrModel', 'openaiOcrApiKey',
+        'googleAiOcrApiKey', 'googleAiOcrModel', 'googleAiOcrRpm', 'fontFamily',
+      ]);
+
+      const ctxOn = (stored.contextMode
+        || ((stored.skipSfx === true || stored.contextAware === true) ? 'on' : 'off')) === 'on';
+      const ctxLevel = stored.contextLevel === 'high' ? 'high' : 'low';
+      const styleFonts = {
+        bold: stored.styleFontBold || '',
+        italic: stored.styleFontItalic || '',
+        regular: stored.styleFontRegular || '',
+      };
+
+      if (!stored.serverUrl) {
+        alert("Please set your FastAPI Server URL in the extension popup first!");
+        return;
       }
-    };
 
-    // ★ Translate All button — 1:1 with popup.js (caches ALL settings + pushes to server)
-    function wireTranslateButton() {
-      document.getElementById('mtStartBtn').onclick = async () => {
-        const cloudMode      = document.getElementById('mtCloudMode').checked;
-        const selectedOcrMode   = document.getElementById('mtOcrModeSelect').value;
-        const selectedOcrLang   = document.getElementById('mtOcrLangSelect').value;
-        const selectedLang      = document.getElementById('mtTargetLangSelect').value;
-        const selectedWeight    = document.getElementById('mtFontWeightHidden').value;
-        const selectedModelType = document.getElementById('mtModelTypeSelect').value;
-        const selectedInpaint   = document.getElementById('mtInpaintMode').value;
-        const colorize          = document.getElementById('mtColorize').checked;
-
-        const orModelEl = document.getElementById('mtOpenrouterModel');
-        const orKeyEl = document.getElementById('mtOpenrouterKey');
-
-        // ★ Cache ALL settings — 1:1 with popup.js
-        const settingsToCache = {
-          targetLang: selectedLang,
-          fontWeight: selectedWeight,
-          modelType: selectedModelType,
-          ocrMode: selectedOcrMode,
-          ocrLang: selectedOcrLang,
-          inpaintMode: selectedInpaint,
-          colorize: colorize,
-          cloudMode: cloudMode,
-        };
-        if (orModelEl && orModelEl.value.trim()) settingsToCache.openrouterModel = orModelEl.value.trim();
-        if (orKeyEl && orKeyEl.value.trim()) settingsToCache.openrouterApiKey = orKeyEl.value.trim();
-
-        // Include the active font family (the chip with the green border), if any.
-        const activeFamilyChip = Array.from(document.querySelectorAll('#mtFontFamilyScroll button[data-filename]'))
-          .find(c => c.style.borderColor === 'rgb(40, 167, 69)' || c.style.borderColor === '#28a745');
-        if (activeFamilyChip) settingsToCache.fontFamily = activeFamilyChip.dataset.filename;
-
-        const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
-        settingsToCache.serverUrl = serverUrl || '';
-        chrome.storage.local.set(settingsToCache);
-
-        // ★ In cloud mode, push cloud settings to server first — 1:1 with popup.js
-        if (cloudMode && serverUrl) {
-          await pushCloudModeFromPopup(serverUrl);
-        } else if (serverUrl) {
-          // Push font weight
-          try {
-            await fetch(`${serverUrl}/SetFont`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ stroke_width: parseInt(selectedWeight, 10) })
-            });
-          } catch (e) {
-            console.warn('[MangaTranslator] Failed to push font weight to server:', e);
-          }
-
-          // Push inpaint mode
-          await pushInpaintMode(serverUrl, selectedInpaint);
-
-          // Push OCR mode
-          await pushOcrMode(serverUrl, selectedOcrMode);
-
-          // If Local is selected, ensure server is switched back to local model
-          if (selectedModelType === 'local') {
-            try {
-              await fetch(`${serverUrl}/SetModelType`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model_type: 'local' })
-              });
-            } catch (e) {
-              console.warn('[MangaTranslator] Failed to switch server to local model:', e);
-            }
-          }
+      // Unified settings push BEFORE translation.
+      const payload = {
+        cloud_mode: stored.cloudMode === true,
+        free_openrouter: stored.freeOpenRouter === true,
+        context_aware: ctxOn,
+        context_level: ctxLevel,
+        style_aware: ctxOn && ctxLevel === 'high',
+        style_fonts: styleFonts,
+      };
+      if (stored.cloudMode) {
+        payload.model_type = 'openrouter';
+        payload.ocr_mode = 'lens';
+        payload.inpaint_mode = 'none';
+        if (stored.openrouterModel) payload.openrouter_model = stored.openrouterModel;
+        if (stored.openrouterApiKey) payload.openrouter_api_key = stored.openrouterApiKey;
+      } else {
+        payload.ocr_mode = stored.ocrMode || 'hayai';
+        payload.inpaint_mode = stored.inpaintMode || 'low';
+        payload.model_type = stored.modelType || 'local';
+        if (payload.ocr_mode === 'openai_endpoint') {
+          payload.openai_ocr_endpoint = stored.openaiOcrEndpoint || 'https://api.openai.com/v1';
+          payload.openai_ocr_model = stored.openaiOcrModel || 'gpt-4o-mini';
+          payload.openai_ocr_api_key = stored.openaiOcrApiKey || '';
         }
+        if (payload.ocr_mode === 'google_ai') {
+          payload.google_ai_ocr_api_key = stored.googleAiOcrApiKey || '';
+          payload.google_ai_ocr_model = stored.googleAiOcrModel || 'gemini-2.5-flash-lite';
+          payload.google_ai_ocr_rpm = parseInt(stored.googleAiOcrRpm || 5, 10);
+        }
+        if (stored.openrouterModel) payload.openrouter_model = stored.openrouterModel;
+        if (stored.openrouterApiKey) payload.openrouter_api_key = stored.openrouterApiKey;
+        if (stored.fontFamily) payload.font_filename = stored.fontFamily;
+      }
+      await pushAllSettings(stored.serverUrl, payload);
 
-        floatPopup.style.display = 'none';
-        startTranslationProcess(selectedOcrLang, selectedLang);
-      };
-    }
-
-    // Remaining wiring is best-effort
-    try {
-      // Gear button toggles settings panel
-      document.getElementById('mtSettingsBtn').onclick = () => {
-        const panel = document.getElementById('mtSettingsPanel');
-        const open = panel.style.display === 'none';
-        panel.style.display = open ? 'block' : 'none';
-        chrome.storage.local.set({ settingsPanelOpen: open });
-      };
-      chrome.storage.local.get(['settingsPanelOpen'], (d) => {
-        document.getElementById('mtSettingsPanel').style.display = d.settingsPanelOpen === true ? 'block' : 'none';
+      floatPopup.style.display = 'none';
+      startTranslationProcess(stored.ocrLang || 'ja', stored.targetLang || 'en', {
+        combineAmount: parseInt(stored.combineAmount || '1', 10) || 1,
+        contextMode: ctxOn ? 'on' : 'off',
+        contextLevel: ctxLevel,
+        styleFonts,
       });
-
-      // Advanced Settings button
-      document.getElementById('mtAdvancedBtn').onclick = () => {
-        floatPopup.style.display = 'none';
-        openSettingsModal();
-      };
-
-      // ★ Cloud Mode toggle — 1:1 with popup.js
-      const cloudEl = document.getElementById('mtCloudMode');
-      cloudEl.onchange = async (e) => {
-        const on = e.target.checked;
-        applyCloudModeToPopup(on);
-        const { serverUrl } = await chrome.storage.local.get(['serverUrl']);
-
-        if (on) {
-          chrome.storage.local.set({
-            cloudMode: true,
-            ocrMode: 'lens',
-            modelType: 'openrouter',
-            inpaintMode: 'none',
-            colorize: false,
-          });
-          await pushCloudModeFromPopup(serverUrl);
-        } else {
-          chrome.storage.local.set({ cloudMode: false });
-          await disableCloudModeOnServer(serverUrl);
-        }
-      };
-    } catch (e) {
-      console.warn('[MangaTranslator] Popup secondary wiring failed:', e);
-    }
+    };
   }
 
   function toggleFloatPopup() {
     if (floatPopup.style.display === 'block') {
       floatPopup.style.display = 'none';
     } else {
-      // Re-sync dropdowns + API key with cache every time popup opens
-      loadCachedSettingsIntoPopup();
-      refreshFontWeightSelection();
-      chrome.storage.local.get(['serverUrl'], (d) => initFontFamilyPicker(d.serverUrl || ''));
       floatPopup.style.display = 'block';
     }
   }
@@ -913,12 +774,13 @@
             <tr>
               <th style="padding: 8px; border: 1px solid #444; text-align: left; background: #1e1e2e; color: #fff;">Repo ID</th>
               <th style="padding: 8px; border: 1px solid #444; text-align: left; background: #1e1e2e; color: #fff;">Filename</th>
+              <th style="padding: 8px; border: 1px solid #444; text-align: left; background: #1e1e2e; color: #fff;">Capability</th>
               <th style="padding: 8px; border: 1px solid #444; text-align: left; background: #1e1e2e; color: #fff;">Size (MB)</th>
               <th style="padding: 8px; border: 1px solid #444; text-align: left; background: #1e1e2e; color: #fff;">Action</th>
             </tr>
           </thead>
           <tbody>
-            <tr><td colspan="4" style="text-align:center; padding: 8px; border: 1px solid #444; color: #aaa;">Click "Refresh List" to load models...</td></tr>
+            <tr><td colspan="5" style="text-align:center; padding: 8px; border: 1px solid #444; color: #aaa;">Click "Refresh List" to load models...</td></tr>
           </tbody>
         </table>
 
@@ -974,7 +836,7 @@
     modal.querySelector('#mtRefreshModelsBtn').addEventListener('click', async () => {
       const serverUrl  = modal.querySelector('#mtOptServerUrl').value.trim().replace(/\/$/, '');
       const tableBody  = modal.querySelector('#mtModelsTable tbody');
-      tableBody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 8px; border: 1px solid #444; color: #aaa;">Loading...</td></tr>';
+      tableBody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 8px; border: 1px solid #444; color: #aaa;">Loading...</td></tr>';
       try {
         const res  = await fetch(`${serverUrl}/v1/listmodels`);
         const data = await res.json();
@@ -985,6 +847,7 @@
             tr.innerHTML = `
               <td style="padding: 8px; border: 1px solid #444; color: #ccc;">${m.repo_id}</td>
               <td style="padding: 8px; border: 1px solid #444; color: #ccc;">${m.filename}</td>
+              <td style="padding: 8px; border: 1px solid #444;"><span style="display:inline-block;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:bold;background:${m.vision_capable ? '#164d2b' : '#30303d'};color:${m.vision_capable ? '#7dffad' : '#aaa'};border:1px solid ${m.vision_capable ? '#287a47' : '#555'};">${m.vision_capable ? 'Vision OCR' : 'Text only'}</span></td>
               <td style="padding: 8px; border: 1px solid #444; color: #ccc;">${m.size_mb}</td>
               <td style="padding: 8px; border: 1px solid #444;">
                 <button class="mt-switch-btn" data-repo="${m.repo_id}" data-file="${m.filename}"
@@ -1009,6 +872,13 @@
                 const data = await res.json();
                 if (res.ok) {
                   modal.querySelector('#mtModelInstallStatus').innerText = `Active: ${data.repo_id}/${data.filename}`;
+                  const modelType = document.getElementById('mtModelTypeSelect');
+                  const cloudMode = document.getElementById('mtCloudMode');
+                  if (modelType) modelType.value = 'local';
+                  if (cloudMode) cloudMode.checked = false;
+                  const inpaintMode = document.getElementById('mtInpaintMode');
+                  if (inpaintMode) inpaintMode.value = 'low';
+                  chrome.storage.local.set({ modelType: 'local', cloudMode: false, inpaintMode: 'low' });
                 } else {
                   modal.querySelector('#mtModelInstallStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
                 }
@@ -1018,10 +888,10 @@
             });
           });
         } else {
-          tableBody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 8px; border: 1px solid #444; color: #aaa;">No models found.</td></tr>';
+          tableBody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 8px; border: 1px solid #444; color: #aaa;">No models found.</td></tr>';
         }
       } catch (e) {
-        tableBody.innerHTML = `<tr><td colspan="4" style="text-align:center; padding: 8px; border: 1px solid #444; color:#ff4d4d;">Error: ${e}</td></tr>`;
+        tableBody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding: 8px; border: 1px solid #444; color:#ff4d4d;">Error: ${e}</td></tr>`;
       }
     });
 
@@ -1040,6 +910,13 @@
         const data = await res.json();
         if (res.ok) {
           modal.querySelector('#mtModelInstallStatus').innerText = `Success! Active: ${data.repo_id}/${data.filename}`;
+          const modelType = document.getElementById('mtModelTypeSelect');
+          const cloudMode = document.getElementById('mtCloudMode');
+          if (modelType) modelType.value = 'local';
+          if (cloudMode) cloudMode.checked = false;
+          const inpaintMode = document.getElementById('mtInpaintMode');
+          if (inpaintMode) inpaintMode.value = 'low';
+          chrome.storage.local.set({ modelType: 'local', cloudMode: false, inpaintMode: 'low' });
           modal.querySelector('#mtRefreshModelsBtn').click();
         } else {
           modal.querySelector('#mtModelInstallStatus').innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
@@ -1052,10 +929,44 @@
 
   injectUI();
 
+  // Expose the image finder + translate trigger for reader.js so the reader
+  // can pull the same translatable-image list the popup uses, and trigger
+  // translation from its own toolbar.
+  window.__mtFindTranslatableImages = findAllTranslatableImages;
+  window.__mtStartTranslation = (ocrLang, targetLang, opts) =>
+    startTranslationProcess(ocrLang, targetLang, opts);
+
+  // ── Swipe up to return to reader ──────────────────────────────────────
+  // If the user recently exited the reader (within 30s) and swipes up from
+  // the bottom of the page, re-open the reader at their last position.
+  if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+    let swipeStartY = 0;
+    document.addEventListener('touchstart', (e) => {
+      const t = e.changedTouches[0];
+      swipeStartY = t.clientY;
+    }, { passive: true });
+    document.addEventListener('touchend', (e) => {
+      const t = e.changedTouches[0];
+      const dy = t.clientY - swipeStartY;
+      // Swipe up from the bottom 15% of the screen.
+      if (dy < -80 && Math.abs(dy) > Math.abs(t.clientX - (e.changedTouches[0] && 0)) &&
+          swipeStartY > window.innerHeight * 0.85) {
+        // Check if the reader was recently active.
+        const exitTime = parseInt(sessionStorage.getItem('mtReaderExitTime') || '0', 10);
+        if (exitTime && (Date.now() - exitTime) < 30000) {
+          if (typeof window.__mtOpenReader === 'function') {
+            console.log('[MangaTranslator] Swipe-up detected — reopening reader.');
+            window.__mtOpenReader();
+          }
+        }
+      }
+    }, { passive: true });
+  }
+
   // ========================================================================
   // MAIN TRANSLATION PROCESS (unchanged)
   // ========================================================================
-  async function startTranslationProcess(selectedOcrLang, selectedTargetLang) {
+  async function startTranslationProcess(selectedOcrLang, selectedTargetLang, opts = {}) {
     if (isTranslating) {
       console.warn("[MangaTranslator] Already translating, ignoring request.");
       return;
@@ -1063,7 +974,11 @@
     isTranslating = true;
     floatPopup.style.display = 'none';
 
-    const stored = await chrome.storage.local.get(['serverUrl', 'ocrLang', 'colorize', 'targetLang']);
+    const stored = await chrome.storage.local.get([
+      'serverUrl', 'ocrLang', 'colorize', 'targetLang', 'combineAmount',
+      'contextMode', 'contextLevel', 'styleFontBold', 'styleFontItalic', 'styleFontRegular',
+      'skipSfx', 'contextAware',
+    ]);
 
     if (!stored.serverUrl) {
       alert("Please set your FastAPI Server URL in the extension popup or Advanced Settings!");
@@ -1075,8 +990,23 @@
     const targetOcr      = selectedOcrLang   || stored.ocrLang   || 'ja';
     const targetLanguage = selectedTargetLang || stored.targetLang || 'en';
     const colorize       = stored.colorize !== false;
+    // Combine amount: explicit opts first, then cached, then default 1.
+    const combineAmount  = Math.max(1, Math.min(20, parseInt(opts.combineAmount ?? stored.combineAmount ?? '1', 10) || 1));
+    // Merged context setting: explicit opts first, then cached, then legacy migration.
+    const contextMode = opts.contextMode
+      || stored.contextMode
+      || ((stored.skipSfx === true || stored.contextAware === true) ? 'on' : 'off');
+    const contextOn = contextMode === 'on';
+    const contextLevel = (opts.contextLevel || stored.contextLevel) === 'high' ? 'high' : 'low';
+    const styleAware = contextOn && contextLevel === 'high';
+    const styleFonts = opts.styleFonts || {
+      bold: stored.styleFontBold || '',
+      italic: stored.styleFontItalic || '',
+      regular: stored.styleFontRegular || '',
+    };
+    const groupOpts = { contextOn, contextLevel, styleAware, styleFonts };
 
-    console.log(`[MangaTranslator] Starting — OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize}, Server: ${serverUrl}`);
+    console.log(`[MangaTranslator] Starting — OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize}, Combine: ${combineAmount}, Context: ${contextMode}/${contextLevel}, Server: ${serverUrl}`);
 
     let images = findAllTranslatableImages();
     if (images.length === 0) {
@@ -1089,33 +1019,261 @@
 
     console.log(`[MangaTranslator] Found ${images.length} images to translate.`);
 
-    const spinners = images.map(img => createSpinner(img));
-    const overlay  = createProgressOverlay(images.length, targetOcr, colorize, targetLanguage);
+    // ── Chunk into groups of `combineAmount` (27 / 10 → [10, 10, 7]) ──
+    const groups = [];
+    for (let i = 0; i < images.length; i += combineAmount) {
+      groups.push(images.slice(i, i + combineAmount));
+    }
+    console.log(`[MangaTranslator] Grouped into ${groups.length} group(s): ${groups.map(g => g.length).join(', ')}`);
 
-    let processedCount = 0;
-    for (const img of images) {
-      updateOverlay(overlay, processedCount, images.length, img.src);
-      img.style.outline = '4px solid yellow';
-      img.style.outlineOffset = '-4px';
+    const overlay = createProgressOverlay(images.length, targetOcr, colorize, targetLanguage);
+
+    let processedImages = 0;
+    let failedImages = 0;
+
+    // ── Dispatch in waves of WAVE_SIZE concurrent jobs ────────────────────
+    // Each group is an independent server job: processImage and
+    // processImageGroup share no state, and the backend's Lens client already
+    // caps its own fan-out with an internal semaphore, so several jobs can be
+    // in flight safely.
+    //
+    // Waves rather than a rolling pool, by request: every job in a wave has to
+    // finish before the next wave is dispatched. That also bounds peak memory
+    // to WAVE_SIZE stitched canvases instead of the whole chapter, and keeps
+    // page order roughly intact so the reader fills in top-to-bottom.
+    const WAVE_SIZE = 3;
+
+    async function runGroup(group, gIdx) {
+      const spinner = createSpinner(group[0]);
+      group.forEach(img => {
+        img.style.outline = '4px solid yellow';
+        img.style.outlineOffset = '-4px';
+      });
 
       try {
-        await processImage(img, serverUrl, colorize, targetLanguage, targetOcr);
-        console.log(`[MangaTranslator] ✅ Done: ${img.dataset.mtTargetSrc}`);
+        if (group.length === 1) {
+          await processImage(group[0], serverUrl, colorize, targetLanguage, targetOcr, groupOpts);
+          console.log(`[MangaTranslator] ✅ Done: ${group[0].dataset.mtTargetSrc}`);
+        } else {
+          await processImageGroup(group, serverUrl, colorize, targetLanguage, targetOcr, groupOpts);
+          console.log(`[MangaTranslator] ✅ Group ${gIdx + 1}/${groups.length} done (${group.length} images)`);
+        }
       } catch (e) {
-        console.error(`[MangaTranslator] ❌ Failed: ${img.src}`, e);
+        failedImages += group.length;
+        console.error(`[MangaTranslator] ❌ Group ${gIdx + 1} failed before image replacement:`, e);
       }
 
-      img.style.outline = '';
-      const spinner = spinners.shift();
-      if (spinner) spinner.remove();
-
-      processedCount++;
-      updateOverlay(overlay, processedCount, images.length);
+      group.forEach(img => { img.style.outline = ''; });
+      spinner.remove();
+      // Counter is only touched after an await, and JS runs these callbacks on
+      // one thread, so += needs no guarding.
+      processedImages += group.length;
+      updateOverlay(overlay, processedImages, images.length);
     }
 
-    overlay.innerText = `✅ Done! (OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize ? 'On' : 'Off'})`;
-    setTimeout(() => overlay.remove(), 4000);
+    for (let wStart = 0; wStart < groups.length; wStart += WAVE_SIZE) {
+      const wave = groups.slice(wStart, wStart + WAVE_SIZE);
+      if (combineAmount > 1) {
+        updateOverlayGroup(overlay, wStart + 1, groups.length, wave[0].length, processedImages, images.length);
+      } else {
+        updateOverlay(overlay, processedImages, images.length);
+      }
+      console.log(`[MangaTranslator] Wave ${Math.floor(wStart / WAVE_SIZE) + 1}: dispatching ${wave.length} job(s) concurrently`);
+      await Promise.all(wave.map((g, i) => runGroup(g, wStart + i)));
+    }
+
+    // Every page keeps its own image — combine groups are sliced back apart
+    // after translation, so there is nothing to hide or restore here.
+    if (failedImages > 0) {
+      overlay.innerText = `Translation finished with ${failedImages} failed image${failedImages === 1 ? '' : 's'}. Open the extension service-worker and page consoles for the exact handoff error.`;
+      overlay.style.background = 'rgba(120, 24, 24, 0.97)';
+      setTimeout(() => overlay.remove(), 12000);
+    } else {
+      overlay.innerText = `Done! (OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize ? 'On' : 'Off'}, Combine: ${combineAmount})`;
+      setTimeout(() => overlay.remove(), 4000);
+    }
     isTranslating = false;
+    // Final sweep signal: individual pages already fired mt-image-translated,
+    // but a run can also fail partway or finish out of order. The reader does
+    // one full reconcile here so nothing is left showing a stale source.
+    try {
+      document.dispatchEvent(new CustomEvent('mt-translation-complete'));
+    } catch (e) {}
+  }
+
+  // ========================================================================
+  // PROCESS A GROUP OF IMAGES (combine > ocr > translate > overlay > uncombine)
+  // ========================================================================
+  // Fetches each image's full-res bytes, stitches them vertically into one
+  // canvas (centered on the widest, white background), sends the stitched
+  // image through the normal translate flow so the backend can OCR across
+  // page boundaries, then slices the returned overlaid image back apart along
+  // the original page seams and puts each slice on its own <img>. Every page
+  // in the group keeps its own element — nothing is hidden or removed.
+  async function processImageGroup(group, serverUrl, colorize, targetLang, ocrLang, opts = {}) {
+    // 1. Fetch each image's full-res bytes.
+    const fetched = [];
+    for (const img of group) {
+      try {
+        const r = await sendRuntimeMessage(
+          { type: "fetchImage", url: img.dataset.mtTargetSrc },
+          `Group image fetch timed out: ${img.dataset.mtTargetSrc}`,
+        );
+        if (r.success) fetched.push({ img, dataUrl: r.base64 });
+        else console.warn(`[MangaTranslator] Fetch failed in group: ${img.dataset.mtTargetSrc}`);
+      } catch (e) {
+        console.warn(`[MangaTranslator] Fetch error in group: ${e}`);
+      }
+    }
+    if (fetched.length === 0) throw new Error("No images in group could be fetched");
+
+    // 2. Load each into an HTMLImageElement to measure dimensions.
+    const loaded = await Promise.all(fetched.map(f => new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve({ img: f.img, el });
+      el.onerror = () => reject(new Error("img load failed"));
+      el.src = f.dataUrl;
+    })));
+
+    // 3. Compute stitched canvas dimensions.
+    const maxW = Math.max(...loaded.map(l => l.el.naturalWidth));
+    const totalH = loaded.reduce((sum, l) => sum + l.el.naturalHeight, 0);
+    const canvas = document.createElement('canvas');
+    canvas.width = maxW;
+    canvas.height = totalH;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, maxW, totalH);
+
+    // 4. Draw each image centered horizontally, stacked vertically. Record
+    //    each page's placement so the translated result can be sliced back
+    //    apart along the exact same seams (the uncombine step).
+    const seams = [];
+    let y = 0;
+    for (const l of loaded) {
+      const x = Math.floor((maxW - l.el.naturalWidth) / 2);
+      ctx.drawImage(l.el, 0, 0, l.el.naturalWidth, l.el.naturalHeight, x, y, l.el.naturalWidth, l.el.naturalHeight);
+      seams.push({ img: l.img, x, y, w: l.el.naturalWidth, h: l.el.naturalHeight });
+      y += l.el.naturalHeight;
+    }
+    const stitchedDataUrl = canvas.toDataURL('image/png');
+
+    // 5. Send the stitched image for translation. OCR + translation run over
+    //    the whole strip so dialogue that spans a page break is read as one
+    //    unit, and the backend overlays the text before returning it.
+    const initialSubmitResponse = await sendRuntimeMessage({
+      type: "submitImage",
+      serverUrl:   serverUrl,
+      base64Data:  stitchedDataUrl,
+      colorize:    colorize,
+      targetLang:  targetLang,
+      ocrLang:     ocrLang,
+      contextMode:  opts.contextOn ? 'on' : 'off',
+      contextLevel: opts.contextLevel || 'low',
+      styleAware:   opts.styleAware === true,
+      styleFonts:   opts.styleFonts || null,
+    }, "Grouped backend submission timed out", 60000);
+    const submitResponse = await finishBackendTranslation(serverUrl, initialSubmitResponse);
+    const translatedStripDataUrl = submitResponse.image_data_url
+      || (submitResponse.image_b64 ? `data:image/png;base64,${submitResponse.image_b64}` : '');
+    if (!translatedStripDataUrl) {
+      throw new Error(`Backend job ${submitResponse.job_id || 'unknown'} completed without a rendered image`);
+    }
+
+    // 6. Uncombine: load the overlaid strip and cut it back into per-page
+    //    images. The backend may return the strip at a different scale than
+    //    we sent it (colorize/upscale paths resize), so derive a scale factor
+    //    from the returned dimensions and map the seam coordinates through it
+    //    instead of assuming a 1:1 pixel match.
+    const translatedStrip = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("translated strip load failed"));
+      el.src = translatedStripDataUrl;
+    });
+
+    const scaleX = translatedStrip.naturalWidth / maxW;
+    const scaleY = translatedStrip.naturalHeight / totalH;
+
+    const sliceCanvas = document.createElement('canvas');
+    const sliceCtx = sliceCanvas.getContext('2d');
+
+    for (const s of seams) {
+      const sx = Math.round(s.x * scaleX);
+      const sy = Math.round(s.y * scaleY);
+      const sw = Math.max(1, Math.round(s.w * scaleX));
+      const sh = Math.max(1, Math.round(s.h * scaleY));
+
+      sliceCanvas.width = sw;
+      sliceCanvas.height = sh;
+      sliceCtx.clearRect(0, 0, sw, sh);
+      sliceCtx.drawImage(translatedStrip, sx, sy, sw, sh, 0, 0, sw, sh);
+
+      await applyTranslatedSrc(s.img, sliceCanvas.toDataURL('image/png'));
+    }
+  }
+
+  function loadTranslatedImage(newSrc) {
+    return new Promise((resolve, reject) => {
+      if (typeof newSrc !== 'string' || !newSrc.startsWith('data:image/')) {
+        reject(new Error('Backend returned an invalid translated image data URL'));
+        return;
+      }
+      const probe = new Image();
+      probe.onload = () => {
+        if (!probe.naturalWidth || !probe.naturalHeight) {
+          reject(new Error('Translated image decoded with zero dimensions'));
+          return;
+        }
+        resolve({ width: probe.naturalWidth, height: probe.naturalHeight });
+      };
+      probe.onerror = () => reject(new Error('Translated image could not be decoded by the page'));
+      probe.src = newSrc;
+    });
+  }
+
+  // Points an <img> (and any <picture>/srcset siblings that would otherwise
+  // win the resolution race) at a translated result, and marks it so the
+  // finder skips it and the reader notices the update.
+  async function applyTranslatedSrc(img, newSrc) {
+    const decoded = await loadTranslatedImage(newSrc);
+    if (!img || !img.isConnected) {
+      throw new Error('The target page image was removed before translation finished');
+    }
+    if (!img.dataset.mtOriginalSrc) img.dataset.mtOriginalSrc = img.currentSrc || img.src;
+
+    const picture = img.closest('picture');
+    if (picture) {
+      picture.querySelectorAll('source').forEach(source => {
+        source.removeAttribute('srcset');
+        source.removeAttribute('data-srcset');
+      });
+    }
+    img.removeAttribute('srcset');
+    img.removeAttribute('data-srcset');
+    img.srcset = '';
+    for (const attr of ['data-src', 'data-original', 'data-lazy-src', 'data-url', 'data-image']) {
+      if (img.hasAttribute(attr)) img.removeAttribute(attr);
+    }
+    img.src = newSrc;
+    img.setAttribute('src', newSrc);
+    img.dataset.mtTargetSrc = newSrc;
+    img.setAttribute('data-mt-translated', 'true');
+
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const liveSrc = img.currentSrc || img.src;
+    const replaced = liveSrc === newSrc || img.src === newSrc || liveSrc.startsWith('data:image/');
+    if (!replaced) {
+      throw new Error(`Site restored the original image after replacement (live src: ${liveSrc.slice(0, 120)})`);
+    }
+
+    console.log(
+      `[MangaTranslator] Replaced page image with translated PNG ${decoded.width}x${decoded.height} ` +
+      `(${Math.round(newSrc.length / 1024)} KiB data URL).`
+    );
+    try {
+      document.dispatchEvent(new CustomEvent('mt-image-translated', { detail: { img } }));
+    } catch (e) {}
   }
 
   // ========================================================================
@@ -1146,17 +1304,56 @@
   // ========================================================================
   // IMAGE FINDER
   // ========================================================================
-  function findAllTranslatableImages() {
+  // The size/pixel/aspect/non-data: gates below all answer one question: "is
+  // this <img> a manga page worth sending to the backend?" For a page we have
+  // already translated that question is settled, so callers that just want to
+  // DISPLAY pages (the reader) pass includeTranslated and skip the re-decision.
+  // Overlaid results fail several of those gates on purpose: they are inline
+  // data: URLs, and the backend returns them smaller than the source, so the
+  // 200px box floor and the 700k-pixel floor both drop them.
+  function findAllTranslatableImages(opts = {}) {
+    const includeTranslated = opts.includeTranslated === true;
     const allImages  = Array.from(document.querySelectorAll('img'));
     const validImages = [];
 
     for (const img of allImages) {
-      if (img.hasAttribute('data-mt-translated')) continue;
+      // The reader renders its own <img> copies of every page inside its
+      // overlay. Translating those is worthless — renderMode() destroys and
+      // rebuilds them, so the result is thrown away — and a copy can shadow
+      // the real page image in the dedupe pass below. Only ever hand back
+      // images that belong to the host page. (Off-screen proxies live in
+      // #mt-reader-proxies, outside the overlay, so they stay eligible.)
+      if (img.closest('#mt-reader-overlay')) continue;
+
+      const isTranslated = img.hasAttribute('data-mt-translated');
+      // Translate flow (the default): skip translated pages so nothing gets
+      // sent through the backend, and paid for, twice.
+      if (isTranslated && !includeTranslated) continue;
+
+      if (isTranslated) {
+        if (!isElementVisible(img)) continue;
+        // Trust the source recorded at overlay time instead of re-deriving it.
+        // getBestImageUrl would actively pick the wrong image here: it prefers
+        // data-src / data-original, which still hold the ORIGINAL untranslated
+        // URL, and its srcset parser splits on ',' which truncates a base64
+        // data: URL into an unusable "data:image/png;base64" stub.
+        if (!img.dataset.mtTargetSrc) img.dataset.mtTargetSrc = img.currentSrc || img.src;
+        validImages.push(img);
+        continue;
+      }
 
       const bestSrc = getBestImageUrl(img);
       if (!bestSrc || bestSrc.startsWith('data:') || bestSrc.startsWith('chrome://')) continue;
       if (!isElementVisible(img)) continue;
       if (!img.complete || img.naturalWidth === 0) continue;
+
+      // Reject small rendered previews/thumbnails even when the underlying
+      // source image is high-res (e.g. an 80x100 <img> pointing at a full
+      // manga page). naturalWidth/naturalHeight reflect the SOURCE image; we
+      // also check the on-page rendered box (clientWidth/clientHeight) and
+      // exclude anything drawn smaller than 200x200 — those are previews,
+      // not the actual reader page.
+      if (img.clientWidth < 200 || img.clientHeight < 200) continue;
 
       const pixelCount  = img.naturalWidth * img.naturalHeight;
       if (pixelCount < 700000) continue;
@@ -1212,34 +1409,92 @@
     return true;
   }
 
+  async function blobToDataUrl(blob) {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Could not encode the rendered image'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function finishBackendTranslation(serverUrl, response) {
+    if (!response?.success) throw new Error(response?.error || 'API submission failed');
+    if (!response.pending) return response;
+    if (!response.job_id) throw new Error('Backend accepted translation without returning a job ID');
+
+    const jobId = response.job_id;
+    const deadline = Date.now() + 15 * 60 * 1000;
+    console.log(`[MangaTranslator] Polling backend job ${jobId} from the page.`);
+    while (Date.now() < deadline) {
+      const statusResponse = await fetch(`${serverUrl}/v1/translate/${jobId}`);
+      const status = await statusResponse.json().catch(() => ({}));
+      if (!statusResponse.ok) {
+        throw new Error(`Job ${jobId} poll failed: HTTP ${statusResponse.status}: ${status.detail || JSON.stringify(status)}`);
+      }
+      if (status.status === 'failed') throw new Error(status.error || `Backend job ${jobId} failed`);
+      if (status.status === 'completed') {
+        console.log(`[MangaTranslator] Job ${jobId} completed; fetching rendered PNG.`);
+        const imageResponse = await fetch(`${serverUrl}/v1/translate/${jobId}/image`, { method: 'POST' });
+        if (!imageResponse.ok) {
+          const detail = await imageResponse.text().catch(() => '');
+          throw new Error(`Rendered image fetch failed for job ${jobId}: HTTP ${imageResponse.status}${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+        }
+        const blob = await imageResponse.blob();
+        if (!blob.size) throw new Error(`Backend returned an empty rendered image for job ${jobId}`);
+        const imageDataUrl = await blobToDataUrl(blob);
+        console.log(`[MangaTranslator] Rendered PNG received for job ${jobId}: ${blob.size} bytes.`);
+        return {
+          success: true,
+          job_id: jobId,
+          image_data_url: imageDataUrl,
+          image_b64: imageDataUrl.split(',', 2)[1] || '',
+          image_bytes: blob.size,
+        };
+      }
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+    throw new Error(`Backend job ${jobId} timed out after 15 minutes`);
+  }
+
+  async function sendRuntimeMessage(request, stage, timeoutMs = 960000) {
+    return await Promise.race([
+      chrome.runtime.sendMessage(request),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${stage} timed out after ${Math.round(timeoutMs / 1000)} seconds`)), timeoutMs)),
+    ]);
+  }
+
   // ========================================================================
   // PROCESS A SINGLE IMAGE
   // ========================================================================
-  async function processImage(img, serverUrl, colorize, targetLang, ocrLang) {
+  async function processImage(img, serverUrl, colorize, targetLang, ocrLang, opts = {}) {
     const targetSrc = img.dataset.mtTargetSrc;
+    const initialSubmitResponse = await sendRuntimeMessage({
+      type: "translateImageUrl",
+      imageUrl: targetSrc,
+      pageUrl: window.location.href,
+      tabId: null,
+      serverUrl: serverUrl,
+      colorize: colorize,
+      targetLang: targetLang,
+      ocrLang: ocrLang,
+      contextMode: opts.contextOn ? 'on' : 'off',
+      contextLevel: opts.contextLevel || 'low',
+      styleAware: opts.styleAware === true,
+      styleFonts: opts.styleFonts || null,
+    }, `Backend submission timed out: ${targetSrc}`, 60000);
+    const submitResponse = await finishBackendTranslation(serverUrl, initialSubmitResponse);
+    const translatedDataUrl = submitResponse.image_data_url
+      || (submitResponse.image_b64 ? `data:image/png;base64,${submitResponse.image_b64}` : '');
+    if (!translatedDataUrl) {
+      throw new Error(`Backend job ${submitResponse.job_id || 'unknown'} completed without a rendered image`);
+    }
+    console.log(
+      `[MangaTranslator] Received rendered image for job ${submitResponse.job_id || 'unknown'}: ` +
+      `${submitResponse.image_bytes || 'unknown'} bytes.`
+    );
 
-    const fetchResponse = await chrome.runtime.sendMessage({ type: "fetchImage", url: targetSrc });
-    if (!fetchResponse.success) throw new Error(`fetchImage failed: ${fetchResponse.error}`);
-
-    const submitResponse = await chrome.runtime.sendMessage({
-      type: "submitImage",
-      serverUrl:   serverUrl,
-      base64Data:  fetchResponse.base64,
-      colorize:    colorize,
-      targetLang:  targetLang,
-      ocrLang:     ocrLang,
-    });
-
-    if (!submitResponse.success) throw new Error(submitResponse.error || "API submission failed");
-
-    const newSrc = `data:image/png;base64,${submitResponse.image_b64}`;
-    if (!img.dataset.mtOriginalSrc) img.dataset.mtOriginalSrc = img.src;
-    img.src = newSrc;
-    img.setAttribute('data-mt-translated', 'true');
-    if (img.srcset) img.srcset = newSrc;
-
-    const picture = img.closest('picture');
-    if (picture) picture.querySelectorAll('source').forEach(s => { s.srcset = newSrc; });
+    await applyTranslatedSrc(img, translatedDataUrl);
   }
 
   // ========================================================================
@@ -1277,6 +1532,18 @@
         </div>
       `;
     }
+  }
+
+  // Group variant: shows "Group X/Y (n pages)" instead of a per-image counter.
+  function updateOverlayGroup(overlay, groupIdx, groupTotal, pagesInGroup, current, total) {
+    const pct = total > 0 ? (current / total) * 100 : 0;
+    overlay.innerHTML = `
+      <div style="margin-bottom: 8px; font-weight: bold;">Group ${groupIdx} / ${groupTotal} — ${pagesInGroup} pages stitched</div>
+      <div style="font-size: 11px; color: #aaa;">Processed ${current} / ${total} pages</div>
+      <div style="margin-top: 10px; height: 5px; background: #444; border-radius: 2px; overflow: hidden;">
+        <div style="width: ${pct}%; height: 100%; background: #0066cc; transition: width 0.3s;"></div>
+      </div>
+    `;
   }
 
 })();

@@ -1,0 +1,59 @@
+{%- macro render_content(content, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or (item.type is defined and item.type == 'image') %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain images.') }}
+                {%- endif %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+
+{{- '<|im_start|>system\n' }}
+{%- if messages[0].role == 'system' or messages[0].role == 'developer' %}
+    {{- render_content(messages[0].content, true)|trim }}
+    {%- set start_index = 1 %}
+{%- else %}
+    {%- set start_index = 0 %}
+{%- endif %}
+{{- '\nOCR every visible text region. Return only JSON: ' }}
+{{- '[{"text":"exact text","bbox":[x1,y1,x2,y2],"angle":0}]. ' }}
+{{- 'Use full-image pixel coordinates and exactly these three fields. ' }}
+{{- 'Angle is baseline tilt in degrees; straight or vertical-layout text is 0. ' }}
+{{- 'Merge only characters belonging to one line or phrase; keep unrelated blocks separate. ' }}
+{{- 'Do not guess, translate, explain, or use markdown. Return [] when no text is visible.' }}
+{{- '<|im_end|>\n' }}
+
+{%- for message in messages %}
+    {%- if loop.index0 >= start_index and message.role != 'system' and message.role != 'developer' %}
+        {%- if message.role == 'user' %}
+            {{- '<|im_start|>user\n' }}
+            {{- render_content(message.content)|trim }}
+            {{- '<|im_end|>\n' }}
+        {%- elif message.role == 'assistant' %}
+            {{- '<|im_start|>assistant\n' }}
+            {{- message.content|default('', true) }}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}

@@ -1,58 +1,125 @@
 let ruleCounter = 1;
+const IMAGE_FETCH_TIMEOUT_MS = 30000;
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "fetchImage") {
     const url = request.url;
-    const pageUrl = sender.tab.url;
-    const tabId = sender.tab.id;
+    const pageUrl = sender.tab?.url;
+    const tabId = sender.tab?.id;
+    if (!url || !pageUrl || tabId === undefined) {
+      sendResponse({ success: false, error: "Missing image URL or sender tab" });
+      return;
+    }
 
+    console.log("[BG] Fetching image for translation:", url);
     fetchImagePowerful(url, pageUrl, tabId)
-      .then(base64 => sendResponse({ success: true, base64: base64 }))
-      .catch(err => sendResponse({ success: false, error: err.toString() }));
-      
+      .then(base64 => {
+        console.log("[BG] Image ready for backend submission:", url);
+        sendResponse({ success: true, base64: base64 });
+      })
+      .catch(err => {
+        console.error("[BG] Image fetch failed:", url, err);
+        sendResponse({ success: false, error: err.toString() });
+      });
+
     return true; // Keep channel open for async
   }
-
   if (request.type === "submitImage") {
-    const { serverUrl, base64Data, colorize, targetLang, ocrLang } = request;
+    submitTranslation(request, sendResponse);
+    return true;
+  }
 
-    // Convert Base64 back to Blob for FormData
-    const byteString = atob(base64Data.split(',')[1]);
-    const arrayBuffer = new ArrayBuffer(byteString.length);
-    const uint8Array = new Uint8Array(arrayBuffer);
-    for (let i = 0; i < byteString.length; i++) {
-      uint8Array[i] = byteString.charCodeAt(i);
+  if (request.type === "translateImageUrl") {
+    const imageUrl = request.imageUrl;
+    const pageUrl = sender.tab?.url || request.pageUrl;
+    const tabId = sender.tab?.id;
+    if (!imageUrl || !pageUrl || tabId === undefined) {
+      sendResponse({ success: false, error: "Missing image URL or source tab for translation" });
+      return;
     }
-    
-    const mimeMatch = base64Data.match(/data:(.*?);base64,/);
-    const mimeString = mimeMatch ? mimeMatch[1] : "image/png";
-    const blob = new Blob([uint8Array], { type: mimeString });
-
-    const formData = new FormData();
-    formData.append("image", blob, "manga_page.png");
-    formData.append("target_lang", targetLang || "en");
-    formData.append("ocr_lang", ocrLang || "ja");
-    formData.append("colorize", colorize ? "true" : "false");
-
-    // Step 1: Create translation job
-    fetch(`${serverUrl}/v1/translate`, {
-      method: "POST",
-      body: formData
-    })
-    .then(res => res.json())
-    .then(data => {
-      if (data.job_id) {
-        // Step 2: Poll job status
-        pollTranslation(serverUrl, data.job_id, sendResponse);
-      } else {
-        sendResponse({ success: false, error: "No job ID returned" });
-      }
-    })
-    .catch(err => sendResponse({ success: false, error: err.toString() }));
-
-    return true; // Keep channel open for async
+    console.log("[BG] Fetching and submitting image in one request path:", imageUrl);
+    fetchImagePowerful(imageUrl, pageUrl, tabId)
+      .then(base64Data => submitTranslation({ ...request, base64Data }, sendResponse))
+      .catch(err => {
+        console.error("[BG] Image fetch failed before /v1/translate:", imageUrl, err);
+        sendResponse({ success: false, error: err.toString() });
+      });
+    return true;
   }
 });
+
+function submitTranslation(request, sendResponse) {
+  const { serverUrl, base64Data, colorize, targetLang, ocrLang, combineAmount,
+          contextMode, contextLevel, styleAware, styleFonts } = request;
+  const endpoint = `${String(serverUrl || '').replace(/\/$/, '')}/v1/translate`;
+    console.log("[BG] submitImage received; preparing request:", endpoint, {
+      hasBase64: typeof base64Data === 'string' && base64Data.length > 0,
+      base64Length: typeof base64Data === 'string' ? base64Data.length : 0,
+    });
+
+    if (!serverUrl || typeof base64Data !== 'string' || !base64Data.includes(',')) {
+      sendResponse({ success: false, error: "submitImage missing serverUrl or valid base64 image data" });
+      return;
+    }
+
+    try {
+      // Convert Base64 back to Blob for FormData
+      const encodedImage = base64Data.split(',')[1];
+      const byteString = atob(encodedImage);
+      const arrayBuffer = new ArrayBuffer(byteString.length);
+      const uint8Array = new Uint8Array(arrayBuffer);
+      for (let i = 0; i < byteString.length; i++) {
+        uint8Array[i] = byteString.charCodeAt(i);
+      }
+
+      const mimeMatch = base64Data.match(/data:(.*?);base64,/);
+      const mimeString = mimeMatch ? mimeMatch[1] : "image/png";
+      const blob = new Blob([uint8Array], { type: mimeString });
+
+      const formData = new FormData();
+      formData.append("image", blob, "manga_page.png");
+      formData.append("target_lang", targetLang || "en");
+      const requestedOcrLang = ocrLang || "ja";
+      formData.append(
+        "ocr_lang",
+        requestedOcrLang === (targetLang || "en") ? "auto" : requestedOcrLang
+      );
+      formData.append("colorize", colorize ? "true" : "false");
+      if (contextMode === 'on') {
+        formData.append("skip_sfx", "true");
+        formData.append("context_aware", "true");
+        formData.append("context_level", contextLevel === 'high' ? 'high' : 'low');
+      }
+      if (combineAmount && combineAmount > 1) formData.append("combine_amount", String(combineAmount));
+      if (styleAware) formData.append("style_aware", "true");
+      formData.append("style_fonts", JSON.stringify(styleFonts || {}));
+
+      console.log("[BG] Sending POST /v1/translate:", endpoint);
+      fetch(endpoint, { method: "POST", body: formData })
+        .then(async res => {
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(`HTTP ${res.status}: ${data.detail || JSON.stringify(data)}`);
+          return data;
+        })
+        .then(data => {
+          console.log("[BG] /v1/translate response:", data);
+          if (data.job_id) {
+            // Return immediately. The page content script owns the long poll;
+            // an MV3 service worker may be suspended during local GGUF work.
+            sendResponse({ success: true, pending: true, job_id: data.job_id });
+          } else sendResponse({ success: false, error: "No job ID returned" });
+        })
+        .catch(err => {
+          console.error("[BG] /v1/translate failed:", err);
+          sendResponse({ success: false, error: err.toString() });
+        });
+    } catch (err) {
+      console.error("[BG] submitImage preparation failed before /v1/translate:", err);
+      sendResponse({ success: false, error: err.toString() });
+    }
+
+    return true;
+  }
 
 async function fetchImagePowerful(url, pageUrl, tabId) {
   // --- METHOD 1: Canvas Extraction (Zero network requests, bypasses all network security) ---
@@ -120,7 +187,18 @@ async function fetchImagePowerful(url, pageUrl, tabId) {
   }
 
   try {
-    const res = await fetch(url);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(url, {
+        credentials: "include",
+        referrer: pageUrl,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`HTTP ${res.status}: ${text.substring(0, 100)}`);
@@ -150,23 +228,32 @@ async function fetchImagePowerful(url, pageUrl, tabId) {
 
 function pollTranslation(serverUrl, jobId, sendResponse) {
   let attempts = 0;
-  const maxAttempts = 60; // Timeout after ~2 minutes
+  const maxAttempts = 450; // Local vision OCR + GGUF translation can take up to 15 minutes.
 
   const poll = () => {
     fetch(`${serverUrl}/v1/translate/${jobId}`)
-      .then(res => res.json())
+      .then(async res => {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(`Job poll failed: HTTP ${res.status}: ${data.detail || JSON.stringify(data)}`);
+        return data;
+      })
       .then(data => {
         if (data.status === "completed") {
-          // Step 3: Fetch the rendered image once the job is done
+          console.log(`[BG] Job ${jobId} completed; requesting rendered image.`);
           fetchFinalImage(serverUrl, jobId, sendResponse);
         } else if (data.status === "failed") {
-          sendResponse({ success: false, error: data.error || "Server error" });
+          console.error(`[BG] Job ${jobId} failed:`, data.error);
+          sendResponse({ success: false, error: data.error || "Server error", job_id: jobId });
         } else {
           attempts++;
           if (attempts < maxAttempts) {
-            setTimeout(poll, 2000); // Wait 2s before polling again
+            setTimeout(poll, 2000);
           } else {
-            sendResponse({ success: false, error: "Polling timeout" });
+            sendResponse({
+              success: false,
+              error: `Polling timeout after 15 minutes for job ${jobId}`,
+              job_id: jobId,
+            });
           }
         }
       })
@@ -175,7 +262,7 @@ function pollTranslation(serverUrl, jobId, sendResponse) {
         if (attempts < maxAttempts) {
           setTimeout(poll, 2000);
         } else {
-          sendResponse({ success: false, error: err.toString() });
+          sendResponse({ success: false, error: err.toString(), job_id: jobId });
         }
       });
   };
@@ -184,18 +271,39 @@ function pollTranslation(serverUrl, jobId, sendResponse) {
 
 function fetchFinalImage(serverUrl, jobId, sendResponse) {
   fetch(`${serverUrl}/v1/translate/${jobId}/image`, { method: "POST" })
-    .then(res => {
-      if (!res.ok) throw new Error(`Image fetch failed: HTTP ${res.status}`);
+    .then(async res => {
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`Image fetch failed: HTTP ${res.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`);
+      }
       return res.blob();
     })
     .then(blob => {
+      if (!blob.size) throw new Error(`Rendered image for job ${jobId} was empty`);
+      console.log(`[BG] Rendered image received for job ${jobId}: ${blob.size} bytes (${blob.type || "unknown type"}).`);
       const reader = new FileReader();
       reader.onloadend = () => {
-        const base64 = reader.result.split(',')[1];
-        sendResponse({ success: true, image_b64: base64 });
+        const dataUrl = typeof reader.result === "string" ? reader.result : "";
+        const comma = dataUrl.indexOf(',');
+        const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+        if (!base64) {
+          sendResponse({ success: false, error: `Rendered image encoding failed for job ${jobId}`, job_id: jobId });
+          return;
+        }
+        console.log(`[BG] Sending rendered image for job ${jobId} to the page (${base64.length} base64 chars).`);
+        sendResponse({
+          success: true,
+          image_b64: base64,
+          image_data_url: dataUrl,
+          image_bytes: blob.size,
+          job_id: jobId,
+        });
       };
-      reader.onerror = () => sendResponse({ success: false, error: "FileReader error" });
+      reader.onerror = () => sendResponse({ success: false, error: "FileReader error", job_id: jobId });
       reader.readAsDataURL(blob);
     })
-    .catch(err => sendResponse({ success: false, error: err.toString() }));
+    .catch(err => {
+      console.error(`[BG] Rendered image handoff failed for job ${jobId}:`, err);
+      sendResponse({ success: false, error: err.toString(), job_id: jobId });
+    });
 }

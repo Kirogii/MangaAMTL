@@ -7,28 +7,6 @@ function _mtFontFilenameFromPath(fontPath) {
   return (fontPath || '').split(/[\\/]/).pop();
 }
 
-async function getActiveFontFace(serverUrl) {
-  const infoRes = await fetch(`${serverUrl}/GetFont`);
-  if (!infoRes.ok) throw new Error(`GetFont failed: HTTP ${infoRes.status}`);
-  const info = await infoRes.json();
-  const filename = _mtFontFilenameFromPath(info.font_path);
-  const cacheKey = `${serverUrl}::${filename}`;
-
-  if (_mtFontByteCache.has(cacheKey)) {
-    return { face: _mtFontByteCache.get(cacheKey), filename, strokeWidth: info.stroke_width };
-  }
-
-  const res = await fetch(`${serverUrl}/v1/font`);
-  if (!res.ok) throw new Error(`font fetch failed: HTTP ${res.status}`);
-  const buf = await res.arrayBuffer();
-  const family = `MTFont_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
-  const face = new FontFace(family, buf);
-  await face.load();
-  document.fonts.add(face);
-  _mtFontByteCache.set(cacheKey, face);
-  return { face, filename, strokeWidth: info.stroke_width };
-}
-
 // Load a specific font (by filename) as a FontFace so a preview element can be
 // rendered in that font's own typeface. Returns the CSS family name, or null
 // if the font could not be loaded.
@@ -49,85 +27,6 @@ async function loadFontFaceByName(serverUrl, filename) {
   } catch (e) {
     console.warn(`[MangaTranslator] Could not load font preview for ${filename}:`, e);
     return null;
-  }
-}
-
-function drawFontWeightSwatch(canvas, level, fontFamily) {
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  const dpr = window.devicePixelRatio || 1;
-
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#8a8a8a';
-  ctx.fillRect(0, 0, w, h);
-
-  const fontSize = (16 + level * 2) * dpr;
-  ctx.font = `${fontSize}px "${fontFamily}"`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.lineJoin = 'round';
-  const text = 'Aあ';
-  const cx = (w * dpr) / 2, cy = (h * dpr) / 2;
-
-  if (level > 0) {
-    ctx.lineWidth = level * 2.2 * dpr;
-    ctx.strokeStyle = '#ffffff';
-    ctx.strokeText(text, cx, cy);
-  }
-  ctx.fillStyle = '#111111';
-  ctx.fillText(text, cx, cy);
-}
-
-async function initFontWeightPicker() {
-  const container = document.getElementById('fontWeightPicker');
-  if (!container) return;
-  container.innerHTML = '';
-
-  const { serverUrl, fontWeight } = await chrome.storage.local.get(['serverUrl', 'fontWeight']);
-  const selected = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
-  document.getElementById('fontWeightHidden').value = selected;
-
-  let fontFamily = 'sans-serif';
-  if (serverUrl) {
-    try {
-      const { face } = await getActiveFontFace(serverUrl);
-      fontFamily = face.family;
-    } catch (e) {
-      console.warn('[MangaTranslator] Could not load server font for preview, using fallback:', e);
-    }
-  }
-
-  const labels = ['Thin', 'Light', 'Regular', 'Bold', 'Heavy'];
-  for (let level = 0; level <= 4; level++) {
-    const wrap = document.createElement('div');
-    wrap.style.cssText = 'display:flex; flex-direction:column; align-items:center; cursor:pointer;';
-    wrap.title = `${level + 1} - ${labels[level]}`;
-
-    const dpr = window.devicePixelRatio || 1;
-    const canvas = document.createElement('canvas');
-    const cssW = 44, cssH = 34;
-    canvas.style.width = cssW + 'px';
-    canvas.style.height = cssH + 'px';
-    canvas.width = cssW * dpr;
-    canvas.height = cssH * dpr;
-    canvas.dataset.level = level;
-    canvas.style.cssText += `border-radius:4px; border:2px solid ${level === selected ? '#28a745' : '#555'}; display:block;`;
-    drawFontWeightSwatch(canvas, level, fontFamily);
-
-    const lbl = document.createElement('div');
-    lbl.innerText = level + 1;
-    lbl.style.cssText = 'font-size:10px; color:#aaa; margin-top:2px;';
-
-    wrap.appendChild(canvas);
-    wrap.appendChild(lbl);
-    wrap.onclick = () => {
-      document.getElementById('fontWeightHidden').value = level;
-      chrome.storage.local.set({ fontWeight: String(level) });
-      container.querySelectorAll('canvas').forEach(c => {
-        c.style.border = `2px solid ${parseInt(c.dataset.level, 10) === level ? '#28a745' : '#555'}`;
-      });
-    };
-    container.appendChild(wrap);
   }
 }
 
@@ -198,13 +97,10 @@ async function selectFontFamily(serverUrl, filename, container) {
   const statusEl = document.getElementById('fontFamilyStatus');
   statusEl.innerText = `Switching to ${filename}...`;
   try {
-    const { fontWeight } = await chrome.storage.local.get(['fontWeight']);
-    const strokeWidth = fontWeight !== undefined ? parseInt(fontWeight, 10) : 2;
-
     const res = await fetch(`${serverUrl}/SetFont`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ font_name: filename, stroke_width: strokeWidth })
+      body: JSON.stringify({ font_name: filename })
     });
     const data = await res.json();
     if (!res.ok) {
@@ -217,10 +113,74 @@ async function selectFontFamily(serverUrl, filename, container) {
     container.querySelectorAll('.font-chip').forEach(c => {
       c.classList.toggle('active', c.dataset.filename === filename);
     });
-
-    await initFontWeightPicker();
   } catch (e) {
     statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${e}</span>`;
+  }
+}
+
+// ============================================================================
+// STYLE FONT PICKERS
+// ============================================================================
+const STYLE_FONT_FIELDS = [
+  { style: 'bold', selectId: 'styleFontBold', storageKey: 'styleFontBold' },
+  { style: 'italic', selectId: 'styleFontItalic', storageKey: 'styleFontItalic' },
+  { style: 'regular', selectId: 'styleFontRegular', storageKey: 'styleFontRegular' },
+];
+
+// Fill the three per-style <select>s with the server's font list, restore the
+// saved choice for each, and persist changes. An empty value means "use the
+// main font" and is always kept as the first option.
+async function initStyleFontPickers(serverUrl, saved) {
+  const statusEl = document.getElementById('styleFontStatus');
+  const selects = STYLE_FONT_FIELDS.map(f => ({
+    ...f,
+    el: document.getElementById(f.selectId),
+    savedValue: (saved && saved[f.storageKey]) || '',
+  })).filter(f => f.el);
+  if (selects.length === 0) return;
+
+  const bind = (f) => {
+    f.el.value = f.savedValue;
+    f.el.onchange = () => chrome.storage.local.set({ [f.storageKey]: f.el.value });
+  };
+
+  if (!serverUrl) {
+    if (statusEl) statusEl.innerText = 'Set a Server URL to list fonts.';
+    selects.forEach(bind);
+    return;
+  }
+
+  if (statusEl) statusEl.innerText = 'Loading fonts…';
+  let fonts = [];
+  try {
+    const res = await fetch(`${serverUrl}/GetFonts`);
+    const data = await res.json();
+    fonts = data.fonts || [];
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = `<span style="color:#ff4d4d;">Could not load fonts: ${e}</span>`;
+    selects.forEach(bind);
+    return;
+  }
+
+  selects.forEach(f => {
+    // Keep the pre-seeded "Main font" option, drop anything stale after it.
+    while (f.el.options.length > 1) f.el.remove(1);
+    fonts.forEach(font => {
+      const opt = document.createElement('option');
+      opt.value = font.filename;
+      opt.textContent = font.name;
+      f.el.appendChild(opt);
+      loadFontFaceByName(serverUrl, font.filename).then(family => {
+        if (family) opt.style.fontFamily = `"${family}", sans-serif`;
+      });
+    });
+    bind(f);
+  });
+
+  if (statusEl) {
+    statusEl.innerText = fonts.length
+      ? `${fonts.length} fonts available.`
+      : 'No fonts found in server fonts folder.';
   }
 }
 
@@ -279,6 +239,17 @@ async function pushInpaintMode(serverUrl, mode) {
   }
 }
 
+function ocrModeLabel(mode) {
+  switch (mode) {
+    case 'lens': return 'Google Lens active';
+    case 'glm': return 'GLM active';
+    case 'openai_endpoint': return 'OpenAI Endpoint OCR active';
+    case 'google_ai': return 'Google AI Studio OCR active (all text)';
+    case 'local_vision': return 'Local GGUF Vision OCR active';
+    default: return 'Hayai active';
+  }
+}
+
 async function syncOcrModeFromServer(serverUrl) {
   const statusEl = document.getElementById('ocrModeStatus');
   if (!serverUrl) return;
@@ -286,8 +257,10 @@ async function syncOcrModeFromServer(serverUrl) {
     const res = await fetch(`${serverUrl}/GetOcrMode`);
     const data = await res.json();
     document.getElementById('ocrMode').value = data.ocr_mode || 'hayai';
+    document.getElementById('openaiOcrBox').style.display = data.ocr_mode === 'openai_endpoint' ? 'block' : 'none';
+    document.getElementById('googleAiOcrBox').style.display = data.ocr_mode === 'google_ai' ? 'block' : 'none';
     chrome.storage.local.set({ ocrMode: data.ocr_mode || 'hayai' });
-    statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+    statusEl.innerText = ocrModeLabel(data.ocr_mode);
   } catch (e) {
     console.warn('[MangaTranslator] Could not fetch OCR mode from server:', e);
   }
@@ -308,7 +281,7 @@ async function pushOcrMode(serverUrl, mode) {
     });
     const data = await res.json();
     if (res.ok) {
-      statusEl.innerText = data.ocr_mode === 'lens' ? 'Google Lens active' : (data.ocr_mode === 'glm' ? 'GLM active' : 'Hayai active');
+      statusEl.innerText = ocrModeLabel(data.ocr_mode);
       chrome.storage.local.set({ ocrMode: data.ocr_mode });
     } else {
       statusEl.innerHTML = `<span style="color:#ff4d4d;">Error: ${data.detail}</span>`;
@@ -341,6 +314,36 @@ function applyCloudMode(on) {
   // Lock the local-resource controls while cloud mode is active.
   [ocrModeEl, inpaintEl, colorizeEl].forEach(el => { el.disabled = on; });
   modelTypeEl.disabled = on;
+  applyContextLevelGate();
+}
+
+// ============================================================================
+// CONTEXT LEVEL GATE — High rides on a vision request, which only OpenRouter
+// can make. Cloud mode forces the backend to OpenRouter, so it counts as
+// eligible even before the modelType select is read back.
+// ============================================================================
+// Assigned by the DOMContentLoaded handler once the context controls exist;
+// the gate calls it so the style-font button follows a forced level change.
+let applyCtxVisibility = () => {};
+
+function applyContextLevelGate() {
+  const ctxLevelEl = document.getElementById('contextLevel');
+  if (!ctxLevelEl) return;
+  const cloudOn = document.getElementById('cloudMode')?.checked === true;
+  const isOpenRouter = cloudOn || document.getElementById('modelType')?.value === 'openrouter';
+
+  const highOpt = ctxLevelEl.querySelector('option[value="high"]');
+  if (highOpt) highOpt.disabled = !isOpenRouter;
+
+  if (!isOpenRouter && ctxLevelEl.value === 'high') {
+    ctxLevelEl.value = 'low';
+    chrome.storage.local.set({ contextLevel: 'low' });
+  }
+
+  const note = document.getElementById('contextHighNote');
+  if (note) note.style.display = isOpenRouter ? 'none' : 'block';
+
+  applyCtxVisibility();
 }
 
 // Push the cloud-mode server settings (lens + openrouter + none) so the backend
@@ -404,15 +407,125 @@ async function disableCloudModeOnServer(serverUrl) {
 }
 
 // ============================================================================
+// Unified settings push — single POST to /SetAllSettings before Translate.
+// Handles the cloud-mode-restart problem: if the backend was restarted (its
+// in-memory settings reset to defaults) while cloud mode was on in the
+// extension, this re-applies the correct state in one shot.
+// ============================================================================
+async function pushAllSettings(serverUrl, settings) {
+  if (!serverUrl) {
+    return { ok: false, error: 'Set a FastAPI Server URL first.' };
+  }
+  try {
+    const res = await fetch(`${serverUrl}/SetAllSettings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const error = data.detail || `Server returned HTTP ${res.status}`;
+      console.warn('[MangaTranslator] /SetAllSettings failed:', error);
+      return { ok: false, error };
+    }
+    console.log('[MangaTranslator] Settings applied:', data.applied);
+    return { ok: true, data };
+  } catch (e) {
+    const error = `Could not apply settings: ${e.message || e}`;
+    console.warn('[MangaTranslator] /SetAllSettings error:', e);
+    return { ok: false, error };
+  }
+}
+
+// Build the full settings payload from the current popup control values.
+// In cloud mode this forces ocr=lens / model_type=openrouter / inpaint=none.
+function buildSettingsPayload() {
+  const cloudMode = document.getElementById('cloudMode').checked;
+  const contextMode = document.getElementById('contextMode').value === 'on';
+  const contextLevel = document.getElementById('contextLevel').value === 'high' ? 'high' : 'low';
+  const payload = {
+    cloud_mode: cloudMode,
+    free_openrouter: document.getElementById('freeOpenRouter').checked,
+    context_aware: contextMode,
+    context_level: contextMode ? contextLevel : 'low',
+    style_aware: contextMode && contextLevel === 'high',
+    style_fonts: {
+      bold: document.getElementById('styleFontBold').value || '',
+      italic: document.getElementById('styleFontItalic').value || '',
+      regular: document.getElementById('styleFontRegular').value || '',
+    },
+  };
+
+  if (cloudMode) {
+    // Cloud-forced state
+    payload.model_type = 'openrouter';
+    payload.ocr_mode = 'lens';
+    payload.inpaint_mode = 'none';
+    const model = document.getElementById('openrouterModel').value.trim();
+    const apiKey = document.getElementById('openrouterKey').value.trim();
+    if (model) payload.openrouter_model = model;
+    if (apiKey) payload.openrouter_api_key = apiKey;
+  } else {
+    // User's actual choices
+    payload.ocr_mode = document.getElementById('ocrMode').value;
+    const ocrEndpoint = document.getElementById('openaiOcrEndpoint').value.trim();
+    const ocrModel = document.getElementById('openaiOcrModel').value.trim();
+    const ocrKey = document.getElementById('openaiOcrKey').value.trim();
+    if (payload.ocr_mode === 'openai_endpoint') {
+      payload.openai_ocr_endpoint = ocrEndpoint;
+      payload.openai_ocr_model = ocrModel;
+      payload.openai_ocr_api_key = ocrKey;
+    }
+    if (payload.ocr_mode === 'google_ai') {
+      const selectedModel = document.getElementById('googleAiOcrModel').value;
+      payload.google_ai_ocr_api_key = document.getElementById('googleAiOcrKey').value.trim();
+      payload.google_ai_ocr_model = selectedModel === 'custom'
+        ? document.getElementById('googleAiOcrCustomModel').value.trim()
+        : selectedModel;
+      payload.google_ai_ocr_rpm = parseInt(document.getElementById('googleAiOcrRpm').value, 10) || 5;
+    }
+    payload.inpaint_mode = document.getElementById('inpaintMode').value;
+    payload.model_type = document.getElementById('modelType').value;
+    const model = document.getElementById('openrouterModel').value.trim();
+    const apiKey = document.getElementById('openrouterKey').value.trim();
+    if (model) payload.openrouter_model = model;
+    if (apiKey) payload.openrouter_api_key = apiKey;
+    // Active font filename, if known
+    const activeFont = document.querySelector('#fontFamilyScroll .font-chip.active');
+    if (activeFont && activeFont.dataset.filename) {
+      payload.font_filename = activeFont.dataset.filename;
+    }
+  }
+  return payload;
+}
+
+// ============================================================================
 // INIT — autoload all cached settings into dropdowns/fields
 // ============================================================================
+function updateLanguageWarning() {
+  const source = document.getElementById('ocrLang');
+  const target = document.getElementById('targetLang');
+  const warning = document.getElementById('languageWarning');
+  if (!source || !target || !warning) return false;
+  const same = source.value && source.value === target.value;
+  warning.innerText = same
+    ? 'Source and target languages match. Select the manga\'s original language for accurate OCR.'
+    : '';
+  return same;
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   const targetSel = document.getElementById('targetLang');
   const ocrLangSel = document.getElementById('ocrLang');
 
   const data = await chrome.storage.local.get(
-    ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'fontWeight', 'modelType',
-     'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'cloudMode']
+    ['serverUrl', 'ocrLang', 'colorize', 'targetLang', 'modelType',
+     'openrouterModel', 'openrouterApiKey', 'inpaintMode', 'ocrMode', 'cloudMode',
+     'openaiOcrEndpoint', 'openaiOcrModel', 'openaiOcrApiKey',
+     'googleAiOcrApiKey', 'googleAiOcrModel', 'googleAiOcrCustomModel', 'googleAiOcrRpm',
+     'combineAmount', 'freeOpenRouter',
+     'contextMode', 'contextLevel', 'styleFontBold', 'styleFontItalic', 'styleFontRegular',
+     'skipSfx', 'contextAware']
   );
 
   // Populate language dropdowns from the built-in list first so they're never
@@ -424,6 +537,79 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('colorize').checked = data.colorize !== false;
   document.getElementById('inpaintMode').value = data.inpaintMode || 'low';
   document.getElementById('ocrMode').value = data.ocrMode || 'hayai';
+  document.getElementById('openaiOcrBox').style.display = data.ocrMode === 'openai_endpoint' ? 'block' : 'none';
+  document.getElementById('openaiOcrEndpoint').value = data.openaiOcrEndpoint || 'https://api.openai.com/v1';
+  document.getElementById('openaiOcrModel').value = data.openaiOcrModel || 'gpt-4o-mini';
+  document.getElementById('openaiOcrKey').value = data.openaiOcrApiKey || '';
+  document.getElementById('googleAiOcrBox').style.display = data.ocrMode === 'google_ai' ? 'block' : 'none';
+  document.getElementById('googleAiOcrKey').value = data.googleAiOcrApiKey || '';
+  const googleModel = data.googleAiOcrModel || 'gemini-2.5-flash-lite';
+  const googleModelSelect = document.getElementById('googleAiOcrModel');
+  const knownGoogleModel = Array.from(googleModelSelect.options).some(option => option.value === googleModel);
+  googleModelSelect.value = knownGoogleModel ? googleModel : 'custom';
+  document.getElementById('googleAiOcrCustomModel').value = data.googleAiOcrCustomModel || (knownGoogleModel ? '' : googleModel);
+  document.getElementById('googleAiOcrCustomModel').style.display = googleModelSelect.value === 'custom' ? 'block' : 'none';
+  document.getElementById('googleAiOcrRpm').value = data.googleAiOcrRpm || 5;
+
+  // ★ Combine slider — restore value + live label
+  const combineAmount = parseInt(data.combineAmount || '1', 10);
+  const combineSlider = document.getElementById('combineAmount');
+  const combineLabel = document.getElementById('combineAmountVal');
+  if (combineSlider && combineLabel) {
+    combineSlider.value = combineAmount;
+    combineLabel.textContent = combineAmount;
+    combineSlider.oninput = () => {
+      combineLabel.textContent = combineSlider.value;
+      chrome.storage.local.set({ combineAmount: String(combineSlider.value) });
+    };
+  }
+
+  // ★ Context (merged Skip SFX + Context Aware) — restore.
+  // Users upgrading from the split settings inherit "on" if either was set.
+  const ctxModeEl = document.getElementById('contextMode');
+  const ctxLevelEl = document.getElementById('contextLevel');
+  const ctxLevelRow = document.getElementById('contextLevelRow');
+  const styleFontsBtn = document.getElementById('styleFontsBtn');
+  const styleFontsBox = document.getElementById('styleFontsBox');
+  if (ctxModeEl && ctxLevelEl) {
+    const ctxMode = data.contextMode
+      || ((data.skipSfx === true || data.contextAware === true) ? 'on' : 'off');
+    const ctxLevel = data.contextLevel === 'high' ? 'high' : 'low';
+    ctxModeEl.value = ctxMode;
+    ctxLevelEl.value = ctxLevel;
+
+    const applyCtxVisibilityLocal = () => {
+      const on = ctxModeEl.value === 'on';
+      const high = on && ctxLevelEl.value === 'high';
+      if (ctxLevelRow) ctxLevelRow.style.display = on ? 'block' : 'none';
+      if (styleFontsBtn) styleFontsBtn.style.display = high ? 'block' : 'none';
+      if (styleFontsBox && !high) styleFontsBox.style.display = 'none';
+    };
+    // Hand the gate a way to refresh this once it forces High → Low.
+    applyCtxVisibility = applyCtxVisibilityLocal;
+    applyCtxVisibilityLocal();
+
+    ctxModeEl.onchange = () => {
+      chrome.storage.local.set({ contextMode: ctxModeEl.value });
+      applyCtxVisibilityLocal();
+    };
+    ctxLevelEl.onchange = () => {
+      chrome.storage.local.set({ contextLevel: ctxLevelEl.value });
+      applyCtxVisibilityLocal();
+    };
+    if (styleFontsBtn && styleFontsBox) {
+      styleFontsBtn.onclick = () => {
+        styleFontsBox.style.display = styleFontsBox.style.display === 'block' ? 'none' : 'block';
+      };
+    }
+  }
+
+  // ★ Free OpenRouter — restore (default off)
+  const freeOrEl = document.getElementById('freeOpenRouter');
+  if (freeOrEl) {
+    freeOrEl.checked = data.freeOpenRouter === true;
+    freeOrEl.onchange = () => chrome.storage.local.set({ freeOpenRouter: freeOrEl.checked });
+  }
 
   const modelType = data.modelType || 'local';
   document.getElementById('modelType').value = modelType;
@@ -446,7 +632,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const initUrl = data.serverUrl || '';
   initFontFamilyPicker(initUrl);
-  initFontWeightPicker();
+  initStyleFontPickers(initUrl, data);
 
   // Refresh language lists from the server (falls back to built-in on error).
   if (initUrl) {
@@ -454,14 +640,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     mtPopulateLangSelect(targetSel, targetSel.value || data.targetLang || 'en', langs);
     mtPopulateLangSelect(ocrLangSel, ocrLangSel.value || data.ocrLang || 'ja', langs);
   }
+  updateLanguageWarning();
+  targetSel.addEventListener('change', updateLanguageWarning);
+  ocrLangSel.addEventListener('change', updateLanguageWarning);
 });
 
 document.getElementById('serverUrl').addEventListener('change', (e) => {
   const url = e.target.value.trim().replace(/\/$/, '');
-  const container = document.getElementById('fontWeightPicker');
-  if (container) container.innerHTML = '<div style="font-size:11px; color:#888;">Loading preview…</div>';
   initFontFamilyPicker(url);
-  initFontWeightPicker();
+  chrome.storage.local.get(['styleFontBold', 'styleFontItalic', 'styleFontRegular'], (saved) => {
+    initStyleFontPickers(url, saved || {});
+  });
   syncInpaintModeFromServer(url);
   syncOcrModeFromServer(url);
 });
@@ -470,6 +659,7 @@ document.getElementById('modelType').addEventListener('change', (e) => {
   const isOpenRouter = e.target.value === 'openrouter';
   document.getElementById('openrouterBox').style.display = isOpenRouter ? 'block' : 'none';
   chrome.storage.local.set({ modelType: e.target.value });
+  applyContextLevelGate();
 });
 
 document.getElementById('inpaintMode').addEventListener('change', (e) => {
@@ -480,8 +670,14 @@ document.getElementById('inpaintMode').addEventListener('change', (e) => {
 
 document.getElementById('ocrMode').addEventListener('change', (e) => {
   const serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+  document.getElementById('openaiOcrBox').style.display = e.target.value === 'openai_endpoint' ? 'block' : 'none';
+  document.getElementById('googleAiOcrBox').style.display = e.target.value === 'google_ai' ? 'block' : 'none';
   chrome.storage.local.set({ ocrMode: e.target.value });
-  pushOcrMode(serverUrl, e.target.value);
+  if (!['openai_endpoint', 'google_ai'].includes(e.target.value)) pushOcrMode(serverUrl, e.target.value);
+});
+
+document.getElementById('googleAiOcrModel').addEventListener('change', (e) => {
+  document.getElementById('googleAiOcrCustomModel').style.display = e.target.value === 'custom' ? 'block' : 'none';
 });
 
 document.getElementById('cloudMode').addEventListener('change', async (e) => {
@@ -556,12 +752,24 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
   const ocrLang = document.getElementById('ocrLang').value;
   const colorize = document.getElementById('colorize').checked;
   const targetLang = document.getElementById('targetLang').value;
-  const fontWeight = document.getElementById('fontWeightHidden').value;
   const modelType = document.getElementById('modelType').value;
   const inpaintMode = document.getElementById('inpaintMode').value;
   const openrouterModel = document.getElementById('openrouterModel').value.trim();
   const openrouterApiKey = document.getElementById('openrouterKey').value.trim();
   const cloudMode = document.getElementById('cloudMode').checked;
+  const combineAmount = document.getElementById('combineAmount').value;
+  const freeOpenRouter = document.getElementById('freeOpenRouter').checked;
+  const openaiOcrEndpoint = document.getElementById('openaiOcrEndpoint').value.trim();
+  const openaiOcrModel = document.getElementById('openaiOcrModel').value.trim();
+  const openaiOcrApiKey = document.getElementById('openaiOcrKey').value.trim();
+  const googleAiOcrModelSelect = document.getElementById('googleAiOcrModel').value;
+  const googleAiOcrModel = googleAiOcrModelSelect === 'custom'
+    ? document.getElementById('googleAiOcrCustomModel').value.trim()
+    : googleAiOcrModelSelect;
+  const googleAiOcrApiKey = document.getElementById('googleAiOcrKey').value.trim();
+  const googleAiOcrRpm = parseInt(document.getElementById('googleAiOcrRpm').value, 10) || 5;
+  const contextMode = document.getElementById('contextMode').value === 'on' ? 'on' : 'off';
+  const contextLevel = document.getElementById('contextLevel').value === 'high' ? 'high' : 'low';
 
   // ★ Cache all settings including the API key
   chrome.storage.local.set({
@@ -570,43 +778,34 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
     ocrLang: ocrLang,
     colorize: colorize,
     targetLang: targetLang,
-    fontWeight: fontWeight,
     modelType: modelType,
     inpaintMode: inpaintMode,
     openrouterModel: openrouterModel,
     openrouterApiKey: openrouterApiKey,
-    cloudMode: cloudMode
+    cloudMode: cloudMode,
+    combineAmount: combineAmount,
+    freeOpenRouter: freeOpenRouter,
+    openaiOcrEndpoint: openaiOcrEndpoint,
+    openaiOcrModel: openaiOcrModel,
+    openaiOcrApiKey: openaiOcrApiKey,
+    googleAiOcrApiKey: googleAiOcrApiKey,
+    googleAiOcrModel: googleAiOcrModel,
+    googleAiOcrCustomModel: googleAiOcrModelSelect === 'custom' ? googleAiOcrModel : '',
+    googleAiOcrRpm: googleAiOcrRpm,
+    contextMode: contextMode,
+    contextLevel: contextLevel,
+    styleFontBold: document.getElementById('styleFontBold').value || '',
+    styleFontItalic: document.getElementById('styleFontItalic').value || '',
+    styleFontRegular: document.getElementById('styleFontRegular').value || ''
   }, () => {
     const status = document.getElementById('status');
     status.innerText = 'Settings saved & cached!';
     setTimeout(() => status.innerText = '', 2000);
   });
 
+  // ★ Unified settings push via /SetAllSettings (single call, handles drift)
   if (url) {
-    try {
-      await fetch(`${url}/SetFont`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stroke_width: parseInt(fontWeight, 10) })
-      });
-    } catch (e) {
-      console.warn('[MangaTranslator] Failed to push font weight to server:', e);
-    }
-
-    await pushInpaintMode(url, inpaintMode);
-    await pushOcrMode(url, ocrMode);
-
-    if (modelType === 'local') {
-      try {
-        await fetch(`${url}/SetModelType`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model_type: 'local' })
-        });
-      } catch (e) {
-        console.warn('[MangaTranslator] Failed to switch server to local model:', e);
-      }
-    }
+    await pushAllSettings(url, buildSettingsPayload());
   }
 });
 
@@ -622,33 +821,108 @@ document.getElementById('translateBtn').addEventListener('click', async () => {
     colorize: document.getElementById('colorize').checked,
     inpaintMode: document.getElementById('inpaintMode').value,
     modelType: document.getElementById('modelType').value,
-    fontWeight: document.getElementById('fontWeightHidden').value,
     openrouterModel: document.getElementById('openrouterModel').value.trim(),
     openrouterApiKey: document.getElementById('openrouterKey').value.trim(),
+    openaiOcrEndpoint: document.getElementById('openaiOcrEndpoint').value.trim(),
+    openaiOcrModel: document.getElementById('openaiOcrModel').value.trim(),
+    openaiOcrApiKey: document.getElementById('openaiOcrKey').value.trim(),
+    googleAiOcrApiKey: document.getElementById('googleAiOcrKey').value.trim(),
+    googleAiOcrModel: document.getElementById('googleAiOcrModel').value === 'custom'
+      ? document.getElementById('googleAiOcrCustomModel').value.trim()
+      : document.getElementById('googleAiOcrModel').value,
+    googleAiOcrCustomModel: document.getElementById('googleAiOcrCustomModel').value.trim(),
+    googleAiOcrRpm: parseInt(document.getElementById('googleAiOcrRpm').value, 10) || 5,
     cloudMode: cloudMode,
+    combineAmount: document.getElementById('combineAmount').value,
+    freeOpenRouter: document.getElementById('freeOpenRouter').checked,
+    contextMode: document.getElementById('contextMode').value === 'on' ? 'on' : 'off',
+    contextLevel: document.getElementById('contextLevel').value === 'high' ? 'high' : 'low',
+    styleFontBold: document.getElementById('styleFontBold').value || '',
+    styleFontItalic: document.getElementById('styleFontItalic').value || '',
+    styleFontRegular: document.getElementById('styleFontRegular').value || '',
   };
 
-  // In cloud mode, make sure the server is actually configured for the cloud
-  // path (Google Lens + OpenRouter + no local inpaint) using the OpenRouter
-  // details the user already entered — no need to re-type them.
-  if (cloudMode && settings.serverUrl) {
-    await pushCloudModeToServer(settings.serverUrl);
+  const status = document.getElementById('status');
+  const translateButton = document.getElementById('translateBtn');
+  if (settings.ocrLang === settings.targetLang) {
+    status.innerText = 'Source and target match; using automatic OCR language detection.';
+    updateLanguageWarning();
+  }
+  if (settings.ocrMode === 'google_ai' && !settings.googleAiOcrApiKey) {
+    status.innerText = 'Google AI Studio OCR requires an API key.';
+    return;
+  }
+  if (settings.ocrMode === 'google_ai' && !settings.googleAiOcrModel) {
+    status.innerText = 'Select or enter a Gemini model ID.';
+    return;
   }
 
-  chrome.storage.local.set(settings, () => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      chrome.tabs.sendMessage(tabs[0].id, {
-        action: "translateAllImages",
-        ocrLang: settings.ocrLang,
-        targetLang: settings.targetLang
-      });
-      window.close();
+  translateButton.disabled = true;
+  status.innerText = 'Applying settings...';
+  const settingsResult = await pushAllSettings(settings.serverUrl, buildSettingsPayload());
+  if (!settingsResult.ok) {
+    status.innerText = `Settings error: ${settingsResult.error}`;
+    translateButton.disabled = false;
+    return;
+  }
+
+  await chrome.storage.local.set(settings);
+  status.innerText = 'Starting translation...';
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tabs.length || !tabs[0].id) {
+    status.innerText = 'No active browser tab was found.';
+    translateButton.disabled = false;
+    return;
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabs[0].id, {
+      action: "translateAllImages",
+      ocrLang: settings.ocrLang === settings.targetLang ? 'auto' : settings.ocrLang,
+      targetLang: settings.targetLang,
+      combineAmount: settings.combineAmount,
+      contextMode: settings.contextMode,
+      contextLevel: settings.contextLevel,
+      styleFonts: {
+        bold: settings.styleFontBold,
+        italic: settings.styleFontItalic,
+        regular: settings.styleFontRegular,
+      },
     });
-  });
+    if (!response || response.ok !== true) {
+      throw new Error(response?.error || 'The page did not acknowledge the translation request.');
+    }
+    window.close();
+  } catch (error) {
+    console.error('[MangaTranslator] Could not start translation in active tab:', error);
+    status.innerText = 'Could not start on this tab. Reload the manga page after reloading the extension, then try again.';
+    translateButton.disabled = false;
+  }
 });
 
 document.getElementById('optionsBtn').addEventListener('click', () => {
   chrome.runtime.openOptionsPage();
+});
+
+// ── Clear Image Cache ───────────────────────────────────────────────────
+// Removes all mtImgCache_* keys from chrome.storage.local. These are
+// page images cached client-side by the reader for offline/fast reading.
+document.getElementById('clearCacheBtn').addEventListener('click', () => {
+  chrome.storage.local.get(null, (all) => {
+    const keysToRemove = Object.keys(all).filter(k => k.startsWith('mtImgCache_'));
+    if (keysToRemove.length === 0) {
+      const status = document.getElementById('status');
+      status.innerText = 'No cached images to clear.';
+      setTimeout(() => status.innerText = '', 2000);
+      return;
+    }
+    chrome.storage.local.remove(keysToRemove, () => {
+      const status = document.getElementById('status');
+      status.innerText = `Cleared ${keysToRemove.length} cached images.`;
+      setTimeout(() => status.innerText = '', 2000);
+      console.log(`[MangaTranslator] Cleared ${keysToRemove.length} cached images.`);
+    });
+  });
 });
 
 // ============================================================================
