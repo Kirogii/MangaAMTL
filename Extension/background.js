@@ -1,5 +1,75 @@
 let ruleCounter = 1;
 const IMAGE_FETCH_TIMEOUT_MS = 30000;
+const JOB_HEALTH_ALARM = "mangaTranslatorJobHealth";
+const JOB_HEALTH_INTERVAL_MINUTES = 0.5;
+const JOB_HEALTH_STORAGE_KEY = "mangaTranslatorActiveJobs";
+
+async function getActiveJobs() {
+  const stored = await chrome.storage.session.get(JOB_HEALTH_STORAGE_KEY);
+  return stored[JOB_HEALTH_STORAGE_KEY] || {};
+}
+
+async function saveActiveJobs(jobs) {
+  await chrome.storage.session.set({ [JOB_HEALTH_STORAGE_KEY]: jobs });
+}
+
+async function reportJobHealth(job, active) {
+  try {
+    const response = await fetch(`${job.serverUrl}/v1/health`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: job.jobId, active }),
+    });
+    if (!response.ok) {
+      console.warn(`[BG] Health report for ${job.jobId} failed: HTTP ${response.status}`);
+    }
+  } catch (error) {
+    console.warn(`[BG] Health report for ${job.jobId} failed:`, error);
+  }
+}
+
+async function registerJobHealth(jobId, serverUrl, tabId) {
+  const jobs = await getActiveJobs();
+  jobs[jobId] = { jobId, serverUrl: String(serverUrl).replace(/\/$/, ""), tabId };
+  await saveActiveJobs(jobs);
+  await chrome.alarms.create(JOB_HEALTH_ALARM, { periodInMinutes: JOB_HEALTH_INTERVAL_MINUTES });
+  await reportJobHealth(jobs[jobId], true);
+}
+
+async function stopJobHealth(jobId, active = false) {
+  const jobs = await getActiveJobs();
+  const job = jobs[jobId];
+  if (!job) return;
+  delete jobs[jobId];
+  await saveActiveJobs(jobs);
+  if (!active) await reportJobHealth(job, false);
+  if (!Object.keys(jobs).length) await chrome.alarms.clear(JOB_HEALTH_ALARM);
+}
+
+async function stopJobsForTab(tabId) {
+  const jobs = await getActiveJobs();
+  const stopped = Object.values(jobs).filter(job => job.tabId === tabId);
+  if (!stopped.length) return;
+  for (const job of stopped) delete jobs[job.jobId];
+  await saveActiveJobs(jobs);
+  await Promise.all(stopped.map(job => reportJobHealth(job, false)));
+  if (!Object.keys(jobs).length) await chrome.alarms.clear(JOB_HEALTH_ALARM);
+}
+
+chrome.alarms.onAlarm.addListener(async alarm => {
+  if (alarm.name !== JOB_HEALTH_ALARM) return;
+  for (const job of Object.values(await getActiveJobs())) {
+    await reportJobHealth(job, true);
+  }
+});
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  stopJobsForTab(tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url) stopJobsForTab(tabId);
+});
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "fetchImage") {
@@ -25,7 +95,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // Keep channel open for async
   }
   if (request.type === "submitImage") {
-    submitTranslation(request, sendResponse);
+    submitTranslation(request, sendResponse, sender.tab?.id);
+    return true;
+  }
+
+  if (request.type === "stopTranslationHealth") {
+    stopJobHealth(request.jobId, request.active === true)
+      .then(() => sendResponse({ success: true }));
     return true;
   }
 
@@ -39,7 +115,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     console.log("[BG] Fetching and submitting image in one request path:", imageUrl);
     fetchImagePowerful(imageUrl, pageUrl, tabId)
-      .then(base64Data => submitTranslation({ ...request, base64Data }, sendResponse))
+      .then(base64Data => submitTranslation({ ...request, base64Data }, sendResponse, tabId))
       .catch(err => {
         console.error("[BG] Image fetch failed before /v1/translate:", imageUrl, err);
         sendResponse({ success: false, error: err.toString() });
@@ -48,7 +124,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-function submitTranslation(request, sendResponse) {
+function submitTranslation(request, sendResponse, senderTabId) {
   const { serverUrl, base64Data, colorize, targetLang, ocrLang, combineAmount,
           contextMode, contextLevel, styleAware, styleFonts } = request;
   const endpoint = `${String(serverUrl || '').replace(/\/$/, '')}/v1/translate`;
@@ -101,9 +177,12 @@ function submitTranslation(request, sendResponse) {
           if (!res.ok) throw new Error(`HTTP ${res.status}: ${data.detail || JSON.stringify(data)}`);
           return data;
         })
-        .then(data => {
+        .then(async data => {
           console.log("[BG] /v1/translate response:", data);
           if (data.job_id) {
+            if (senderTabId !== undefined) {
+              await registerJobHealth(data.job_id, serverUrl, senderTabId);
+            }
             // Return immediately. The page content script owns the long poll;
             // an MV3 service worker may be suspended during local GGUF work.
             sendResponse({ success: true, pending: true, job_id: data.job_id });

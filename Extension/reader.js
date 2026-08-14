@@ -824,11 +824,9 @@
     centerZone.onclick = (e) => { e.stopPropagation(); toggleControls(); };
     overlay.appendChild(centerZone);
 
-    // Mouse wheel — page flip with cooldown. Attached to `overlay` on ALL
-    // devices (touch laptops have mice too). A single wheel notch triggers
-    // exactly one flip, then a cooldown blocks subsequent ticks. If the user
-    // keeps scrolling aggressively (≥ BURST_THRESHOLD ticks within a burst
-    // window), we lift the cooldown so each notch flips a page.
+    // Mouse wheel navigation is handled as one gesture per event burst. The
+    // wheel path advances one page at a time; click, keyboard, and drag
+    // navigation continue to advance a complete two-page spread.
     overlay.addEventListener('wheel', onWheel, { passive: false });
 
     // Seek bar must be built before wireSeekInput() — the latter binds to the
@@ -1379,13 +1377,17 @@
   function goNext() { if (mode === 'two-page') flipPage('next', true); }
   function goPrev() { if (mode === 'two-page') flipPage('prev', true); }
   function goNextImmediate() {
+    const previousSpread = currentSpread;
     currentSpread = Math.min(currentSpread + 2, pages.length - 1);
+    if (currentSpread !== previousSpread && controlsVisible) hideControls();
     if (currentSpread >= pages.length - 1) maybeGoNextChapter();
     renderTwoPage();
     updateProgress();
   }
   function goPrevImmediate() {
+    const previousSpread = currentSpread;
     currentSpread = Math.max(currentSpread - 2, 0);
+    if (currentSpread !== previousSpread && controlsVisible) hideControls();
     renderTwoPage();
     updateProgress();
   }
@@ -2256,15 +2258,27 @@
     }
   }
 
-  // ── Mouse wheel page-flip with cooldown (PC only) ────────────────────
-  // A single wheel notch = exactly one flip, then a cooldown blocks the
-  // next notch for COOLDOWN_MS. No burst bypass — fast scrolling still only
-  // does 1 page per cooldown. Only on PC (IS_TOUCH = false) so mobile
-  // touch-scrolling in webtoon mode is unaffected.
+  // ── Mouse wheel page navigation (PC only) ────────────────────────────
+  // Trackpads and high-resolution wheels emit several events for one physical
+  // gesture. Accumulate those events, move exactly one page, then wait until
+  // the gesture has gone quiet before accepting another one.
   let wheelAccum = 0;
+  let wheelGestureActive = false;
+  let wheelGestureTimer = null;
   let wheelCooldownUntil = 0;
   const WHEEL_THRESHOLD = 60;
-  const COOLDOWN_MS = 320;
+  const WHEEL_GESTURE_END_MS = 240;
+  const WHEEL_COOLDOWN_MS = 800;
+
+  function releaseWheelGestureWhenReady() {
+    const cooldownRemaining = wheelCooldownUntil - performance.now();
+    if (cooldownRemaining > 0) {
+      wheelGestureTimer = setTimeout(releaseWheelGestureWhenReady, cooldownRemaining);
+      return;
+    }
+    wheelAccum = 0;
+    wheelGestureActive = false;
+  }
 
   function onWheel(e) {
     if (!overlay || mode !== 'two-page' || IS_TOUCH) return;
@@ -2272,23 +2286,50 @@
     if (Math.abs(dy) < 1) return;
 
     e.preventDefault();
-    const now = performance.now();
-    wheelAccum += dy;
+    clearTimeout(wheelGestureTimer);
+    wheelGestureTimer = setTimeout(releaseWheelGestureWhenReady, WHEEL_GESTURE_END_MS);
 
+    if (wheelGestureActive || performance.now() < wheelCooldownUntil) return;
+    if (wheelAccum && Math.sign(wheelAccum) !== Math.sign(dy)) wheelAccum = 0;
+    wheelAccum += dy;
     if (Math.abs(wheelAccum) < WHEEL_THRESHOLD) return;
 
     const direction = wheelAccum > 0 ? 'next' : 'prev';
+    wheelAccum = 0;
+    wheelGestureActive = true;
+    wheelCooldownUntil = performance.now() + WHEEL_COOLDOWN_MS;
+    flipWheelPage(direction);
+  }
 
-    // Hard cooldown — always enforced, no burst bypass.
-    if (now < wheelCooldownUntil) {
-      wheelAccum = 0;
+  function flipWheelPage(direction) {
+    const duration = REDUCED_MOTION ? 100 : 200;
+    const spread = document.getElementById('mt-reader-spread');
+    const pagesEls = spread ? spread.querySelectorAll('.mt-reader-page') : [];
+    const target = direction === 'next' ? pagesEls[pagesEls.length - 1] : pagesEls[0];
+    if (!target) {
+      advanceWheelPage(direction);
       return;
     }
+    playCrinkle();
+    const isRight = target.style.transformOrigin === 'left center';
+    const baseRot = isRight ? 6 : -6;
+    const dir = isRight ? -1 : 1;
+    target.style.transition = `transform ${duration}ms ease-in`;
+    target.style.transform = `rotateY(${baseRot + dir * 90}deg)`;
+    setTimeout(() => advanceWheelPage(direction), duration);
+  }
 
-    wheelAccum = 0;
-    wheelCooldownUntil = now + COOLDOWN_MS;
-    if (direction === 'next') goNext();
-    else goPrev();
+  function advanceWheelPage(direction) {
+    const previousSpread = currentSpread;
+    if (direction === 'next') {
+      currentSpread = Math.min(currentSpread + 1, pages.length - 1);
+      if (currentSpread >= pages.length - 1) maybeGoNextChapter();
+    } else {
+      currentSpread = Math.max(currentSpread - 1, 0);
+    }
+    if (currentSpread !== previousSpread && controlsVisible) hideControls();
+    renderTwoPage();
+    updateProgress();
   }
 
   function triggerTranslate() {

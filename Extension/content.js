@@ -1426,35 +1426,43 @@
     const jobId = response.job_id;
     const deadline = Date.now() + 15 * 60 * 1000;
     console.log(`[MangaTranslator] Polling backend job ${jobId} from the page.`);
-    while (Date.now() < deadline) {
-      const statusResponse = await fetch(`${serverUrl}/v1/translate/${jobId}`);
-      const status = await statusResponse.json().catch(() => ({}));
-      if (!statusResponse.ok) {
-        throw new Error(`Job ${jobId} poll failed: HTTP ${statusResponse.status}: ${status.detail || JSON.stringify(status)}`);
-      }
-      if (status.status === 'failed') throw new Error(status.error || `Backend job ${jobId} failed`);
-      if (status.status === 'completed') {
-        console.log(`[MangaTranslator] Job ${jobId} completed; fetching rendered PNG.`);
-        const imageResponse = await fetch(`${serverUrl}/v1/translate/${jobId}/image`, { method: 'POST' });
-        if (!imageResponse.ok) {
-          const detail = await imageResponse.text().catch(() => '');
-          throw new Error(`Rendered image fetch failed for job ${jobId}: HTTP ${imageResponse.status}${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+    try {
+      while (Date.now() < deadline) {
+        const statusResponse = await fetch(`${serverUrl}/v1/translate/${jobId}`);
+        const status = await statusResponse.json().catch(() => ({}));
+        if (!statusResponse.ok) {
+          throw new Error(`Job ${jobId} poll failed: HTTP ${statusResponse.status}: ${status.detail || JSON.stringify(status)}`);
         }
-        const blob = await imageResponse.blob();
-        if (!blob.size) throw new Error(`Backend returned an empty rendered image for job ${jobId}`);
-        const imageDataUrl = await blobToDataUrl(blob);
-        console.log(`[MangaTranslator] Rendered PNG received for job ${jobId}: ${blob.size} bytes.`);
-        return {
-          success: true,
-          job_id: jobId,
-          image_data_url: imageDataUrl,
-          image_b64: imageDataUrl.split(',', 2)[1] || '',
-          image_bytes: blob.size,
-        };
+        if (status.status === 'cancelled' || status.status === 'failed') {
+          throw new Error(status.error || `Backend job ${jobId} ${status.status}`);
+        }
+        if (status.status === 'completed') {
+          console.log(`[MangaTranslator] Job ${jobId} completed; fetching rendered PNG.`);
+          const imageResponse = await fetch(`${serverUrl}/v1/translate/${jobId}/image`, { method: 'POST' });
+          if (!imageResponse.ok) {
+            const detail = await imageResponse.text().catch(() => '');
+            throw new Error(`Rendered image fetch failed for job ${jobId}: HTTP ${imageResponse.status}${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+          }
+          const blob = await imageResponse.blob();
+          if (!blob.size) throw new Error(`Backend returned an empty rendered image for job ${jobId}`);
+          const imageDataUrl = await blobToDataUrl(blob);
+          await chrome.runtime.sendMessage({ type: 'stopTranslationHealth', jobId, active: true });
+          console.log(`[MangaTranslator] Rendered PNG received for job ${jobId}: ${blob.size} bytes.`);
+          return {
+            success: true,
+            job_id: jobId,
+            image_data_url: imageDataUrl,
+            image_b64: imageDataUrl.split(',', 2)[1] || '',
+            image_bytes: blob.size,
+          };
+        }
+        await new Promise(resolve => setTimeout(resolve, 5000));
       }
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      throw new Error(`Backend job ${jobId} timed out after 15 minutes`);
+    } catch (error) {
+      await chrome.runtime.sendMessage({ type: 'stopTranslationHealth', jobId });
+      throw error;
     }
-    throw new Error(`Backend job ${jobId} timed out after 15 minutes`);
   }
 
   async function sendRuntimeMessage(request, stage, timeoutMs = 960000) {

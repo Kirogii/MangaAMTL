@@ -36,7 +36,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pydantic import BaseModel, Field
 
 # --- FastAPI ---------------------------------------------------------------
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Request, Form
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, Request, Form, Depends
 from fastapi.responses import JSONResponse, Response, HTMLResponse, PlainTextResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -278,6 +278,7 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 _job_lock = asyncio.Lock()
 _job_queue: Optional[asyncio.Queue] = None
 _worker_task = None
+JOB_HEALTH_TIMEOUT_SECONDS = 75.0
 
 _llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
 _llm_lock = threading.Lock()
@@ -5868,6 +5869,55 @@ async def colorize_endpoint(image: UploadFile = File(...)):
 # ===========================================================================
 # Translation Job endpoints
 # ===========================================================================
+class JobHealthRequest(BaseModel):
+    job_id: str
+    active: bool = True
+
+
+def _job_health_expired(job: Dict[str, Any], now: Optional[float] = None) -> bool:
+    if not job.get("health_required", False):
+        return False
+    checked_at = time.time() if now is None else now
+    return checked_at - float(job.get("last_health", job.get("created", checked_at))) > JOB_HEALTH_TIMEOUT_SECONDS
+
+
+def _cancel_job(job: Dict[str, Any], reason: str) -> None:
+    status = job.get("status")
+    if status in {"failed", "cancelled"} or (status == "completed" and not job.get("rendering", False)):
+        return
+    job["status"] = "cancelled"
+    job["error"] = reason
+
+
+async def _ensure_job_active(job_id: str) -> Dict[str, Any]:
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise asyncio.CancelledError(f"Job {job_id} no longer exists")
+        if _job_health_expired(job):
+            _cancel_job(job, "Translation stopped because the originating page stopped sending health reports.")
+        if job.get("status") == "cancelled":
+            raise asyncio.CancelledError(job.get("error") or "Translation cancelled")
+        return job
+
+
+@app.post("/v1/health")
+async def update_job_health(request: JobHealthRequest):
+    async with _job_lock:
+        job = _jobs.get(request.job_id)
+        if not job:
+            raise HTTPException(404, f"Job {request.job_id} not found")
+        if request.active:
+            if job.get("status") == "cancelled":
+                return {"job_id": request.job_id, "status": "cancelled"}
+            job["health_required"] = True
+            job["last_health"] = time.time()
+        else:
+            job["health_required"] = True
+            _cancel_job(job, "Translation stopped because the originating page was closed or navigated away.")
+        return {"job_id": request.job_id, "status": job["status"]}
+
+
 @app.post("/v1/translate")
 async def create_translate_job(
     image: UploadFile = File(...),
@@ -5943,6 +5993,8 @@ async def create_translate_job(
             "result": None,
             "error": None,
             "created": time.time(),
+            "health_required": True,
+            "last_health": time.time(),
         }
 
     asyncio.create_task(_process_job(job_id))
@@ -5964,11 +6016,13 @@ async def _process_job(job_id: str):
         job["status"] = "processing"
 
     try:
+        job = await _ensure_job_active(job_id)
         pil_img = job["image"]
         target_lang = job["target_lang"]
         ocr_lang = job["ocr_lang"]
 
         ocr_results = await get_ocr_results(pil_img, ocr_lang, job.get("ocr_mode"))
+        job = await _ensure_job_active(job_id)
         logging.info(
             f"[Job {job_id}] OCR mode={job.get('ocr_mode')} produced "
             f"{len(ocr_results)} renderable region(s)."
@@ -6156,6 +6210,7 @@ async def _process_job(job_id: str):
 
         # Fail closed at the job boundary. Provider parsing success does not
         # guarantee that a candidate was translated rather than echoed.
+        await _ensure_job_active(job_id)
         rejected_count = 0
         for entry in translations:
             source = entry.get("text", "")
@@ -6192,6 +6247,7 @@ async def _process_job(job_id: str):
         # translation prompt (romanized straight from the OCR source text). No
         # mechanical post-process reinsertion.
 
+        await _ensure_job_active(job_id)
         async with _job_lock:
             job["status"] = "completed"
             job["result"] = {
@@ -6205,6 +6261,12 @@ async def _process_job(job_id: str):
                 "style_fonts": style_fonts,
             }
 
+    except asyncio.CancelledError as exc:
+        logging.info(f"[Job {job_id}] Cancelled: {exc}")
+        async with _job_lock:
+            current = _jobs.get(job_id)
+            if current:
+                _cancel_job(current, str(exc) or "Translation cancelled")
     except Exception as e:
         logging.error(f"[Job {job_id}] Failed: {e}\n{traceback.format_exc()}")
         async with _job_lock:
@@ -6217,6 +6279,8 @@ async def get_translate_job(job_id: str):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, f"Job {job_id} not found")
+        if _job_health_expired(job):
+            _cancel_job(job, "Translation stopped because the originating page stopped sending health reports.")
         result = {
             "id": job["id"],
             "status": job["status"],
@@ -6226,7 +6290,7 @@ async def get_translate_job(job_id: str):
         }
         if job["status"] == "completed":
             result["result"] = job["result"]
-        elif job["status"] == "failed":
+        elif job["status"] in {"failed", "cancelled"}:
             result["error"] = job["error"]
         return result
 
@@ -6240,8 +6304,28 @@ def _render_translation_text(item: Dict[str, Any], target_lang: str) -> str:
     return render_text
 
 
-@app.post("/v1/translate/{job_id}/image")
-async def get_translated_image(job_id: str):
+async def _rendering_job(job_id: str):
+    async with _job_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        if _job_health_expired(job):
+            _cancel_job(job, "Translation stopped because the originating page stopped sending health reports.")
+        if job.get("status") == "cancelled":
+            raise HTTPException(409, job.get("error") or "Translation cancelled")
+        if job.get("status") != "completed":
+            raise HTTPException(400, f"Job {job_id} is not completed (status: {job.get('status')})")
+        job["rendering"] = True
+    try:
+        yield job
+    finally:
+        async with _job_lock:
+            current = _jobs.get(job_id)
+            if current:
+                current["rendering"] = False
+
+
+async def _render_translated_image(job_id: str, job: Dict[str, Any]):
     """Generate the final translated image.
 
     Inpaint mode behaviour:
@@ -6252,12 +6336,6 @@ async def get_translated_image(job_id: str):
                       on top.
     """
     async with _job_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(404, f"Job {job_id} not found")
-        if job["status"] != "completed":
-            raise HTTPException(400, f"Job {job_id} is not completed (status: {job['status']})")
-
         pil_img = job["image"]
         translations = job["result"].get("translations", [])
         do_inpaint = job.get("inpaint", True)
@@ -6265,6 +6343,8 @@ async def get_translated_image(job_id: str):
         skip_sfx = job.get("skip_sfx", False)
         style_aware = bool(job["result"].get("style_aware", False))
         style_fonts = job["result"].get("style_fonts", {}) or {}
+
+    await _ensure_job_active(job_id)
 
     if not translations:
         buf = io.BytesIO()
@@ -6435,8 +6515,10 @@ async def get_translated_image(job_id: str):
             )
             use_lama = inpaint_mode == "high" or SimpleLama is not None
             img_bgr = await inpaint_image_async(img_bgr, mask, use_lama=use_lama)
+            await _ensure_job_active(job_id)
             logging.info(f"[Inpaint] Inpainting complete for {len(boxes_to_inpaint)} regions.")
 
+    await _ensure_job_active(job_id)
     out_pil = cv2_to_pil(img_bgr)
     draw = ImageDraw.Draw(out_pil)
 
@@ -6474,6 +6556,9 @@ async def get_translated_image(job_id: str):
     is_lens = (ocr_mode == "lens")
 
     for item_idx, item in enumerate(items_to_draw):
+        if item_idx % 4 == 0:
+            await asyncio.sleep(0)
+            await _ensure_job_active(job_id)
         translated_text = item["translated_text"]
         bbox = item["bbox"]
         x1, y1, x2, y2 = bbox
@@ -6601,9 +6686,23 @@ async def get_translated_image(job_id: str):
                 layer,
             )
 
+    await _ensure_job_active(job_id)
     buf = io.BytesIO()
     out_pil.save(buf, format="PNG")
+    await _ensure_job_active(job_id)
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+@app.post("/v1/translate/{job_id}/image")
+async def get_translated_image(job_id: str, job: Optional[Dict[str, Any]] = Depends(_rendering_job)):
+    if not isinstance(job, dict):
+        dependency = _rendering_job(job_id)
+        direct_job = await anext(dependency)
+        try:
+            return await _render_translated_image(job_id, direct_job)
+        finally:
+            await dependency.aclose()
+    return await _render_translated_image(job_id, job)
 
 # ===========================================================================
 # SFX Detection Endpoint
