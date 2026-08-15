@@ -11,7 +11,6 @@
 
 import asyncio
 import base64
-import bisect
 import io
 import json
 import math
@@ -19,6 +18,7 @@ import os
 import pathlib
 import time
 import traceback
+import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
@@ -127,55 +127,17 @@ except Exception:
 # --- Sanitization ----
 import re
 
-_ALLOWED_RANGES = (
-    (0x0020, 0x007E),
-    (0x00A0, 0x00FF),
-    (0x0100, 0x017F),
-    (0x0180, 0x024F),
-    (0x0400, 0x04FF),
-    (0x0500, 0x052F),
-    (0x2000, 0x206F),
-    (0x3000, 0x303F),
-    (0x3040, 0x309F),
-    (0x30A0, 0x30FF),
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xAC00, 0xD7AF),
-    (0xFF00, 0xFFEF),
-)
-
-_ALLOWED_LOWS  = tuple(r[0] for r in _ALLOWED_RANGES)
-_ALLOWED_HIGHS = tuple(r[1] for r in _ALLOWED_RANGES)
-
-_PUNCT_MAP = {
-    0x2018: "'", 0x2019: "'",
-    0x201C: '"', 0x201D: '"',
-    0x2013: '-', 0x2014: '-',
-    0x2026: '...',
-    0x00A0: ' ',
-    0x2022: '*',
-    0x300C: '[', 0x300D: ']',
-    0x300E: '[', 0x300F: ']',
-    0x2122: '(TM)', 0x00A9: '(c)', 0x00AE: '(R)',
-}
-
-def _is_allowed_cp(cp: int) -> bool:
-    idx = bisect.bisect_right(_ALLOWED_LOWS, cp) - 1
-    return idx >= 0 and cp <= _ALLOWED_HIGHS[idx]
 
 def clean_text_for_font(text: str) -> str:
+    """Preserve printable Unicode while removing unsafe control characters."""
     if not text:
         return ""
-    if not hasattr(clean_text_for_font, '_trans_table'):
-        clean_text_for_font._punct_table = str.maketrans(
-            {chr(cp): rep for cp, rep in _PUNCT_MAP.items()}
-        )
+    if not hasattr(clean_text_for_font, '_re_space'):
         clean_text_for_font._re_space = re.compile(r'[ \t]+')
-        clean_text_for_font._re_nl   = re.compile(r'\n+')
-    out = text.translate(clean_text_for_font._punct_table)
+        clean_text_for_font._re_nl = re.compile(r'\n+')
     out = ''.join(
-        ch for ch in out
-        if (ch in '\t\n') or (0x20 <= ord(ch) and _is_allowed_cp(ord(ch)))
+        ch for ch in text
+        if ch in '\t\n' or unicodedata.category(ch) not in {'Cc', 'Cs', 'Cn'}
     )
     out = clean_text_for_font._re_space.sub(' ', out)
     out = clean_text_for_font._re_nl.sub(' ', out)
@@ -1104,6 +1066,29 @@ STACKED_GROUP_Y_OVERLAP = 0.20
 # same thing, still get their own overlay.
 DUPLICATE_OVERLAY_IOU = 0.55
 
+# Lens uses YOLO regions as translation/overlay containers. A detector box that
+# spans nearly the full page and also covers a large fraction of its area is a
+# page-layout detection, not a plausible text bubble.
+LENS_MAX_REGION_AREA_FRACTION = 0.25
+LENS_PAGE_SPAN_FRACTION = 0.80
+
+
+def _is_implausibly_large_lens_region(
+    bbox: Tuple[int, int, int, int],
+    image_size: Tuple[int, int],
+) -> bool:
+    x1, y1, x2, y2 = bbox
+    image_w, image_h = image_size
+    box_w = max(0, x2 - x1)
+    box_h = max(0, y2 - y1)
+    image_area = max(1, image_w * image_h)
+    area_fraction = (box_w * box_h) / image_area
+    spans_page = (
+        box_w >= LENS_PAGE_SPAN_FRACTION * image_w
+        or box_h >= LENS_PAGE_SPAN_FRACTION * image_h
+    )
+    return area_fraction >= LENS_MAX_REGION_AREA_FRACTION and spans_page
+
 
 def _normalize_tilt(angle_deg) -> float:
     """Fold a raw Lens angle into a modest, readable tilt (degrees)."""
@@ -1416,6 +1401,69 @@ def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     return merged_blocks
 
+def _group_lens_blocks_by_yolo(
+    blocks: List[Dict[str, Any]],
+    yolo_boxes: List[Tuple[int, int, int, int]],
+    image_size: Optional[Tuple[int, int]] = None,
+) -> List[Dict[str, Any]]:
+    """Combine every Lens block assigned to the same plausible YOLO region."""
+    if image_size is not None:
+        image_w, image_h = image_size
+        filtered_boxes = []
+        for bbox in yolo_boxes:
+            if _is_implausibly_large_lens_region(bbox, image_size):
+                x1, y1, x2, y2 = bbox
+                area_fraction = ((x2 - x1) * (y2 - y1)) / max(1, image_w * image_h)
+                logging.info(
+                    f"[Google Lens] Skipping implausibly large YOLO region {bbox}: "
+                    f"area={area_fraction * 100:.1f}%, "
+                    f"span={(x2 - x1) / image_w * 100:.1f}%x"
+                    f"{(y2 - y1) / image_h * 100:.1f}% of page."
+                )
+                continue
+            filtered_boxes.append(bbox)
+        yolo_boxes = filtered_boxes
+
+    grouped: List[List[Dict[str, Any]]] = [[] for _ in yolo_boxes]
+    for block in blocks:
+        bbox = block.get("bbox")
+        if not bbox:
+            continue
+        x1, y1, x2, y2 = bbox
+        block_area = max(1, (x2 - x1) * (y2 - y1))
+        best_index = None
+        best_coverage = 0.0
+        for index, (yx1, yy1, yx2, yy2) in enumerate(yolo_boxes):
+            overlap_w = max(0, min(x2, yx2) - max(x1, yx1))
+            overlap_h = max(0, min(y2, yy2) - max(y1, yy1))
+            coverage = (overlap_w * overlap_h) / block_area
+            if coverage > best_coverage:
+                best_index = index
+                best_coverage = coverage
+        if best_index is not None and best_coverage > 0:
+            grouped[best_index].append(block)
+
+    results: List[Dict[str, Any]] = []
+    for yolo_bbox, members in zip(yolo_boxes, grouped):
+        if not members:
+            continue
+        members.sort(key=lambda block: (-block["bbox"][0], block["bbox"][1]))
+        member_boxes = [block["bbox"] for block in members]
+        member_angles = [float(block.get("angle", 0.0) or 0.0) for block in members]
+        if max(member_angles) - min(member_angles) <= TILT_GROUP_SPREAD_DEG:
+            angle = sum(member_angles) / len(member_angles)
+        else:
+            angle = 0.0
+        results.append({
+            "text": " ".join(block["text"] for block in members),
+            "bbox": yolo_bbox,
+            "bboxes": member_boxes,
+            "angle": angle,
+            "angles": member_angles,
+        })
+    return results
+
+
 async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Dict[str, Any]]:
     api = get_lens_api()
     w, h = pil_img.size
@@ -1460,7 +1508,19 @@ async def google_lens_ocr(pil_img: Image.Image, ocr_lang: str = "ja") -> List[Di
             continue
         out.append({"text": text, "bbox": bbox, "angle": _geometry_angle(geometry)})
 
-    # Merge close blocks before returning
+    if not out:
+        return []
+
+    yolo_boxes = _detect_yolo_text_boxes(pil_img)
+    if yolo_boxes:
+        grouped = _group_lens_blocks_by_yolo(out, yolo_boxes, pil_img.size)
+        logging.info(
+            f"[Google Lens] Combined {len(out)} Lens OCR blocks into "
+            f"{len(grouped)} YOLO region(s) for translation and overlay."
+        )
+        return grouped
+
+    # Keep the Lens-only merge as a fallback when YOLO produces no regions.
     merged = _merge_close_blocks(out)
     logging.info(f"[Google Lens] Found {len(out)} raw blocks -> merged to {len(merged)} blocks.")
     return merged
@@ -2672,55 +2732,63 @@ def _local_vision_detected_regions(
     return remapped
 
 
-def _local_vision_ocr_yolo_box(
+def _local_vision_ocr_yolo_boxes(
     pil_img: Image.Image,
-    bbox: Tuple[int, int, int, int],
+    boxes: List[Tuple[int, int, int, int]],
     llm: Any,
     ocr_lang: str,
-) -> Dict[str, Any]:
-    crop = pil_img.crop(bbox).convert("RGB")
+) -> List[Dict[str, Any]]:
+    sheet, _ = _local_vision_contact_sheet(pil_img, boxes)
     raw = _complete_local_vision_ocr(
         llm,
         [{"role": "system", "content": ""}, {"role": "user", "content": [
             {
                 "type": "text",
                 "text": (
-                    f"Source language hint: {ocr_lang}. OCR the complete text in this "
-                    "single YOLO-detected crop. Return one JSON object in an array with "
-                    "the exact visible text, a bbox covering the crop, and angle 0. Do not "
-                    "split, merge, translate, explain, or return markdown."
+                    f"Source language hint: {ocr_lang}. This image is a grid atlas of "
+                    "separate YOLO-detected text-region crops divided by blank gutters. "
+                    "OCR every crop in reading order. Return exactly one JSON object per "
+                    "crop. If a crop contains multiple text lines or detected text pieces, "
+                    "combine all of them into that crop's single text field in natural "
+                    "reading order. Never combine text from different crops. Use a bbox "
+                    "covering the crop and angle 0. Do not translate, omit, explain, or "
+                    "return markdown."
                 ),
             },
-            {"type": "image_url", "image_url": {"url": _local_vision_crop_data_uri(crop)}},
+            {"type": "image_url", "image_url": {"url": _local_vision_crop_data_uri(sheet)}},
         ]}],
-        max_tokens=512,
-        expected_regions=1,
+        max_tokens=min(4096, max(1024, len(boxes) * 256)),
+        expected_regions=len(boxes),
     )
     parsed = _parse_vision_ocr_json(str(raw))
     if not parsed:
-        return {"text": "", "bbox": bbox}
+        return []
 
     repaired = _repair_local_vision_regions(parsed)
-    if not repaired or not isinstance(repaired[0], dict):
-        return {"text": "", "bbox": bbox}
-
-    raw_region = repaired[0]
-    text = str(
-        raw_region.get("text")
-        or raw_region.get("transcription")
-        or raw_region.get("content")
-        or raw_region.get("label")
-        or ""
-    ).strip()
-    result: Dict[str, Any] = {"text": text, "bbox": bbox}
-    try:
-        result["angle"] = float(raw_region.get("angle", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        result["angle"] = 0.0
-    for key in ("or_color", "or_glow", "or_style", "or_bold", "or_font_px"):
-        if key in raw_region:
-            result[key] = raw_region[key]
-    return result
+    results: List[Dict[str, Any]] = []
+    for index, bbox in enumerate(boxes):
+        if index >= len(repaired) or not isinstance(repaired[index], dict):
+            continue
+        raw_region = repaired[index]
+        text = str(
+            raw_region.get("text")
+            or raw_region.get("transcription")
+            or raw_region.get("content")
+            or raw_region.get("label")
+            or ""
+        ).strip()
+        if not text:
+            continue
+        item: Dict[str, Any] = {"text": text, "bbox": bbox}
+        try:
+            item["angle"] = float(raw_region.get("angle", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            item["angle"] = 0.0
+        for key in ("or_color", "or_glow", "or_style", "or_bold", "or_font_px"):
+            if key in raw_region:
+                item[key] = raw_region[key]
+        results.append(item)
+    return results
 
 
 def local_vision_ocr(pil_img: Image.Image, ocr_lang: str = "auto") -> List[Dict[str, Any]]:
@@ -2732,33 +2800,28 @@ def local_vision_ocr(pil_img: Image.Image, ocr_lang: str = "auto") -> List[Dict[
         return []
 
     logging.info(
-        f"[Local Vision OCR] Running GGUF OCR independently on "
-        f"{len(detected_boxes)} YOLO crop(s)."
+        f"[Local Vision OCR] Batching {len(detected_boxes)} independent YOLO "
+        "crop(s) into one GGUF OCR request."
     )
-    results: List[Dict[str, Any]] = []
     with _local_vision_inference_lock:
-        for index, bbox in enumerate(detected_boxes, start=1):
-            try:
-                item = _local_vision_ocr_yolo_box(
-                    pil_img, bbox, llm, ocr_lang
-                )
-            except Exception as exc:
-                logging.warning(
-                    f"[Local Vision OCR] OCR failed for YOLO crop "
-                    f"{index}/{len(detected_boxes)} at {bbox}: {exc}"
-                )
-                continue
-            if not item["text"]:
-                logging.warning(
-                    f"[Local Vision OCR] YOLO crop {index}/{len(detected_boxes)} "
-                    f"at {bbox} returned no text."
-                )
-                continue
-            results.append(item)
-            logging.info(
-                f"[Local Vision OCR] YOLO crop {index}/{len(detected_boxes)} "
-                f"read {item['text'][:40]!r} at unchanged box {bbox}."
+        try:
+            results = _local_vision_ocr_yolo_boxes(
+                pil_img, detected_boxes, llm, ocr_lang
             )
+        except Exception as exc:
+            logging.warning(f"[Local Vision OCR] Batched YOLO OCR failed: {exc}")
+            results = []
+
+    if len(results) < len(detected_boxes):
+        logging.warning(
+            f"[Local Vision OCR] Batched GGUF OCR returned usable text for "
+            f"{len(results)}/{len(detected_boxes)} YOLO crop(s)."
+        )
+    for index, item in enumerate(results, start=1):
+        logging.info(
+            f"[Local Vision OCR] Batched crop {index}/{len(results)} read "
+            f"{item['text'][:40]!r} at unchanged box {item['bbox']}."
+        )
 
     logging.info(
         f"[Local Vision OCR] Produced {len(results)} one-to-one YOLO region(s) "
@@ -2965,6 +3028,13 @@ SYSTEM_PROMPT = (
     "Translate the user's text from its original language into {lang}. "
     "Output ONLY the {lang} translation — no source text, no notes, no quotes. "
     "{script_hint}"
+)
+
+DELIMITER_CLAUSE = (
+    " Preserve every bracket and delimiter from the source exactly, including"
+    " < >, [ ], ( ), { }, 【 】, 「 」, 『 』, 〈 〉, 《 》, and full-width variants."
+    " Keep the same characters in the same order; translate only the text"
+    " inside or around them. Do not remove, replace, or add delimiters."
 )
 
 # Always appended to every translation system prompt (both backends, both
@@ -3483,6 +3553,7 @@ def _retry_translate_single(text: str, lang_name: str, src_lang_name: str, llm) 
         f"The source is {src_lang_name}. "
         f"DO NOT output any {src_lang_name} text. "
         f"Output ONLY {lang_name} text, nothing else. No explanations."
+        + DELIMITER_CLAUSE
     )
     retry_user = f"[Source: {src_lang_name}] -> [Target: {lang_name}]\n{text}"
     msgs = [
@@ -3519,7 +3590,11 @@ def qwen_translate(text: str, target_lang: str = "en", ocr_lang: str = "ja") -> 
     logging.info(f"[LLM] Starting translation for: '{text[:40]}' -> {lang_name}")
     llm = get_qwen()
     
-    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name)) + HONORIFIC_CLAUSE
+    sys_prompt = (
+        SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name))
+        + DELIMITER_CLAUSE
+        + HONORIFIC_CLAUSE
+    )
     user_prompt = f"[Source language: {src_lang_name}]\n{text}"
     
     msgs = [
@@ -3586,7 +3661,7 @@ def qwen_translate_batch(texts: List[str], target_lang: str = "en", ocr_lang: st
         f"Output the same numbered list, containing ONLY the {lang_name} translations. "
         f"Do not include the original text. No explanations. {_script_hint(lang_name)}"
     ).strip()
-    batch_system_prompt += HONORIFIC_CLAUSE
+    batch_system_prompt += DELIMITER_CLAUSE + HONORIFIC_CLAUSE
     if context_aware:
         batch_system_prompt += CONTEXT_AWARE_CLAUSE
 
@@ -3740,7 +3815,7 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
         f"Output ONLY the translated list, one per line, keeping the exact same numbers. "
         f"Do not include the original text. No explanations, no notes, no quotes. {_script_hint(lang_name)}"
     ).strip()
-    base_system_prompt += HONORIFIC_CLAUSE
+    base_system_prompt += DELIMITER_CLAUSE + HONORIFIC_CLAUSE
     if context_aware:
         base_system_prompt += CONTEXT_AWARE_CLAUSE
     
@@ -3825,7 +3900,7 @@ async def openrouter_translate_batch(texts: List[str], target_lang: str = "en", 
                 f"Output ONLY the translated list, one per line, keeping the exact same numbers. "
                 f"No explanations, no notes, no quotes. {_script_hint(lang_name)}"
             ).strip()
-            escalated_prompt += HONORIFIC_CLAUSE
+            escalated_prompt += DELIMITER_CLAUSE + HONORIFIC_CLAUSE
             if context_aware:
                 escalated_prompt += CONTEXT_AWARE_CLAUSE
             if style_aware:
@@ -4034,7 +4109,11 @@ async def openrouter_translate(text: str, target_lang: str = "en", ocr_lang: str
 
     logging.info(f"[OpenRouter] Translating '{text[:40]}' -> {lang_name} using {model}")
 
-    sys_prompt = SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name)) + HONORIFIC_CLAUSE
+    sys_prompt = (
+        SYSTEM_PROMPT.format(lang=lang_name, script_hint=_script_hint(lang_name))
+        + DELIMITER_CLAUSE
+        + HONORIFIC_CLAUSE
+    )
     user_prompt = f"[Source language: {src_lang_name}]\n{text}"
 
     headers = {
@@ -4837,6 +4916,14 @@ def get_current_font(size: int) -> ImageFont.FreeTypeFont:
         font_path = _current_font_path
     return get_font(font_path, size)
 
+def _normalize_text_for_wrapping(text: str) -> str:
+    """Repair OCR line-break artifacts before measuring translated text."""
+    normalized = text.replace("\u00ad", "").replace("\n", " ")
+    normalized = re.sub(r"(?<=[A-Za-z])-\s+(?=[A-Za-z])", "", normalized)
+    normalized = re.sub(r"(?<=[A-Za-z])[:;|](?=[A-Za-z])", "", normalized)
+    return " ".join(normalized.split())
+
+
 def _add_cutoff_marker(draw, line, font, max_width):
     marker = "-"
     if line.endswith(marker) and draw.textlength(line, font=font) <= max_width:
@@ -4866,8 +4953,11 @@ def _break_long_word(draw, word, font, max_width):
             chunk = candidate
 
         if not chunk:
-            pieces.append(_add_cutoff_marker(draw, "", font, max_width))
-            break
+            # A single glyph may fit even when glyph-plus-hyphen does not.
+            # Emit it unchanged so the fallback never drops source text.
+            pieces.append(remaining[0])
+            remaining = remaining[1:]
+            continue
 
         pieces.append(chunk + "-")
         remaining = remaining[len(chunk):]
@@ -4875,11 +4965,11 @@ def _break_long_word(draw, word, font, max_width):
     return pieces or [word]
 
 def wrap_text(draw, text, font, max_width, allow_break=False, is_vertical=False):
-    """Wrap text by words, optionally hyphenating oversized words."""
+    """Wrap normalized text by words, optionally hyphenating oversized words."""
     if is_vertical:
         return [text] if text else [""]
 
-    words = text.split()
+    words = _normalize_text_for_wrapping(text).split()
     if not words:
         return [""]
 
@@ -5023,35 +5113,48 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             best_size = min_size
         return best_size, best_cols, best_col_widths, inner_w, inner_h
 
-    # ── Horizontal text: binary search for largest font that fits inner box ──
-    lo, hi = min_size, max_size
+    # ── Horizontal text: preflight 8-20, then find the largest complete fit ──
     best_size = None
     best_lines = None
     best_heights = None
 
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        key = (font_path, mid)
+    def _complete_layout(candidate_size):
+        key = (font_path, candidate_size)
         if key not in cache:
             try:
-                cache[key] = ImageFont.truetype(font_path, mid)
+                cache[key] = ImageFont.truetype(font_path, candidate_size)
             except Exception:
                 cache[key] = ImageFont.load_default()
-        font = cache[key]
-
-        lines = wrap_text(draw, text, font, inner_w, allow_break=False, is_vertical=False)
-        heights, total_h, max_w = _measure_block(draw, lines, font)
-
+        candidate_font = cache[key]
+        candidate_lines = wrap_text(
+            draw, text, candidate_font, inner_w, allow_break=False, is_vertical=False
+        )
+        candidate_heights, total_h, max_w = _measure_block(
+            draw, candidate_lines, candidate_font
+        )
         if max_w <= inner_w and total_h <= inner_h:
-            best_size, best_lines, best_heights = mid, lines, heights
-            lo = mid + 1
+            return candidate_lines, candidate_heights
+        return None
+
+    for candidate_size in range(8, min(20, max_size) + 1):
+        layout = _complete_layout(candidate_size)
+        if candidate_size >= min_size and layout is not None:
+            best_size = candidate_size
+            best_lines, best_heights = layout
+
+    lo = max(21, min_size)
+    hi = max_size
+    while lo <= hi:
+        candidate_size = (lo + hi) // 2
+        layout = _complete_layout(candidate_size)
+        if layout is not None:
+            best_size = candidate_size
+            best_lines, best_heights = layout
+            lo = candidate_size + 1
         else:
-            hi = mid - 1
+            hi = candidate_size - 1
 
     if best_lines is None:
-        # Preserve the readable floor while containing dense translations within
-        # the region. Oversized words are hyphenated, and text beyond the
-        # available line count is marked as cut off on the final visible line.
         key = (font_path, min_size)
         if key not in cache:
             try:
@@ -5059,18 +5162,9 @@ def fit_font_and_wrap(draw, text, box_w, box_h,
             except Exception:
                 cache[key] = ImageFont.load_default()
         font = cache[key]
-        wrapped_lines = wrap_text(
+        best_lines = wrap_text(
             draw, text, font, inner_w, allow_break=True, is_vertical=False
         )
-        wrapped_heights, _, _ = _measure_block(draw, wrapped_lines, font)
-        line_h = wrapped_heights[0] if wrapped_heights else max(1, min_size)
-        visible_line_count = max(1, int(inner_h // line_h))
-        was_cut_off = len(wrapped_lines) > visible_line_count
-        best_lines = wrapped_lines[:visible_line_count]
-        if was_cut_off and best_lines:
-            best_lines[-1] = _add_cutoff_marker(
-                draw, best_lines[-1], font, inner_w
-            )
         best_heights, _, _ = _measure_block(draw, best_lines, font)
         best_size = min_size
 
@@ -7037,9 +7131,9 @@ async def _render_translated_image(job_id: str, job: Dict[str, Any]):
         _style_font_cache[style] = resolved
         return resolved
 
-    # Preserve the complete translation by allowing compact text in dense OCR
-    # boxes. The fitter still chooses the largest size that fits first.
-    ABS_MIN_SIZE = 8
+    # Keep translated overlays readable while preserving every translated word.
+    # Sizes 8-20 are measured during preflight; 10 is the selectable floor.
+    ABS_MIN_SIZE = 10
 
     is_lens = (ocr_mode == "lens")
 
@@ -7082,6 +7176,16 @@ async def _render_translated_image(job_id: str, job: Dict[str, Any]):
             inner_padding_ratio=INNER_PADDING_RATIO,
         )
         font = get_font(item_fp, font_size)
+        measured_width = max(
+            (draw.textlength(line, font=font) for line in lines),
+            default=0.0,
+        )
+        measured_height = sum(heights)
+        logging.info(
+            f"[Render] Fit box {item_idx + 1}/{len(items_to_draw)} "
+            f"{box_w}x{box_h}px at {bbox}: font={font_size}px, "
+            f"lines={len(lines)}, used={measured_width:.0f}x{measured_height}px."
+        )
 
         # Never split words: text is always wrapped by whole words only. If the
         # block is taller than the bubble it overflows (the whole translation

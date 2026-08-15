@@ -1042,9 +1042,8 @@
     let processedImages = 0;
     let failedImages = 0;
 
-    // Local GGUF vision is a single shared model. Submit one page/group at a
-    // time so later pages do not create jobs that only sit behind its lock.
-    const WAVE_SIZE = stored.ocrMode === 'local_vision' ? 1 : 3;
+    // Process groups strictly in page order. `combineAmount` controls how many
+    // pages belong to one stitched request; it does not enable parallel waves.
 
     async function runGroup(group, gIdx) {
       const spinner = createSpinner(group[0]);
@@ -1074,15 +1073,15 @@
       updateOverlay(overlay, processedImages, images.length);
     }
 
-    for (let wStart = 0; wStart < groups.length; wStart += WAVE_SIZE) {
-      const wave = groups.slice(wStart, wStart + WAVE_SIZE);
+    for (let gIdx = 0; gIdx < groups.length; gIdx++) {
+      const group = groups[gIdx];
       if (combineAmount > 1) {
-        updateOverlayGroup(overlay, wStart + 1, groups.length, wave[0].length, processedImages, images.length);
+        updateOverlayGroup(overlay, gIdx + 1, groups.length, group.length, processedImages, images.length);
       } else {
         updateOverlay(overlay, processedImages, images.length);
       }
-      console.log(`[MangaTranslator] Wave ${Math.floor(wStart / WAVE_SIZE) + 1}: dispatching ${wave.length} job(s) concurrently`);
-      await Promise.all(wave.map((g, i) => runGroup(g, wStart + i)));
+      console.log(`[MangaTranslator] Group ${gIdx + 1}/${groups.length}: processing one job in page order`);
+      await runGroup(group, gIdx);
     }
 
     // Every page keeps its own image — combine groups are sliced back apart
