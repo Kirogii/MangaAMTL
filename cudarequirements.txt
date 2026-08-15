@@ -1,7 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 
-llama-cpp-python
+llama-cpp-python==0.3.32
 
 chrome-lens-py
 rich
