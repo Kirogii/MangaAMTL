@@ -25,6 +25,7 @@ import uuid
 import logging
 import threading
 import functools
+import hashlib
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
@@ -53,7 +54,33 @@ def get_torch_device() -> str:
     return "cuda" if has_cuda() else "cpu"
 
 def get_llm_gpu_layers() -> int:
-    return -1 if has_cuda() else 0
+    return -1 if llama_cpp_gpu_available() else 0
+
+
+def llama_cpp_gpu_available() -> bool:
+    if not has_cuda() or llama_cpp is None:
+        return False
+    try:
+        return bool(llama_cpp.llama_supports_gpu_offload())
+    except Exception:
+        return False
+
+
+def _log_llama_device(component: str) -> bool:
+    use_gpu = llama_cpp_gpu_available()
+    if use_gpu:
+        device_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() else "CUDA"
+        logging.info(f"[{component}] llama.cpp CUDA offload enabled on {device_name}; all model layers and KQV will be offloaded.")
+    elif has_cuda():
+        logging.warning(
+            f"[{component}] CUDA is available to PyTorch, but this llama-cpp-python build has no GPU offload support. "
+            "Using CPU fallback. Reinstall a CUDA wheel, for example: "
+            "python -m pip install --upgrade --force-reinstall llama-cpp-python "
+            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124"
+        )
+    else:
+        logging.info(f"[{component}] CUDA is unavailable; using CPU fallback.")
+    return use_gpu
 
 logging.info(f"[Device] CUDA available: {has_cuda()} -> device='{get_torch_device()}'")
 
@@ -76,8 +103,10 @@ except Exception:
     SimpleLama = None
 
 try:
+    import llama_cpp
     from llama_cpp import Llama
 except Exception:
+    llama_cpp = None
     Llama = None
 
 try:
@@ -125,6 +154,8 @@ _PUNCT_MAP = {
     0x2026: '...',
     0x00A0: ' ',
     0x2022: '*',
+    0x300C: '[', 0x300D: ']',
+    0x300E: '[', 0x300F: ']',
     0x2122: '(TM)', 0x00A9: '(c)', 0x00AE: '(R)',
 }
 
@@ -176,6 +207,8 @@ INPAINT_DILATE_PASSES = 2
 INPAINT_FEATHER_PX = 3
 INPAINT_USE_MULTI_PASS = True
 INPAINT_COLOR_MATCH = True
+LOCAL_VISION_INPAINT_PADDING = 6
+LOCAL_VISION_INPAINT_DILATE_KERNEL = 5
 
 # --- Inpainting Model Config (Low/High) -----------------------------------
 LAMA_LARGE_URL = "https://huggingface.co/df1412/anime-big-lama/resolve/main/anime-manga-big-lama.pt"
@@ -273,6 +306,8 @@ _current_qwen_repo_id = Qwen_REPO_ID
 _current_qwen_filename = Qwen_MODEL_FILENAME
 _current_qwen_path: Optional[pathlib.Path] = None
 _qwen_model_lock = threading.Lock()
+_yolo_lock = threading.RLock()
+_local_vision_inference_lock = threading.Lock()
 
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_lock = asyncio.Lock()
@@ -881,38 +916,45 @@ def get_hayai_ocr():
 
 def get_yolo():
     global _global_yolo
-    if _global_yolo is None:
-        ensure_yolo()
-        device = get_torch_device()
-        logging.info(f"[YOLO] Loading model on device: {device}")
-        _global_yolo = YOLO(str(YOLO_MODEL_PATH))
-        _global_yolo.to(device)
-        logging.info(f"[YOLO] Ready on {device}.")
-    return _global_yolo
+    with _yolo_lock:
+        if _global_yolo is None:
+            ensure_yolo()
+            device = get_torch_device()
+            logging.info(f"[YOLO] Loading model on device: {device}")
+            _global_yolo = YOLO(str(YOLO_MODEL_PATH))
+            _global_yolo.to(device)
+            logging.info(f"[YOLO] Ready on {device}.")
+        return _global_yolo
 
-def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
+
+def _detect_yolo_text_boxes(pil_img: Image.Image) -> List[Tuple[int, int, int, int]]:
     img_bgr = pil_to_cv2(pil_img)
     h, w = img_bgr.shape[:2]
-    yolo = get_yolo()
-    logging.info(f"[OCR] Running YOLO text detection on {w}x{h} image...")
-    results = yolo(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
+    logging.info(f"[YOLO] Detecting text regions on {w}x{h} image...")
+    with _yolo_lock:
+        results = get_yolo()(img_bgr, verbose=False, conf=0.4, device=get_torch_device())
     if not results:
         return []
-    r = results[0]
-    out = []
+
     img_area = h * w
-    mocr = get_hayai_ocr()
-    boxes = []
-    for b in r.boxes:
-        xy = b.xyxy[0].cpu().numpy()
+    boxes: List[Tuple[int, int, int, int]] = []
+    for box in results[0].boxes:
+        xy = box.xyxy[0].cpu().numpy()
         x1, y1 = max(0, int(xy[0])), max(0, int(xy[1]))
-        x2, y2 = min(w - 1, int(xy[2])), min(h - 1, int(xy[3]))
+        x2, y2 = min(w, int(xy[2])), min(h, int(xy[3]))
         box_area = (x2 - x1) * (y2 - y1)
         if box_area > 0.8 * img_area or box_area < 100:
             continue
         boxes.append((x1, y1, x2, y2))
+    return boxes
+
+
+def hayai_ocr_with_yolo(pil_img: Image.Image) -> List[Dict[str, Any]]:
+    boxes = _detect_yolo_text_boxes(pil_img)
     if not boxes:
         return []
+    out = []
+    mocr = get_hayai_ocr()
     def _ocr_one(bbox):
         x1, y1, x2, y2 = bbox
         crop = pil_img.crop((x1, y1, x2, y2))
@@ -1150,6 +1192,77 @@ def _bbox_iou(a, b) -> float:
     if union_area <= 0:
         return 0.0
     return inter / union_area
+
+
+def _lens_geometry_groups(boxes: List[Tuple[int, int, int, int]]) -> List[List[int]]:
+    """Return Lens-style groups for boxes without requiring OCR text."""
+    if len(boxes) <= 1:
+        return [list(range(len(boxes)))] if boxes else []
+
+    parent = list(range(len(boxes)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[left_root] = right_root
+
+    for i, first in enumerate(boxes):
+        x1_i, y1_i, x2_i, y2_i = first
+        w_i = max(1, x2_i - x1_i)
+        h_i = max(1, y2_i - y1_i)
+        for j in range(i + 1, len(boxes)):
+            x1_j, y1_j, x2_j, y2_j = boxes[j]
+            w_j = max(1, x2_j - x1_j)
+            h_j = max(1, y2_j - y1_j)
+            gap = max(x1_i, x1_j) - min(x2_i, x2_j)
+            if gap > MERGE_GAP_RATIO * min(w_i, h_i, w_j, h_j):
+                continue
+            vertical_overlap = min(y2_i, y2_j) - max(y1_i, y1_j)
+            if vertical_overlap >= 0.3 * min(h_i, h_j):
+                union(i, j)
+
+    changed = True
+    while changed:
+        changed = False
+        grouped: Dict[int, List[int]] = {}
+        for index in range(len(boxes)):
+            grouped.setdefault(find(index), []).append(index)
+        group_boxes = []
+        for root, members in grouped.items():
+            group_boxes.append((root, (
+                min(boxes[index][0] for index in members),
+                min(boxes[index][1] for index in members),
+                max(boxes[index][2] for index in members),
+                max(boxes[index][3] for index in members),
+            )))
+        for left, (root_i, box_i) in enumerate(group_boxes):
+            x1_i, y1_i, x2_i, y2_i = box_i
+            w_i = max(1, x2_i - x1_i)
+            h_i = max(1, y2_i - y1_i)
+            for root_j, box_j in group_boxes[left + 1:]:
+                x1_j, y1_j, x2_j, y2_j = box_j
+                w_j = max(1, x2_j - x1_j)
+                h_j = max(1, y2_j - y1_j)
+                x_overlap = min(x2_i, x2_j) - max(x1_i, x1_j)
+                y_overlap = min(y2_i, y2_j) - max(y1_i, y1_j)
+                if (x_overlap >= STACKED_GROUP_X_OVERLAP * min(w_i, w_j)
+                        and y_overlap >= STACKED_GROUP_Y_OVERLAP * min(h_i, h_j)):
+                    union(root_i, root_j)
+                    changed = True
+                    break
+            if changed:
+                break
+
+    result: Dict[int, List[int]] = {}
+    for index in range(len(boxes)):
+        result.setdefault(find(index), []).append(index)
+    return list(result.values())
 
 
 def _merge_close_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1842,12 +1955,12 @@ def _selected_vision_model() -> Optional[Dict[str, Any]]:
     return None
 
 
-def _vision_chat_handler(model_name: str, projector_path: str):
+def _vision_chat_handler(model_name: str, projector_path: str, use_gpu: Optional[bool] = None):
     try:
         from llama_cpp.llama_chat_format import MTMDChatHandler
         return MTMDChatHandler(
             clip_model_path=projector_path,
-            use_gpu=has_cuda(),
+            use_gpu=llama_cpp_gpu_available() if use_gpu is None else use_gpu,
             verbose=False,
         )
     except (ImportError, TypeError) as exc:
@@ -1872,26 +1985,41 @@ def get_local_vision_qwen():
                 and _local_vision_model_path == model_path
                 and _local_vision_projector_path == projector_path):
             return _local_vision_qwen
-        handler = _vision_chat_handler(model_path.name, str(projector_path))
-        if LOCAL_VISION_CHAT_TEMPLATE:
-            handler._get_chat_template = lambda _llama: LOCAL_VISION_CHAT_TEMPLATE
-            logging.info("[Local Vision OCR] Using jinja.txt as the multimodal chat template.")
-        _local_vision_qwen = Llama(
-            model_path=str(model_path),
-            chat_handler=handler,
-            n_ctx=2048,
-            n_batch=1024,
-            n_ubatch=512,
-            n_threads=max(4, os.cpu_count() or 4),
-            n_threads_batch=max(4, os.cpu_count() or 4),
-            n_gpu_layers=get_llm_gpu_layers(),
-            flash_attn=has_cuda(),
-            offload_kqv=has_cuda(),
-            verbose=False,
-        )
+        use_gpu = _log_llama_device("Local Vision OCR")
+
+        def _load_local_vision(enable_gpu: bool):
+            handler = _vision_chat_handler(model_path.name, str(projector_path), enable_gpu)
+            if LOCAL_VISION_CHAT_TEMPLATE:
+                handler._get_chat_template = lambda _llama: LOCAL_VISION_CHAT_TEMPLATE
+                logging.info("[Local Vision OCR] Using jinja.txt as the multimodal chat template.")
+            return Llama(
+                model_path=str(model_path),
+                chat_handler=handler,
+                n_ctx=4096,
+                n_batch=1024,
+                n_ubatch=512,
+                n_threads=max(4, os.cpu_count() or 4),
+                n_threads_batch=max(4, os.cpu_count() or 4),
+                n_gpu_layers=-1 if enable_gpu else 0,
+                flash_attn=enable_gpu,
+                offload_kqv=enable_gpu,
+                verbose=False,
+            )
+
+        try:
+            _local_vision_qwen = _load_local_vision(use_gpu)
+        except Exception as exc:
+            if not use_gpu:
+                raise
+            logging.warning(f"[Local Vision OCR] CUDA model initialization failed; retrying on CPU: {exc}")
+            _local_vision_qwen = _load_local_vision(False)
+            use_gpu = False
         _local_vision_model_path = model_path
         _local_vision_projector_path = projector_path
-        logging.info(f"[Local Vision OCR] Loaded {model_path.name} with {projector_path.name}")
+        logging.info(
+            f"[Local Vision OCR] Loaded {model_path.name} with {projector_path.name} "
+            f"on {'CUDA' if use_gpu else 'CPU'}"
+        )
         return _local_vision_qwen
 
 
@@ -2000,6 +2128,27 @@ def _normalize_local_vision_regions(
             item["angle"] = float(region.get("angle", region.get("rotation", 0.0)) or 0.0)
         except (TypeError, ValueError):
             item["angle"] = 0.0
+        member_boxes = region.get("bboxes")
+        if isinstance(member_boxes, (list, tuple)):
+            normalized_members = [
+                member_bbox
+                for member in member_boxes
+                if (member_bbox := _local_vision_box_to_pixels(member, image_size)) is not None
+            ]
+            if normalized_members:
+                item["bboxes"] = normalized_members
+                raw_angles = region.get("angles")
+                if isinstance(raw_angles, (list, tuple)):
+                    angles = []
+                    for value in raw_angles[:len(normalized_members)]:
+                        try:
+                            angles.append(float(value or 0.0))
+                        except (TypeError, ValueError):
+                            angles.append(0.0)
+                    angles.extend([item["angle"]] * (len(normalized_members) - len(angles)))
+                    item["angles"] = angles
+                else:
+                    item["angles"] = [item["angle"]] * len(normalized_members)
         color = _norm_hex_color(region.get("color") or region.get("text_color"))
         if color:
             item["or_color"] = color
@@ -2201,15 +2350,47 @@ def _dedupe_local_vision_regions(regions: List[Any], image_size: Tuple[int, int]
     return kept
 
 
-def _complete_local_vision_ocr(llm: Any, messages: List[Dict[str, Any]]) -> str:
-    response = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=512,
-        temperature=0,
-        top_p=1.0,
-        stop=["<|im_end|>", "</s>"],
-        stream=True,
-    )
+def _complete_local_vision_ocr(
+    llm: Any,
+    messages: List[Dict[str, Any]],
+    max_tokens: int = 512,
+    expected_regions: Optional[int] = None,
+) -> str:
+    response_kwargs: Dict[str, Any] = {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "top_p": 1.0,
+        "stop": ["<|im_end|>", "</s>"],
+        "stream": True,
+    }
+    if llama_cpp is not None and hasattr(llama_cpp, "LlamaGrammar"):
+        properties = {
+            "text": {"type": "string", "minLength": 1},
+            "bbox": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 4,
+                "maxItems": 4,
+            },
+            "angle": {"type": "number"},
+        }
+        schema: Dict[str, Any] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": properties,
+                "required": ["text", "bbox", "angle"],
+                "additionalProperties": False,
+            },
+        }
+        if expected_regions is not None:
+            schema["minItems"] = expected_regions
+            schema["maxItems"] = expected_regions
+        response_kwargs["grammar"] = llama_cpp.LlamaGrammar.from_json_schema(
+            json.dumps(schema), verbose=False
+        )
+    response = llm.create_chat_completion(**response_kwargs)
     if isinstance(response, dict):
         return str(response.get("choices", [{}])[0].get("message", {}).get("content", ""))
 
@@ -2259,50 +2440,332 @@ def _complete_local_vision_ocr(llm: Any, messages: List[Dict[str, Any]]) -> str:
     return output
 
 
-def local_vision_ocr(pil_img: Image.Image, ocr_lang: str = "auto") -> List[Dict[str, Any]]:
-    started = time.perf_counter()
-    data_uri = _page_image_data_uri_local_vision(pil_img)
-    if not data_uri:
-        return []
-    llm = get_local_vision_qwen()
-    inference_started = time.perf_counter()
+def _local_vision_crop_data_uri(crop: Image.Image) -> str:
+    buf = io.BytesIO()
+    crop.convert("RGB").save(buf, format="PNG", optimize=True)
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
+
+
+def _local_vision_contact_sheet(
+    pil_img: Image.Image,
+    boxes: List[Tuple[int, int, int, int]],
+) -> Tuple[Image.Image, List[Dict[str, Any]]]:
+    gutter = 24
+    source_crops = [pil_img.crop(box).convert("RGB") for box in boxes]
+    scales = [min(4.0, max(1.0, 128.0 / max(1, crop.width))) for crop in source_crops]
+    crops = [
+        crop.resize(
+            (max(1, round(crop.width * scale)), max(1, round(crop.height * scale))),
+            Image.Resampling.LANCZOS,
+        ) if scale > 1.0 else crop
+        for crop, scale in zip(source_crops, scales)
+    ]
+    columns = math.ceil(math.sqrt(len(crops)))
+    rows = math.ceil(len(crops) / columns)
+    column_widths = [
+        max(crops[index].width for index in range(column, len(crops), columns))
+        for column in range(columns)
+    ]
+    row_heights = [
+        max(crop.height for crop in crops[row * columns:(row + 1) * columns])
+        for row in range(rows)
+    ]
+    column_x = []
+    x = 0
+    for width in column_widths:
+        column_x.append(x)
+        x += width + gutter
+    row_y = []
+    y = 0
+    for height in row_heights:
+        row_y.append(y)
+        y += height + gutter
+
+    sheet_w = sum(column_widths) + gutter * (columns - 1)
+    sheet_h = sum(row_heights) + gutter * (rows - 1)
+    sheet = Image.new("RGB", (sheet_w, sheet_h), "white")
+    placements: List[Dict[str, Any]] = []
+    for index, (crop, page_box, scale) in enumerate(zip(crops, boxes, scales)):
+        row, column = divmod(index, columns)
+        x = column_x[column] + (column_widths[column] - crop.width) // 2
+        y = row_y[row] + (row_heights[row] - crop.height) // 2
+        sheet.paste(crop, (x, y))
+        placements.append({
+            "sheet_bbox": (x, y, x + crop.width, y + crop.height),
+            "page_bbox": page_box,
+            "scale": scale,
+        })
+    logging.info(
+        f"[Local Vision OCR] Built {columns}x{rows} crop atlas "
+        f"({sheet_w}x{sheet_h}) from {len(crops)} YOLO regions."
+    )
+    return sheet, placements
+
+
+def _local_vision_detected_regions(
+    pil_img: Image.Image,
+    boxes: List[Tuple[int, int, int, int]],
+    llm: Any,
+    ocr_lang: str,
+) -> List[Dict[str, Any]]:
+    sheet, placements = _local_vision_contact_sheet(pil_img, boxes)
+    completion_started = time.perf_counter()
     raw = _complete_local_vision_ocr(
         llm,
-        [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": [
-                {"type": "text", "text": f"Source language hint: {ocr_lang}. OCR the complete page."},
-                {"type": "image_url", "image_url": {"url": data_uri}},
-            ]},
-        ],
+        [{"role": "system", "content": ""}, {"role": "user", "content": [
+            {
+                "type": "text",
+                "text": (
+                    f"Source language hint: {ocr_lang}. This image is a compact grid atlas of "
+                    "complete YOLO-detected text crops divided by blank gutters. OCR every crop "
+                    "once, in reading order, and return one JSON object for each crop. For each "
+                    "object, return the exact visible text and a tight second-stage bbox relative "
+                    "to that crop's own top-left corner, not page coordinates. Do not omit crops "
+                    "or return empty text, placeholder bboxes, reasoning, or <think> text."
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": _local_vision_crop_data_uri(sheet)}},
+        ]}],
+        max_tokens=min(4096, max(1024, len(boxes) * 256)),
     )
-    regions = _parse_vision_ocr_json(str(raw))
-    if regions is None:
-        logging.error(f"[Local Vision OCR] Could not parse response: {str(raw)[:300]!r}")
-        return []
-    inference_size = _local_vision_inference_size(pil_img.size)
-    regions = _repair_local_vision_regions(regions)
-    regions = _scale_local_vision_regions(regions, inference_size, pil_img.size)
-    before_dedupe = len(regions)
-    regions = _dedupe_local_vision_regions(regions, pil_img.size)
-    if len(regions) != before_dedupe:
-        logging.warning(
-            f"[Local Vision OCR] Removed {before_dedupe - len(regions)} duplicate AI regions."
-        )
-    normalized = _normalize_local_vision_regions(regions, pil_img.size)
-    rejected = len(regions) - len(normalized)
-    if not normalized and regions:
-        logging.error(
-            f"[Local Vision OCR] Rejected all {len(regions)} OCR regions; "
-            f"first raw region={regions[0]!r}"
-        )
+    completion_seconds = time.perf_counter() - completion_started
+    parsed = _parse_vision_ocr_json(str(raw))
     logging.info(
-        f"[Local Vision OCR] Normalized {len(normalized)}/{len(regions)} regions "
-        f"for image {pil_img.width}x{pil_img.height} ({rejected} rejected); "
-        f"inference={time.perf_counter() - inference_started:.1f}s, "
+        f"[Local Vision OCR] GGUF crop-atlas completion took {completion_seconds:.1f}s, "
+        f"returned {len(str(raw))} characters and "
+        f"{len(parsed) if parsed is not None else 0} parsed regions."
+    )
+    if parsed is None:
+        preview = " ".join(str(raw).split())[:500]
+        logging.warning(
+            f"[Local Vision OCR] GGUF returned no parseable JSON for "
+            f"{len(boxes)}-crop atlas. Raw response: {preview!r}"
+        )
+        return []
+
+    regions = _repair_local_vision_regions(parsed)
+    remapped: List[Dict[str, Any]] = []
+    used_placements = set()
+    rejected = 0
+    for index, raw_region in enumerate(regions, start=1):
+        if not isinstance(raw_region, dict):
+            rejected += 1
+            continue
+        text = str(
+            raw_region.get("text")
+            or raw_region.get("transcription")
+            or raw_region.get("content")
+            or raw_region.get("label")
+            or ""
+        ).strip()
+        raw_bbox = raw_region.get("bbox")
+        if not text or not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+            rejected += 1
+            continue
+        try:
+            values = [float(value) for value in raw_bbox]
+        except (TypeError, ValueError):
+            rejected += 1
+            continue
+
+        placement_index: Optional[int] = None
+        crop_bbox: Optional[Tuple[int, int, int, int]] = None
+        coordinate_mode = "crop-local"
+        ordered_index = index - 1
+        if ordered_index < len(placements) and ordered_index not in used_placements:
+            sx1, sy1, sx2, sy2 = placements[ordered_index]["sheet_bbox"]
+            crop_w, crop_h = sx2 - sx1, sy2 - sy1
+            if (min(values) >= 0 and values[0] <= crop_w and values[2] <= crop_w
+                    and values[1] <= crop_h and values[3] <= crop_h):
+                normalized = _normalize_local_vision_regions([raw_region], (crop_w, crop_h))
+                if normalized:
+                    placement_index = ordered_index
+                    crop_bbox = normalized[0]["bbox"]
+
+        if crop_bbox is None:
+            atlas_boxes: List[Tuple[str, Tuple[int, int, int, int]]] = []
+            atlas_pixel = _local_vision_box_to_pixels(raw_bbox, sheet.size)
+            if atlas_pixel is not None:
+                atlas_boxes.append(("atlas", atlas_pixel))
+            if min(values) >= 0 and max(values) <= 1000 and max(values) > 1:
+                normalized_atlas = (
+                    round(values[0] * sheet.width / 1000.0),
+                    round(values[1] * sheet.height / 1000.0),
+                    round(values[2] * sheet.width / 1000.0),
+                    round(values[3] * sheet.height / 1000.0),
+                )
+                atlas_boxes.insert(0, ("normalized-atlas", normalized_atlas))
+
+            best_match = None
+            for mode, atlas_bbox in atlas_boxes:
+                ax1, ay1, ax2, ay2 = atlas_bbox
+                for candidate_index, placement in enumerate(placements):
+                    if candidate_index in used_placements:
+                        continue
+                    sx1, sy1, sx2, sy2 = placement["sheet_bbox"]
+                    clipped = (
+                        max(ax1, sx1), max(ay1, sy1),
+                        min(ax2, sx2), min(ay2, sy2),
+                    )
+                    overlap_w = max(0, clipped[2] - clipped[0])
+                    overlap_h = max(0, clipped[3] - clipped[1])
+                    overlap = overlap_w * overlap_h
+                    if overlap < 16:
+                        continue
+                    placement_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+                    score = overlap / placement_area
+                    if best_match is None or score > best_match[0]:
+                        best_match = (score, candidate_index, mode, clipped)
+            if best_match is not None:
+                _, placement_index, coordinate_mode, clipped = best_match
+                sx1, sy1, _, _ = placements[placement_index]["sheet_bbox"]
+                crop_bbox = (
+                    clipped[0] - sx1, clipped[1] - sy1,
+                    clipped[2] - sx1, clipped[3] - sy1,
+                )
+
+        if placement_index is None or crop_bbox is None:
+            rejected += 1
+            logging.warning(
+                f"[Local Vision OCR] Rejected result {index}: text={text[:80]!r}, "
+                f"bbox={raw_bbox!r}; it did not map to an unused atlas crop."
+            )
+            continue
+
+        placement = placements[placement_index]
+        used_placements.add(placement_index)
+        crop_x1, crop_y1, crop_x2, crop_y2 = crop_bbox
+        if crop_x2 - crop_x1 < 4 or crop_y2 - crop_y1 < 4:
+            rejected += 1
+            continue
+        scale = float(placement.get("scale", 1.0) or 1.0)
+        page_x1, page_y1, page_x2, page_y2 = placement["page_bbox"]
+        refined = dict(raw_region)
+        refined["text"] = text
+        refined["bbox"] = (
+            max(page_x1, min(page_x2, page_x1 + round(crop_x1 / scale))),
+            max(page_y1, min(page_y2, page_y1 + round(crop_y1 / scale))),
+            max(page_x1, min(page_x2, page_x1 + round(crop_x2 / scale))),
+            max(page_y1, min(page_y2, page_y1 + round(crop_y2 / scale))),
+        )
+        try:
+            refined["angle"] = float(raw_region.get("angle", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            refined["angle"] = 0.0
+        logging.info(
+            f"[Local Vision OCR] Accepted result {index}/{len(regions)} for crop "
+            f"{placement_index + 1}/{len(placements)} using {coordinate_mode} second bbox "
+            f"{crop_bbox} -> page {refined['bbox']}."
+        )
+        remapped.append(refined)
+
+    if rejected:
+        logging.warning(
+            f"[Local Vision OCR] Rejected {rejected}/{len(regions)} OCR results because "
+            "text or the refined bbox was invalid."
+        )
+    if len(used_placements) < len(placements):
+        logging.warning(
+            f"[Local Vision OCR] GGUF represented {len(used_placements)}/{len(placements)} "
+            "atlas crops with usable OCR results."
+        )
+    return remapped
+
+
+def _local_vision_ocr_yolo_box(
+    pil_img: Image.Image,
+    bbox: Tuple[int, int, int, int],
+    llm: Any,
+    ocr_lang: str,
+) -> Dict[str, Any]:
+    crop = pil_img.crop(bbox).convert("RGB")
+    raw = _complete_local_vision_ocr(
+        llm,
+        [{"role": "system", "content": ""}, {"role": "user", "content": [
+            {
+                "type": "text",
+                "text": (
+                    f"Source language hint: {ocr_lang}. OCR the complete text in this "
+                    "single YOLO-detected crop. Return one JSON object in an array with "
+                    "the exact visible text, a bbox covering the crop, and angle 0. Do not "
+                    "split, merge, translate, explain, or return markdown."
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": _local_vision_crop_data_uri(crop)}},
+        ]}],
+        max_tokens=512,
+        expected_regions=1,
+    )
+    parsed = _parse_vision_ocr_json(str(raw))
+    if not parsed:
+        return {"text": "", "bbox": bbox}
+
+    repaired = _repair_local_vision_regions(parsed)
+    if not repaired or not isinstance(repaired[0], dict):
+        return {"text": "", "bbox": bbox}
+
+    raw_region = repaired[0]
+    text = str(
+        raw_region.get("text")
+        or raw_region.get("transcription")
+        or raw_region.get("content")
+        or raw_region.get("label")
+        or ""
+    ).strip()
+    result: Dict[str, Any] = {"text": text, "bbox": bbox}
+    try:
+        result["angle"] = float(raw_region.get("angle", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        result["angle"] = 0.0
+    for key in ("or_color", "or_glow", "or_style", "or_bold", "or_font_px"):
+        if key in raw_region:
+            result[key] = raw_region[key]
+    return result
+
+
+def local_vision_ocr(pil_img: Image.Image, ocr_lang: str = "auto") -> List[Dict[str, Any]]:
+    started = time.perf_counter()
+    llm = get_local_vision_qwen()
+    detected_boxes = _detect_yolo_text_boxes(pil_img)
+    if not detected_boxes:
+        logging.info("[Local Vision OCR] YOLO found no text regions.")
+        return []
+
+    logging.info(
+        f"[Local Vision OCR] Running GGUF OCR independently on "
+        f"{len(detected_boxes)} YOLO crop(s)."
+    )
+    results: List[Dict[str, Any]] = []
+    with _local_vision_inference_lock:
+        for index, bbox in enumerate(detected_boxes, start=1):
+            try:
+                item = _local_vision_ocr_yolo_box(
+                    pil_img, bbox, llm, ocr_lang
+                )
+            except Exception as exc:
+                logging.warning(
+                    f"[Local Vision OCR] OCR failed for YOLO crop "
+                    f"{index}/{len(detected_boxes)} at {bbox}: {exc}"
+                )
+                continue
+            if not item["text"]:
+                logging.warning(
+                    f"[Local Vision OCR] YOLO crop {index}/{len(detected_boxes)} "
+                    f"at {bbox} returned no text."
+                )
+                continue
+            results.append(item)
+            logging.info(
+                f"[Local Vision OCR] YOLO crop {index}/{len(detected_boxes)} "
+                f"read {item['text'][:40]!r} at unchanged box {bbox}."
+            )
+
+    logging.info(
+        f"[Local Vision OCR] Produced {len(results)} one-to-one YOLO region(s) "
+        f"for image {pil_img.width}x{pil_img.height}; "
         f"total={time.perf_counter() - started:.1f}s."
     )
-    return normalized
+    return results
 
 
 async def get_ocr_results(pil_img: Image.Image, ocr_lang: str = "ja",
@@ -2965,9 +3428,9 @@ def get_qwen():
                     pass
                 if not _is_valid_gguf(path):
                     raise RuntimeError(f"Refusing to load invalid GGUF: {path}.")
-                use_gpu = has_cuda()
+                use_gpu = _log_llama_device("Qwen")
                 n_gpu_layers = -1 if use_gpu else 0
-                logging.info(f"[Qwen] loading {path} (GPU layers: {n_gpu_layers}) ...")
+                logging.info(f"[Qwen] loading {path} ({'CUDA all layers' if use_gpu else 'CPU fallback'}) ...")
                 try:
                     _global_qwen = Llama(
                         model_path=str(path), n_ctx=2048,
@@ -5957,6 +6420,7 @@ async def create_translate_job(
 
     job_id = str(uuid.uuid4())[:8]
     contents = await image.read()
+    request_fingerprint = hashlib.sha256(contents).hexdigest()
     pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
 
     level = "high" if str(context_level).lower() == "high" else "low"
@@ -5976,10 +6440,31 @@ async def create_translate_job(
         job_model_type = _current_model_type
 
     async with _job_lock:
+        for existing_id, existing in _jobs.items():
+            if (
+                existing.get("request_fingerprint") == request_fingerprint
+                and existing.get("target_lang") == target_lang
+                and existing.get("ocr_lang") == ocr_lang
+                and existing.get("ocr_mode") == job_ocr_mode
+                and existing.get("status") in {"pending", "processing"}
+            ):
+                existing["last_health"] = time.time()
+                logging.info(f"[Job {job_id}] Coalesced duplicate request into active job {existing_id}.")
+                return {
+                    "job_id": existing_id,
+                    "status": existing["status"],
+                    "inpaint": existing.get("inpaint", inpaint),
+                    "skip_sfx": existing.get("skip_sfx", skip_sfx),
+                    "context_aware": existing.get("context_aware", context_aware),
+                    "context_level": existing.get("context_level", level),
+                    "style_aware": existing.get("style_aware", style_on),
+                    "coalesced": True,
+                }
         _jobs[job_id] = {
             "id": job_id,
             "status": "pending",
             "image": pil_img,
+            "request_fingerprint": request_fingerprint,
             "target_lang": target_lang,
             "ocr_lang": ocr_lang,
             "ocr_mode": job_ocr_mode,
@@ -6506,11 +6991,16 @@ async def _render_translated_image(job_id: str, job: Dict[str, Any]):
             # ── Low/High mode: standard inpainting ──
             logging.info(f"[Inpaint] Building mask for {len(boxes_to_inpaint)} text regions "
                          f"(from {len(translations)} translation groups)...")
+            mask_padding = 2
+            mask_dilate_kernel = 3
+            if ocr_mode == "local_vision":
+                mask_padding = LOCAL_VISION_INPAINT_PADDING
+                mask_dilate_kernel = LOCAL_VISION_INPAINT_DILATE_KERNEL
             mask = build_inpaint_mask(
                 img_bgr.shape,
                 boxes_to_inpaint,
-                padding=2,
-                dilate_kernel=3,
+                padding=mask_padding,
+                dilate_kernel=mask_dilate_kernel,
                 angles=inpaint_angles,
             )
             use_lama = inpaint_mode == "high" or SimpleLama is not None
@@ -6547,11 +7037,9 @@ async def _render_translated_image(job_id: str, job: Dict[str, Any]):
         _style_font_cache[style] = resolved
         return resolved
 
-    # ── Font size limits ──
-    # The region geometry, not a fixed policy cap, determines the largest font.
-    # The fitter searches upward and keeps the largest complete wrapped block
-    # that fits, while preserving a readable minimum for dense regions.
-    ABS_MIN_SIZE = 17
+    # Preserve the complete translation by allowing compact text in dense OCR
+    # boxes. The fitter still chooses the largest size that fits first.
+    ABS_MIN_SIZE = 8
 
     is_lens = (ocr_mode == "lens")
 

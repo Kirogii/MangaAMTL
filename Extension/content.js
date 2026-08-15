@@ -1,4 +1,7 @@
 (function() {
+  if (window.__mtContentScriptReady) return;
+  window.__mtContentScriptReady = true;
+
   let isTranslating = false;
   let floatBtn, floatPopup;
 
@@ -129,29 +132,35 @@
 
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.action === "mangaTranslatorPing") {
+      sendResponse({ ok: true, ready: true, translating: isTranslating });
+      return;
+    }
     if (message.action === "translateAllImages") {
       if (isTranslating) {
-        sendResponse({ ok: false, error: 'Translation is already running on this page.' });
+        sendResponse({ ok: true, started: false, alreadyRunning: true });
         return;
       }
-      const imageCount = findAllTranslatableImages().length;
-      if (imageCount === 0) {
-        sendResponse({
-          ok: false,
-          error: 'No eligible manga images found. Images must be visible, at least 200x200 on the page, and at least 700,000 source pixels.',
-        });
-        return;
-      }
-      // Popup forwards combineAmount + contextMode/contextLevel/styleFonts; fall back to cached.
-      const opts = {
-        combineAmount: parseInt(message.combineAmount, 10) || 1,
-        contextMode: message.contextMode,
-        contextLevel: message.contextLevel,
-        styleFonts: message.styleFonts || null,
-      };
-      startTranslationProcess(message.ocrLang, message.targetLang, opts)
-        .catch((error) => console.error('[MangaTranslator] Translation failed to start:', error));
-      sendResponse({ ok: true, started: true, imageCount });
+      waitForTranslatableImages().then(images => {
+        if (images.length === 0) {
+          sendResponse({
+            ok: false,
+            error: 'No eligible manga images were found after waiting for page images to settle.',
+          });
+          return;
+        }
+        const opts = {
+          combineAmount: parseInt(message.combineAmount, 10) || 1,
+          contextMode: message.contextMode,
+          contextLevel: message.contextLevel,
+          styleFonts: message.styleFonts || null,
+          images,
+        };
+        startTranslationProcess(message.ocrLang, message.targetLang, opts)
+          .catch((error) => console.error('[MangaTranslator] Translation failed to start:', error));
+        sendResponse({ ok: true, started: true, imageCount: images.length });
+      }).catch(error => sendResponse({ ok: false, error: String(error) }));
+      return true;
     }
   });
 
@@ -972,10 +981,11 @@
       return;
     }
     isTranslating = true;
-    floatPopup.style.display = 'none';
+    try {
+      floatPopup.style.display = 'none';
 
-    const stored = await chrome.storage.local.get([
-      'serverUrl', 'ocrLang', 'colorize', 'targetLang', 'combineAmount',
+      const stored = await chrome.storage.local.get([
+      'serverUrl', 'ocrMode', 'ocrLang', 'colorize', 'targetLang', 'combineAmount',
       'contextMode', 'contextLevel', 'styleFontBold', 'styleFontItalic', 'styleFontRegular',
       'skipSfx', 'contextAware',
     ]);
@@ -1008,9 +1018,10 @@
 
     console.log(`[MangaTranslator] Starting — OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize}, Combine: ${combineAmount}, Context: ${contextMode}/${contextLevel}, Server: ${serverUrl}`);
 
-    let images = findAllTranslatableImages();
+    let images = Array.isArray(opts.images) ? opts.images.filter(img => img?.isConnected) : [];
+    if (images.length === 0) images = await waitForTranslatableImages();
     if (images.length === 0) {
-      alert("No suitable manga images found on this page. (Images must be at least 700k pixels and visible)");
+      alert("No suitable manga images found on this page after waiting for images to load.");
       isTranslating = false;
       return;
     }
@@ -1031,17 +1042,9 @@
     let processedImages = 0;
     let failedImages = 0;
 
-    // ── Dispatch in waves of WAVE_SIZE concurrent jobs ────────────────────
-    // Each group is an independent server job: processImage and
-    // processImageGroup share no state, and the backend's Lens client already
-    // caps its own fan-out with an internal semaphore, so several jobs can be
-    // in flight safely.
-    //
-    // Waves rather than a rolling pool, by request: every job in a wave has to
-    // finish before the next wave is dispatched. That also bounds peak memory
-    // to WAVE_SIZE stitched canvases instead of the whole chapter, and keeps
-    // page order roughly intact so the reader fills in top-to-bottom.
-    const WAVE_SIZE = 3;
+    // Local GGUF vision is a single shared model. Submit one page/group at a
+    // time so later pages do not create jobs that only sit behind its lock.
+    const WAVE_SIZE = stored.ocrMode === 'local_vision' ? 1 : 3;
 
     async function runGroup(group, gIdx) {
       const spinner = createSpinner(group[0]);
@@ -1092,13 +1095,15 @@
       overlay.innerText = `Done! (OCR Lang: ${targetOcr}, Lang: ${targetLanguage}, Colorize: ${colorize ? 'On' : 'Off'}, Combine: ${combineAmount})`;
       setTimeout(() => overlay.remove(), 4000);
     }
-    isTranslating = false;
     // Final sweep signal: individual pages already fired mt-image-translated,
     // but a run can also fail partway or finish out of order. The reader does
     // one full reconcile here so nothing is left showing a stale source.
     try {
       document.dispatchEvent(new CustomEvent('mt-translation-complete'));
     } catch (e) {}
+    } finally {
+      isTranslating = false;
+    }
   }
 
   // ========================================================================
@@ -1309,8 +1314,27 @@
   // already translated that question is settled, so callers that just want to
   // DISPLAY pages (the reader) pass includeTranslated and skip the re-decision.
   // Overlaid results fail several of those gates on purpose: they are inline
-  // data: URLs, and the backend returns them smaller than the source, so the
-  // 200px box floor and the 700k-pixel floor both drop them.
+  // data: URLs, and the backend returns them smaller than the source.
+  async function waitForTranslatableImages(timeoutMs = 8000) {
+    const deadline = Date.now() + timeoutMs;
+    let best = [];
+    let lastCount = -1;
+    let stablePasses = 0;
+    while (Date.now() < deadline) {
+      const images = findAllTranslatableImages();
+      if (images.length > best.length) best = images;
+      if (images.length > 0 && images.length === lastCount) {
+        stablePasses += 1;
+        if (stablePasses >= 3) return images;
+      } else {
+        stablePasses = 0;
+      }
+      lastCount = images.length;
+      await new Promise(resolve => setTimeout(resolve, 350));
+    }
+    return best;
+  }
+
   function findAllTranslatableImages(opts = {}) {
     const includeTranslated = opts.includeTranslated === true;
     const allImages  = Array.from(document.querySelectorAll('img'));
@@ -1356,7 +1380,7 @@
       if (img.clientWidth < 200 || img.clientHeight < 200) continue;
 
       const pixelCount  = img.naturalWidth * img.naturalHeight;
-      if (pixelCount < 700000) continue;
+      if (pixelCount < 240000) continue;
 
       const aspectRatio = img.naturalWidth / img.naturalHeight;
       if (aspectRatio > 4.0 || aspectRatio < 0.2) continue;

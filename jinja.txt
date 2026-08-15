@@ -34,7 +34,7 @@
 {%- endif %}
 {{- '\nOCR every visible text region. Return only JSON: ' }}
 {{- '[{"text":"exact text","bbox":[x1,y1,x2,y2],"angle":0}]. ' }}
-{{- 'Use full-image pixel coordinates and exactly these three fields. ' }}
+{{- 'Use the coordinate system requested by the user message and exactly these three fields. ' }}
 {{- 'Angle is baseline tilt in degrees; straight or vertical-layout text is 0. ' }}
 {{- 'Merge only characters belonging to one line or phrase; keep unrelated blocks separate. ' }}
 {{- 'Do not guess, translate, explain, or use markdown. Return [] when no text is visible.' }}

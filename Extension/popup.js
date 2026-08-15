@@ -809,6 +809,44 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
   }
 });
 
+async function ensureTranslationContentScript(tab) {
+  const url = tab.url || '';
+  let protocol = '';
+  try { protocol = new URL(url).protocol; } catch (error) {}
+  if (!['http:', 'https:', 'file:'].includes(protocol)) {
+    throw new Error('This browser page does not allow extension scripts. Open the manga on a normal website tab.');
+  }
+
+  try {
+    const ping = await chrome.tabs.sendMessage(tab.id, { action: 'mangaTranslatorPing' });
+    if (ping?.ready === true) return;
+  } catch (error) {}
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['languages.js', 'content.js', 'reader.js'],
+    });
+  } catch (error) {
+    const recoveredPing = await chrome.tabs.sendMessage(tab.id, { action: 'mangaTranslatorPing' }).catch(() => null);
+    if (recoveredPing?.ready !== true) throw error;
+  }
+
+  const ping = await chrome.tabs.sendMessage(tab.id, { action: 'mangaTranslatorPing' });
+  if (!ping?.ready) {
+    throw new Error('The manga page did not initialize the translation script.');
+  }
+}
+
+function translationStartError(error) {
+  const message = error instanceof Error ? error.message : String(error || 'Unknown startup error');
+  if (/No eligible manga images/i.test(message)) return message;
+  if (/This browser page does not allow|Cannot access contents|Cannot access a chrome|Missing host permission/i.test(message)) {
+    return 'Chrome blocked access to this page. Open the manga in a normal http/https tab. For local files, enable “Allow access to file URLs” for the extension.';
+  }
+  return message;
+}
+
 document.getElementById('translateBtn').addEventListener('click', async () => {
   // Snapshot every current control so the choices persist across popup reopens
   // and stay in sync with the content-script popup and options page.
@@ -876,6 +914,7 @@ document.getElementById('translateBtn').addEventListener('click', async () => {
   }
 
   try {
+    await ensureTranslationContentScript(tabs[0]);
     const response = await chrome.tabs.sendMessage(tabs[0].id, {
       action: "translateAllImages",
       ocrLang: settings.ocrLang === settings.targetLang ? 'auto' : settings.ocrLang,
@@ -895,7 +934,7 @@ document.getElementById('translateBtn').addEventListener('click', async () => {
     window.close();
   } catch (error) {
     console.error('[MangaTranslator] Could not start translation in active tab:', error);
-    status.innerText = 'Could not start on this tab. Reload the manga page after reloading the extension, then try again.';
+    status.innerText = `Could not start: ${translationStartError(error)}`;
     translateButton.disabled = false;
   }
 });
